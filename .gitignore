@@ -1,0 +1,31 @@
+# secrets and local configuration
+.env
+.env.*
+!.env.example
+service-account*.json
+*-service-account*.json
+*.pem
+*.key
+.claude/
+
+# real or local data: never publish
+clinic.db
+clinic.db-wal
+clinic.db-shm
+clinic.db.bak*
+*.db
+*.sqlite
+*.sqlite3
+*.wav
+*.xmind
+
+# python / tooling
+.venv/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+node_modules/
+
+# scratch scripts kept out of the project
+test_sarvam.py

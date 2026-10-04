@@ -1,0 +1,36 @@
+{# The Appointments tab's status strip. Rendered by the dashboard ("/") and
+   by /calendar/status/partial (polled while the tab is open). It never
+   contains the iframe, so refreshing it cannot reset the person's view. #}
+{% set s = cal.status %}
+{% if not s.configured %}
+  {% set pill_class, pill_text = 'cal-pill-warn', 'Not configured' %}
+{% elif s.last_error %}
+  {% set pill_class, pill_text = 'cal-pill-bad', 'Configured · last sync had errors' %}
+{% elif s.last_sync_local %}
+  {% set pill_class, pill_text = 'cal-pill-ok', 'Configured · syncing' %}
+{% else %}
+  {% set pill_class, pill_text = 'cal-pill-info', 'Configured · waiting for the first sync' %}
+{% endif %}
+<div class="cal-status">
+  <div class="cal-status-item">
+    <span class="cal-status-label">Sync</span>
+    <span class="cal-pill {{ pill_class }}">{{ pill_text }}</span>
+  </div>
+  <div class="cal-status-item">
+    <span class="cal-status-label">Last synced</span>
+    <span>{% if s.last_sync_local %}{{ s.last_sync_local }} IST{% else %}<span class="muted">never</span>{% endif %}</span>
+  </div>
+  <div class="cal-status-item">
+    <span class="cal-status-label">Pending changes</span>
+    <span>{{ s.pending }}{% if s.failed %} <span class="muted">· {{ s.failed }} gave up (retried every ~10 min)</span>{% endif %}</span>
+  </div>
+</div>
+{% if not s.configured %}
+<p class="cal-status-note"><strong>Appointments are not being copied to Google Calendar</strong> until the setup below is done.</p>
+{% endif %}
+{% if s.last_error %}
+<div class="flash error cal-error">
+  <strong>Last error:</strong> {{ s.last_error }}
+  <div class="muted cal-error-hint">If this mentions 403 or 404, check that the calendar is shared with the service account with "Make changes to events", and that the Google Calendar API is enabled.</div>
+</div>
+{% endif %}

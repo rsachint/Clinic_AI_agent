@@ -1,0 +1,71 @@
+{# Contents of the Queue tab. Rendered by the dashboard ("/") and, for the
+   15-second auto-refresh, by /queue/partial -- one source for both. #}
+{# An app started before the staff-edit feature existed passes no queue_date: fall back to today and hide the new buttons. #}
+{% set new_backend = queue_date is defined %}
+{% set queue_is_today = queue_is_today if queue_is_today is defined else true %}
+{% set queue_is_past = queue_is_past if queue_is_past is defined else false %}
+{% set queue_date = queue_date if queue_date is defined else queue_today %}
+{% set state_labels = {'booked': 'Not arrived', 'checked_in': 'Checked in', 'in_consultation': 'In consultation', 'done': 'Done', 'no_show': 'No-show'} %}
+<div class="card" id="queue-card">
+  <h2>{% if queue_is_today %}Today's queue{% else %}Queue for {{ queue_date }}{% endif %} <span class="count">({{ queue_entries|length }} · {{ queue_date }})</span></h2>
+  {% if queue_entries %}
+  <table class="queue-table">
+    <tr><th>Token</th><th>Patient</th><th>Slot</th><th>State</th><th>N ahead</th><th>Actions</th></tr>
+    {% for e in queue_entries %}
+    {% set state = 'done' if e.status == 'completed' else ('no_show' if e.status == 'no_show' else (e.queue_state or 'booked')) %}
+    <tr class="queue-row state-{{ state }}">
+      <td class="queue-token">{{ e.token_label }}</td>
+      <td>{{ e.name or '(no name)' }}{% if e.phone %}<div class="muted queue-phone">{{ e.phone }}</div>{% endif %}</td>
+      <td>{{ e.start_time }}</td>
+      <td><span class="state-badge state-badge-{{ state }}">{{ state_labels[state] }}</span></td>
+      <td>{{ e.ahead if e.ahead is not none else '-' }}</td>
+      <td><div class="queue-actions">
+        {% if queue_is_today %}
+        {% if state == 'booked' %}
+          <button type="button" class="btn-queue btn-queue-primary" data-queue-action="check_in" data-appointment-id="{{ e.id }}">Check in</button>
+          <button type="button" class="btn-queue" data-queue-action="call" data-appointment-id="{{ e.id }}">Call</button>
+          <button type="button" class="btn-queue btn-queue-danger" data-queue-action="no_show" data-appointment-id="{{ e.id }}">No-show</button>
+        {% elif state == 'checked_in' %}
+          <button type="button" class="btn-queue btn-queue-primary" data-queue-action="call" data-appointment-id="{{ e.id }}">Call</button>
+          <button type="button" class="btn-queue btn-queue-danger" data-queue-action="no_show" data-appointment-id="{{ e.id }}">No-show</button>
+        {% elif state == 'in_consultation' %}
+          <button type="button" class="btn-queue btn-queue-ok" data-queue-action="done" data-appointment-id="{{ e.id }}">Done</button>
+        {% endif %}
+        {% endif %}
+        {# Staff direct edits: the click is the approval (no review card); the patient is notified automatically. #}
+        {% if new_backend and e.outstanding and not queue_is_past and state != 'in_consultation' %}
+          <button type="button" class="btn-queue" data-queue-edit="move" data-appointment-id="{{ e.id }}" data-name="{{ e.name or '' }}" data-date="{{ e.appt_date }}" data-time="{{ e.start_time }}">Move</button>
+          <button type="button" class="btn-queue btn-queue-danger" data-queue-edit="cancel" data-appointment-id="{{ e.id }}" data-name="{{ e.name or '' }}" data-date="{{ e.appt_date }}" data-time="{{ e.start_time }}">Cancel</button>
+        {% endif %}
+      </div></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">No appointments {% if queue_is_today %}today{% else %}on {{ queue_date }}{% endif %}.</p>
+  {% endif %}
+</div>
+
+<div class="card" id="notifications-card">
+  <h2>Recent notifications <span class="count">(WhatsApp messages to patients)</span></h2>
+  {% if notifications %}
+  <table class="notif-table">
+    <tr><th>When (IST)</th><th>Event</th><th>To</th><th>Status</th><th></th></tr>
+    {% for n in notifications %}
+    <tr>
+      <td class="muted">{{ n.created_at|ist }}</td>
+      <td>{{ n.event }}</td>
+      <td>{{ n.patient_name or '' }}{% if n.wa_id %} <span class="muted">{{ n.wa_id }}</span>{% elif not n.patient_name %}<span class="muted">-</span>{% endif %}</td>
+      <td>
+        <span class="notif-badge notif-{{ n.status }}">{{ n.status.replace('_', ' ') }}</span>
+        {% if n.error %}<div class="muted notif-reason">{{ n.error }}</div>{% endif %}
+        {% if n.status == 'skipped_no_phone' %}<div class="muted notif-reason">No phone number on file.</div>{% endif %}
+      </td>
+      <td>{% if n.status in ('blocked_no_window', 'failed') %}<button type="button" class="btn-queue" data-notification-retry="{{ n.id }}">Retry</button>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
+  <p class="muted">Nothing sent yet.</p>
+  {% endif %}
+</div>

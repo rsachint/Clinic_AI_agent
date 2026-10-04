@@ -1,0 +1,240 @@
+from datetime import date
+
+
+def missed_followups(conn, as_of=None):
+    as_of = as_of or date.today().isoformat()
+    return conn.execute(
+        """
+        SELECT f.id, p.name, p.phone, f.due_date
+        FROM followups f
+        JOIN patients p ON p.id = f.patient_id
+        WHERE f.status = 'pending' AND f.due_date <= ?
+        ORDER BY f.due_date
+        """,
+        (as_of,),
+    ).fetchall()
+
+
+def day_end_cashbook(conn, on_date=None):
+    on_date = on_date or date.today().isoformat()
+    fees_paise = conn.execute(
+        "SELECT COALESCE(SUM(fee_paise), 0) AS total FROM visits WHERE visit_date = ?",
+        (on_date,),
+    ).fetchone()["total"]
+    expenses_paise = conn.execute(
+        "SELECT COALESCE(SUM(amount_paise), 0) AS total FROM expenses WHERE expense_date = ?",
+        (on_date,),
+    ).fetchone()["total"]
+    return {
+        "date": on_date,
+        "fees_paise": fees_paise,
+        "expenses_paise": expenses_paise,
+        "net_paise": fees_paise - expenses_paise,
+    }
+
+
+def nearest_pending_followup(conn, patient_id):
+    """Which pending follow-up a bare 'cancel/reschedule my follow-up'
+    command refers to, when a patient has more than one: the nearest due
+    date. A best-effort heuristic, not a certainty -- surfaced as an
+    editable dropdown on the review card (see static/review_card.js's
+    "followup" field type) so a human can correct a wrong guess before
+    approving. Returns the followup id, or None if there isn't one."""
+    row = conn.execute(
+        "SELECT id FROM followups WHERE patient_id = ? AND status = 'pending' ORDER BY due_date LIMIT 1",
+        (patient_id,),
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def pending_followups_for_patient(conn, patient_id):
+    """All of a patient's pending follow-ups, for the review card's
+    "followup" dropdown (context.followups) to offer as alternatives to the
+    best guess above."""
+    return conn.execute(
+        "SELECT id, due_date FROM followups WHERE patient_id = ? AND status = 'pending' ORDER BY due_date",
+        (patient_id,),
+    ).fetchall()
+
+
+def upcoming_appointments_for_patient(conn, patient_id):
+    """A patient's upcoming (booked/confirmed, not yet past) appointments,
+    for the review card's "appointment" dropdown (context.appointments)."""
+    return conn.execute(
+        """
+        SELECT id, appt_date, start_time, duration_minutes
+        FROM appointments
+        WHERE patient_id = ? AND status IN ('booked', 'confirmed')
+          AND (appt_date > date('now') OR (appt_date = date('now') AND start_time >= time('now')))
+        ORDER BY appt_date, start_time
+        """,
+        (patient_id,),
+    ).fetchall()
+
+
+def next_appointment_for_patient(conn, patient_id):
+    """The single nearest upcoming appointment for a patient, or None --
+    backs both the 'cancel/reschedule my appointment' best-guess and the
+    read-only next_appointment intent ("when's this patient's next
+    appointment")."""
+    return conn.execute(
+        """
+        SELECT id, appt_date, start_time, duration_minutes, status
+        FROM appointments
+        WHERE patient_id = ? AND status IN ('booked', 'confirmed')
+          AND (appt_date > date('now') OR (appt_date = date('now') AND start_time >= time('now')))
+        ORDER BY appt_date, start_time
+        LIMIT 1
+        """,
+        (patient_id,),
+    ).fetchone()
+
+
+def scheduled_appointments(conn, start_date, end_date=None):
+    """Booked/confirmed appointments in [start_date, end_date] -- backs the
+    read-only list_appointments intent ("what's scheduled today/this
+    week"). end_date defaults to start_date (a single day)."""
+    end_date = end_date or start_date
+    return conn.execute(
+        """
+        SELECT a.id, a.appt_date, a.start_time, a.duration_minutes, a.status, a.notes,
+               COALESCE(p.name, a.patient_name) AS patient_name,
+               COALESCE(p.phone, a.patient_phone) AS patient_phone
+        FROM appointments a
+        LEFT JOIN patients p ON p.id = a.patient_id
+        WHERE a.appt_date BETWEEN ? AND ?
+          AND a.status IN ('booked', 'confirmed')
+        ORDER BY a.appt_date, a.start_time
+        """,
+        (start_date, end_date),
+    ).fetchall()
+
+
+def attendance_register(conn, on_date=None):
+    on_date = on_date or date.today().isoformat()
+    return conn.execute(
+        """
+        SELECT s.name, a.status
+        FROM attendance a
+        JOIN staff s ON s.id = a.staff_id
+        WHERE a.attendance_date = ?
+        ORDER BY s.name
+        """,
+        (on_date,),
+    ).fetchall()
+
+
+def registered_names(conn):
+    """Names the voice name-extractor can recognise without asking the model:
+    patients with at least two words (a lone first name is too easily the start
+    of a different, new person's name) and every staff member. Best effort:
+    any database problem just means "no shortcut", never an error."""
+    try:
+        names = [r[0] for r in conn.execute("SELECT name FROM patients") if r[0] and len(r[0].split()) >= 2]
+        names += [r[0] for r in conn.execute("SELECT name FROM staff") if r[0]]
+        return names
+    except Exception:
+        return []
+
+
+def appointment_option(conn, appointment_id):
+    """One booked appointment as a review-card dropdown option, or None."""
+    return conn.execute(
+        "SELECT id, appt_date, start_time, duration_minutes FROM appointments "
+        "WHERE id = ? AND status IN ('booked', 'confirmed')", (appointment_id,)
+    ).fetchone()
+
+
+# What a person-name search lists: everything that actually happened or is still
+# going to, but not what was cancelled or moved away.
+NAMED_LIST_STATUSES = ("booked", "confirmed", "completed", "no_show")
+
+
+def _name_score(name, who, first_name_ok):
+    """How well the heard `name` fits the written `who`. A single spoken word
+    ("Amit") also counts as a full match for any one word of the written name
+    ("Amit Dua", "Amit Anand"), when `first_name_ok`."""
+    from clinic.entity_resolution import similarity
+
+    score = similarity(name, who)
+    if first_name_ok and len(name.split()) == 1:
+        score = max([score] + [similarity(name, word) for word in who.split()])
+    return score
+
+
+def _appointments_matching(conn, name, start, end, statuses, min_score, closeness, first_name_ok):
+    """Appointments (with the person shown in `patient_name`, as in
+    scheduled_appointments) in [start, end] with one of `statuses` (any, if
+    empty) whose person sounds like `name`: (score, row) pairs of the
+    best-fitting names only, in date and time order. Includes walk-ins whose
+    name is only written on the appointment (no patient record) and names in
+    the other script (Devanagari vs Roman). Others must score within
+    `closeness` of the best."""
+    name = (name or "").strip()
+    if not name:
+        return []
+    where, params = ["1 = 1"], []
+    if statuses:
+        where.append("a.status IN ({})".format(", ".join("?" * len(statuses))))
+        params.extend(statuses)
+    if start:
+        where.append("a.appt_date >= ?")
+        params.append(start)
+    if end:
+        where.append("a.appt_date <= ?")
+        params.append(end)
+    rows = conn.execute(
+        """
+        SELECT a.id, a.appt_date, a.start_time, a.duration_minutes, a.status, a.notes,
+               COALESCE(p.name, a.patient_name) AS patient_name,
+               COALESCE(p.phone, a.patient_phone) AS patient_phone
+        FROM appointments a
+        LEFT JOIN patients p ON p.id = a.patient_id
+        WHERE {}
+        ORDER BY a.appt_date, a.start_time
+        """.format(" AND ".join(where)),
+        params,
+    ).fetchall()
+    scored = [(_name_score(name, r["patient_name"], first_name_ok), r) for r in rows if r["patient_name"]]
+    scored = [(score, r) for score, r in scored if score >= min_score]
+    if not scored:
+        return []
+    best = max(score for score, _ in scored)
+    return [(score, r) for score, r in scored if best - score <= closeness]
+
+
+def appointments_named(conn, name, start=None, end=None, statuses=NAMED_LIST_STATUSES,
+                       min_score=0.6, closeness=0.08):
+    """One person's appointments, in date and time order, shaped exactly like
+    scheduled_appointments' rows (so the on-screen table and the conversation
+    memory work the same) -- backs "show Amit's appointments". Without `start` /
+    `end` it spans every date, past and upcoming; cancelled ones are left out
+    by default. The person is found by sound (see _appointments_matching), and a
+    spoken first name alone finds every person with that first name."""
+    # Who is meant is decided over every appointment, whatever its day or status;
+    # only then is the person's list narrowed. Otherwise "Amit Anand" with nothing
+    # on the day asked would quietly turn into whichever other Amit has something.
+    matches = _appointments_matching(conn, name, None, None, (), min_score, closeness, first_name_ok=True)
+    return [
+        dict(r) for _, r in matches
+        if r["status"] in statuses and (not start or r["appt_date"] >= start) and (not end or r["appt_date"] <= end)
+    ]
+
+
+def upcoming_appointments_named(conn, name, today=None, min_score=0.6, closeness=0.08):
+    """Booked appointments from `today` on whose person sounds like `name`, best
+    match first -- including walk-ins whose name is only written on the
+    appointment (no patient record), and names in the other script (Devanagari
+    vs Roman). Each row carries `who` (the name shown) and `score`. Only the
+    best-fitting names are kept: others must score within `closeness` of the
+    best. Today's earlier appointments are included, since staff do cancel those."""
+    from datetime import date as _date
+
+    today = today or _date.today().isoformat()
+    matches = _appointments_matching(conn, name, today, None, ("booked", "confirmed"), min_score, closeness,
+                                     first_name_ok=False)
+    return [
+        {"id": r["id"], "appt_date": r["appt_date"], "start_time": r["start_time"],
+         "duration_minutes": r["duration_minutes"], "who": r["patient_name"], "score": round(score, 3)}
+        for score, r in matches
+    ]
