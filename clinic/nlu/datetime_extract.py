@@ -336,6 +336,51 @@ _TIME_DEDH_DHAI = re.compile(
 _TIME_WORD_BAJE = re.compile(_EDGE_BEFORE + "(" + _HOUR_WORD_ALT + ")" + _BAJE)
 
 
+# English number words ("one PM", "two thirty in the evening", "half past
+# four"). A bare "one" is far too common a word to read as a time, so one of
+# am/pm, "o'clock", a part-of-day phrase, or half/quarter past/to must be there.
+_EN_HOURS = {w: n for w, n in _CARDINALS.items() if 1 <= n <= 12}
+_EN_HOUR_ALT = "|".join(sorted(_EN_HOURS, key=len, reverse=True))
+_EN_MINUTES = {
+    "oh five": 5, "five": 5, "ten": 10, "fifteen": 15, "twenty": 20,
+    "twenty five": 25, "thirty": 30, "thirty five": 35, "forty": 40,
+    "forty five": 45, "fifty": 50, "fifty five": 55,
+}
+_EN_MINUTE_ALT = "|".join(sorted((w.replace(" ", r"[\s-]") for w in _EN_MINUTES), key=len, reverse=True))
+_EN_MERIDIEM = r"(?:(a\.?m\.?|p\.?m\.?)(?![a-z])|o'?clock|(?:in the |at )?(morning|afternoon|evening|night))"
+_TIME_EN_WORDS = re.compile(
+    r"(?<![\w'])(" + _EN_HOUR_ALT + r")(?:[\s-]+(" + _EN_MINUTE_ALT + r"))?\s*" + _EN_MERIDIEM)
+_TIME_EN_FRACTION = re.compile(
+    r"\b(half past|quarter past|quarter to)\s+(" + _EN_HOUR_ALT + r"|\d{1,2})\b(?:\s*(a\.?m\.?|p\.?m\.?)(?![a-z]))?")
+
+
+def _en_meridiem(am_pm, part_of_day):
+    if am_pm:
+        return "am" if am_pm.startswith("a") else "pm"
+    if part_of_day == "morning":
+        return "am"
+    if part_of_day in ("afternoon", "evening", "night"):
+        return "pm"
+    return None   # "o'clock": no marker, so the hour is taken as said
+
+
+def _extract_english_time(normalized):
+    m = _TIME_EN_FRACTION.search(normalized)
+    if m:
+        phrase, token, am_pm = m.groups()
+        hour = int(token) if token.isdigit() else _EN_HOURS[token]
+        minutes = {"half past": 30, "quarter past": 15, "quarter to": 45}[phrase]
+        if phrase == "quarter to":
+            hour = 12 if hour == 1 else hour - 1
+        return _resolve_hour(hour, minutes, _en_meridiem(am_pm, None), normalized)
+    m = _TIME_EN_WORDS.search(normalized)
+    if m:
+        hour_word, minute_word, am_pm, part_of_day = m.groups()
+        minutes = _EN_MINUTES[re.sub(r"[\s-]+", " ", minute_word)] if minute_word else 0
+        return _resolve_hour(_EN_HOURS[hour_word], minutes, _en_meridiem(am_pm, part_of_day), normalized)
+    return None
+
+
 def _extract_worded_time(normalized):
     m = _TIME_FRACTION_WORD.search(normalized)
     if m:
@@ -353,7 +398,7 @@ def _extract_worded_time(normalized):
     m = _TIME_WORD_BAJE.search(normalized)
     if m:
         return _resolve_hour(_HOUR_WORDS[m.group(1)], 0, None, normalized)
-    return None
+    return _extract_english_time(normalized)
 
 
 def _resolve_hour(hour, minute, meridiem, normalized):

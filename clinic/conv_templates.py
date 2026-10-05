@@ -35,6 +35,45 @@ MSG = {
         "hi": "आपका स्वागत है। विकल्प देखने के लिए कभी भी 'हाय' लिखें।",
         "hinglish": "Aapka swagat hai. Options dekhne ke liye kabhi bhi 'hi' likhein.",
     },
+    # --- branches (only asked when the clinic has more than one) ---------
+    "ask_branch": {
+        "en": "Which branch would you like to visit?\nTap a branch below, or type your 6-digit PIN code to see the nearest first.",
+        "hi": "आप किस ब्रांच में आना चाहेंगे?\nनीचे से ब्रांच चुनें, या सबसे नज़दीकी देखने के लिए अपना 6 अंकों का पिन कोड लिखें।",
+        "hinglish": "Aap kis branch mein aana chahenge?\nNeeche se branch chunein, ya sabse najdeeki dekhne ke liye apna 6 digit PIN code likhein.",
+    },
+    "ask_branch_nearest": {
+        "en": "Here are our branches, nearest to PIN code {pin} first.\nTap the one you want.",
+        "hi": "पिन कोड {pin} के सबसे नज़दीक वाली ब्रांच पहले दिखाई गई हैं।\nजो चाहिए उसे चुनें।",
+        "hinglish": "PIN code {pin} ke sabse najdeek wali branch pehle dikhayi gayi hain.\nJo chahiye use chunein.",
+    },
+    "ask_branch_retry": {
+        "en": "Sorry, I couldn't tell which branch you meant. Tap one below, type its name, or type your 6-digit PIN code.",
+        "hi": "क्षमा करें, यह समझ नहीं आया कि आप कौन सी ब्रांच चाहते हैं। नीचे से चुनें, उसका नाम लिखें, या अपना 6 अंकों का पिन कोड लिखें।",
+        "hinglish": "Maaf kijiye, samajh nahi aaya aap kaun si branch chahte hain. Neeche se chunein, uska naam likhein, ya apna 6 digit PIN code likhein.",
+    },
+    "branch_no_slots": {
+        "en": "Sorry, {branch} has no free times in the next {days} days. Please choose another branch.",
+        "hi": "क्षमा करें, {branch} में अगले {days} दिनों में कोई खाली समय नहीं है। कृपया दूसरी ब्रांच चुनें।",
+        "hinglish": "Maaf kijiye, {branch} mein agle {days} dinon mein koi khaali time nahi hai. Kripya doosri branch chunein.",
+    },
+    # --- a closure moved the appointment (clinic/closure_notify.py); the patient tapped a button ---
+    "closure_accepted": {
+        "en": "Thank you. Your appointment is confirmed for {date} at {time}.",
+        "hi": "धन्यवाद। आपकी अपॉइंटमेंट {date} को {time} के लिए पक्की है।",
+        "hinglish": "Dhanyavaad. Aapki appointment {date} ko {time} ke liye pakki hai.",
+    },
+    "closure_choose_another": {
+        "en": "No problem, let's find another time for your appointment on {date} at {time}.",
+        "hi": "कोई बात नहीं, {date} को {time} की आपकी अपॉइंटमेंट के लिए दूसरा समय ढूँढते हैं।",
+        "hinglish": "Koi baat nahi, {date} ko {time} ki aapki appointment ke liye doosra time dhoondhte hain.",
+    },
+    "closure_gone": {
+        "en": "Sorry, I couldn't find that appointment change. It may already have been updated. What would you like to do?",
+        "hi": "क्षमा करें, वह बदलाव नहीं मिला। शायद वह पहले ही अपडेट हो चुका है। आप क्या करना चाहेंगे?",
+        "hinglish": "Maaf kijiye, woh badlaav nahi mila. Shayad woh pehle hi update ho chuka hai. Aap kya karna chahenge?",
+    },
+    "where_branch": {"en": "Branch: {branch}", "hi": "ब्रांच: {branch}", "hinglish": "Branch: {branch}"},
+    "where_doctor": {"en": "Doctor: {doctor}", "hi": "डॉक्टर: {doctor}", "hinglish": "Doctor: {doctor}"},
     # --- booking questions -----------------------------------------------
     "ask_name": {
         "en": "Sure. May I have the patient's name for the booking?",
@@ -256,6 +295,16 @@ BTN = {
     "no": {"en": "No", "hi": "नहीं", "hinglish": "Nahi"},
     "choose_time": {"en": "Choose time", "hi": "समय चुनें", "hinglish": "Time chunein"},
     "choose": {"en": "Choose", "hi": "चुनें", "hinglish": "Chunein"},
+    "choose_branch": {"en": "Choose branch", "hi": "ब्रांच चुनें", "hinglish": "Branch chunein"},
+}
+
+# Short notes shown under a branch in the "Which branch?" list (<= 72 chars with the address).
+ROW_NOTE = {
+    "last_visit": {"en": "Your last visit", "hi": "आपकी पिछली विज़िट", "hinglish": "Aapki pichhli visit"},
+    "your PIN code": {"en": "Your PIN code area", "hi": "आपके पिन कोड का इलाका", "hinglish": "Aapke PIN code ka ilaaka"},
+    "very close": {"en": "Very close", "hi": "बहुत नज़दीक", "hinglish": "Bahut najdeek"},
+    "close by": {"en": "Close by", "hi": "पास में", "hinglish": "Paas mein"},
+    "nearby": {"en": "Nearby", "hi": "आस-पास", "hinglish": "Aas-paas"},
 }
 
 DAY_WORDS = {
@@ -279,6 +328,10 @@ def greet(language, name=None):
 
 def text(key, language, **values):
     return MSG[key][norm_lang(language)].format(**values)
+
+
+def row_note(key, language):
+    return ROW_NOTE[key][norm_lang(language)]
 
 
 def button(key, language):

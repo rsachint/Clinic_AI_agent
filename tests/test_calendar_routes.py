@@ -166,23 +166,6 @@ class NotConfiguredTests(CalendarRouteCase):
         self.assertFalse(response.get_json()["ok"])
         self.assertEqual(self.queue_rows(), [])
 
-    def test_dashboard_shows_setup_steps_and_no_live_iframe(self):
-        html = self.client.get("/").get_data(as_text=True)
-        self.assertIn('data-tab="appointments"', html)
-        self.assertIn("Set up the Google Calendar connection", html)
-        for needle in ("Google Calendar API", "service account", "JSON key", "clinic-demo@example.com",
-                       "Make changes to events", "GOOGLE_SERVICE_ACCOUNT_FILE", "Restart the app"):
-            self.assertIn(needle, html)
-        self.assertIn("Appointments are not being copied to Google Calendar", html)
-        self.assertIn("Not configured", html)
-        self.assertNotIn("Configured &middot;", html)
-        self.assertNotIn('id="cal-sync-btn"\n', html)
-        self.assertIn('id="cal-sync-btn" disabled', html)
-        # The viewer is tucked behind "View the calendar anyway" and never loads by itself.
-        self.assertIn("View the calendar anyway", html)
-        self.assertNotIn(' src="https://calendar.google.com', html)
-        self.assertIn("will <strong>not</strong> contain clinic appointments", html)
-
     def test_status_partial(self):
         html = self.client.get("/calendar/status/partial").get_data(as_text=True)
         self.assertIn("Not configured", html)
@@ -190,26 +173,13 @@ class NotConfiguredTests(CalendarRouteCase):
 
 
 class ConfiguredPanelTests(CalendarRouteCase):
-    def test_dashboard_shows_the_viewer_buttons_and_honest_notes(self):
-        html = self.client.get("/").get_data(as_text=True)
-        self.assertNotIn("Set up the Google Calendar connection", html)
-        self.assertIn("Configured", html)
-        self.assertIn("waiting for the first sync", html)
-        for mode in ("week", "month", "agenda"):
-            self.assertIn('data-cal-mode="{}"'.format(mode), html)
-        for needle in ("calendar.google.com/calendar/embed?src=clinic-demo%40example.com", "ctz=Asia%2FKolkata",
-                       "mode=WEEK", "mode=MONTH", "mode=AGENDA", "Open in Google Calendar", "Sync now",
-                       "One-way sync", "not copied back", "Do not make the calendar public",
-                       "signed in to a Google account", "Week, Month and Agenda only", "T-04 · Sunita D."):
-            self.assertIn(needle, html)
-        # lazy: nothing points the iframe at Google until the tab is opened
-        self.assertNotIn(' src="https://calendar.google.com', html)
-        self.assertNotIn("data-src-week=\"\"", html)
-
-    def test_connectors_tab_reflects_the_real_state(self):
+    def test_google_sync_is_hidden_from_the_page_even_when_configured(self):
+        # The Appointments tab is the in-app calendar now; the Google integration is dormant.
         html = self.client.get("/").get_data(as_text=True)
         calendar_card = html.split("Google Calendar</div>")[1].split("connector-desc")[0]
-        self.assertIn("is-configured", calendar_card)
+        self.assertNotIn("is-configured", calendar_card)
+        self.assertNotIn("cal-frame", html)
+        self.assertNotIn("calendar.google.com", html)
 
     def test_status_partial_reports_pending_last_sync_and_errors(self):
         self.client.post("/calendar/sync")                          # ran inline: synced
@@ -264,18 +234,6 @@ class SyncNowTests(CalendarRouteCase):
         clinic_app.GCAL_CLIENT = None
         with mock.patch.object(gcal_client, "get_client", return_value=None):
             clinic_app._gcal_drain_job()                          # must not raise
-
-
-class StaleAppTests(CalendarRouteCase):
-    def test_a_template_newer_than_the_running_app_still_renders(self):
-        # Templates reload on every request but app.py only on restart, so an
-        # app started before this feature must not 500 on the new dashboard.
-        with mock.patch.object(clinic_app, "calendar_panel_context", return_value={}):
-            response = self.client.get("/")
-        self.assertEqual(response.status_code, 200)
-        html = response.get_data(as_text=True)
-        self.assertIn("Restart the app to enable the Appointments tab", html)
-        self.assertIn("not configured", html)       # the Connectors card falls back too
 
 
 class NoRealGoogleTests(unittest.TestCase):

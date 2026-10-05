@@ -15,6 +15,7 @@ and edits to a card that is still waiting for that approval.
 
 import uuid
 
+from clinic import branches, voice_branch
 from clinic.nlu.classify import classify
 from clinic.nlu.llm_slots import extract_name
 from clinic.pipeline import ParsedResult, PipelineError, respond_to_intent, transcript_to_response
@@ -51,7 +52,10 @@ def handle_pick(ctx, conn, index, clinical_adapter, ops_adapter, language="hi-IN
     option = pending["options"][index]
     ctx.pending = None
     slots = dict(pending["slots"])
-    slots["patient_name"] = option["patient_name"]
+    if pending["kind"] == "branch":
+        slots["branch_id"] = option["branch_id"]
+    else:
+        slots["patient_name"] = option["patient_name"]
     result = _continue(ctx, conn, pending["intent"], slots, option["label"], clinical_adapter, ops_adapter,
                        language, defer_intents, pending["skipped"])
     _remember(ctx, result)
@@ -71,7 +75,7 @@ def _route(ctx, conn, text, clinical_adapter, ops_adapter, language, defer_inten
             return answered
         ctx.pending = None  # not an answer: it is a new command
 
-    edit = _try_card_edit(ctx, text)
+    edit = _try_card_edit(ctx, conn, text)
     if edit is not None:
         return edit
 
@@ -121,6 +125,11 @@ def _answer_pending(ctx, conn, text, clinical_adapter, ops_adapter, language, de
             slots["patient_name"] = name  # a new, unregistered patient
         else:
             return _ask_again(ctx, pending, language, "I couldn't find {}. ".format(name))
+    elif kind == "branch":
+        named = voice_branch.find(conn, text, bare=True).branch
+        if named is None:
+            return _ask_again(ctx, pending, language)
+        slots["branch_id"] = named["id"]
     elif kind == "choose_patient":
         index = pick_option(text, pending["options"])
         if index is None:
@@ -181,18 +190,25 @@ def _heard_name(text):
         return None
 
 
-def _try_card_edit(ctx, text):
+def _try_card_edit(ctx, conn, text):
     card = ctx.open_card
     if not card:
         return None
     rules = classify(text)
     if rules is not None and not (rules == card["intent"] and looks_like_edit(text)):
         return None  # a different command, or a fresh one of the same kind
+    branch = None
+    if card["intent"] in ("book_appointment", "reschedule_appointment"):
+        mention = voice_branch.find(conn, text)
+        branch, text = mention.branch, mention.text      # "make it Branch C" changes the branch field
     changes = extract_card_edits(card["intent"], text)
+    if branch:
+        changes["branch_id"] = branch["id"]
     if not changes:
         return None
     card["slots"].update(changes)
-    return CardUpdate(card["card_id"], card["intent"], changes, describe_edits(changes))
+    shown = dict(changes, **({"branch_id": branch["name"]} if branch else {}))
+    return CardUpdate(card["card_id"], card["intent"], changes, describe_edits(shown))
 
 
 # -- keeping the context current ------------------------------------------

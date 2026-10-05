@@ -71,7 +71,7 @@ def _appointment_label(row):
 
 def _appointment_info(conn, appointment_id):
     return conn.execute(
-        "SELECT a.id, a.patient_id, a.appt_date, a.start_time, a.status, "
+        "SELECT a.id, a.patient_id, a.appt_date, a.start_time, a.status, a.branch_id, "
         "COALESCE(p.name, a.patient_name) AS name FROM appointments a "
         "LEFT JOIN patients p ON p.id = a.patient_id WHERE a.id = ?", (appointment_id,)).fetchone()
 
@@ -131,7 +131,7 @@ def _request_detail(conn, intent, slots):
 
 
 def _slot_meta(slots):
-    return {k: slots[k] for k in ("appt_date", "start_time", "appointment_id") if slots.get(k) is not None}
+    return {k: slots[k] for k in ("appt_date", "start_time", "appointment_id", "branch_id") if slots.get(k) is not None}
 
 
 def _not_auto(conn, decision, intent, slots, wa_id, patient_id, patient_name, now, meta):
@@ -153,6 +153,10 @@ def _not_auto(conn, decision, intent, slots, wa_id, patient_id, patient_name, no
 def _commit(conn, intent, slots, wa_id, patient_id, patient_name, msg_id, now, handlers, after_commit, meta,
             source_note, language):
     handler_slots = {k: v for k, v in slots.items() if k not in ("agent_note",)}
+    # Nobody reviewed this booking, so it may write the appointment and nothing
+    # else: it does not register the sender as a patient (a staff-approved
+    # booking does).
+    handler_slots["unattended"] = True
     before = None
     if intent != "book_appointment":
         handler_slots["require_active"] = True
@@ -199,7 +203,8 @@ def _commit(conn, intent, slots, wa_id, patient_id, patient_name, msg_id, now, h
         detail = "Moved {} to {} {}".format(
             _appointment_label(before) if before else "appointment", slots["appt_date"], slots["start_time"])
         if before is not None:
-            activity_meta.update(old_date=before["appt_date"], old_time=before["start_time"])
+            activity_meta.update(old_date=before["appt_date"], old_time=before["start_time"],
+                                 old_branch_id=before["branch_id"])
     # Written while still holding the commit lock, so the daily-cap counter
     # (which reads this table) can never lag behind a booking that happened.
     patient_activity.log(
@@ -355,6 +360,9 @@ def undo(conn, activity_id, handlers, after_commit, now):
             intent = "reschedule_appointment"
             slots = {"appointment_id": appointment_id, "appt_date": meta["old_date"], "start_time": meta["old_time"],
                      "require_active": True}
+            if meta.get("old_branch_id"):      # the move also changed branch: put it back there
+                slots["branch_id"] = meta["old_branch_id"]
+                slots["restore"] = True        # back where it was, even if that was outside the doctor's hours
             done = "Reschedule undone -- the appointment is back in its original slot and the patient was told."
 
         # Claim the entry first: a second click (or a second browser) loses here.

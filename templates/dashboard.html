@@ -13,6 +13,10 @@
       <h1>🏥 Clinic Copilot</h1>
       <div class="date">{{ today }}</div>
     </div>
+    <div class="branch-switcher" id="branch-switcher-box" hidden>
+      <label for="branch-switcher">Viewing</label>
+      <select id="branch-switcher" aria-label="Branch to view"></select>
+    </div>
     <ul class="nav-tabs" id="nav-tabs"><!-- filled in by static/nav.js from the NAV_TABS array --></ul>
   </nav>
 
@@ -72,6 +76,7 @@
             </label>
             <label class="new-appt-unreg">Name <input type="text" id="new-appt-name" maxlength="60" placeholder="Patient name"></label>
             <label class="new-appt-unreg">Phone <input type="tel" id="new-appt-phone" maxlength="15" placeholder="10-digit mobile"></label>
+            <label class="branch-field" hidden>Branch <select id="new-appt-branch"></select></label>
             <label>Date <input type="date" id="new-appt-date" value="{{ queue_today }}" min="{{ queue_today }}"></label>
             <label>Time
               <select id="new-appt-time"><option value="">Pick a date first</option></select>
@@ -88,6 +93,7 @@
       <div class="card" id="move-appt" hidden>
         <div class="mini-form-title" id="move-appt-title">Move appointment</div>
         <div class="appt-form-grid">
+          <label class="branch-field" hidden>Branch <select id="move-appt-branch"></select></label>
           <label>New date <input type="date" id="move-appt-date" min="{{ queue_today }}"></label>
           <label>New time <select id="move-appt-time"></select></label>
         </div>
@@ -134,6 +140,8 @@
         <p class="muted auto-help">Block a day, several days, or a time range on those days -- the doctor is away, the clinic is being renovated. Patients are never offered blocked times, and nobody can be booked into them without a confirmed override. Appointments that already exist are <strong>not</strong> touched; they are listed so you can handle them.</p>
         <form id="block-form" class="appt-form" autocomplete="off">
           <div class="appt-form-grid">
+            <label class="branch-field" hidden>Branch <select id="block-branch"></select></label>
+            <label class="branch-field" hidden>Doctor <select id="block-doctor"></select></label>
             <label>From <input type="date" id="block-start-date" required></label>
             <label>To <input type="date" id="block-end-date" required></label>
             <label>Start time <input type="time" id="block-start-time"></label>
@@ -149,6 +157,31 @@
         <div id="blocks-list"><p class="muted">No blocks.</p></div>
       </div>
 
+      <div class="card" id="closures-card" hidden>
+        <h2>Close a branch <span class="count">(and move its patients)</span></h2>
+        <p class="muted auto-help">The doctor is ill, or a branch must shut for a few days. This stops new bookings in that window <strong>and</strong> proposes a new branch and time for every patient already booked, all in one batch. You review and change each row, then apply: the moves are saved, and each patient is told on WhatsApp and can Accept or Choose another. The whole closure can be undone.</p>
+        <form id="closure-form" class="appt-form" autocomplete="off">
+          <div class="appt-form-grid">
+            <label>Branch <select id="closure-branch" required></select></label>
+            <label>Who <select id="closure-doctor"></select></label>
+            <label>From <input type="date" id="closure-start-date" required></label>
+            <label>To <input type="date" id="closure-end-date"></label>
+            <label>Start time <input type="time" id="closure-start-time"></label>
+            <label>End time <input type="time" id="closure-end-time"></label>
+          </div>
+          <div class="appt-form-grid">
+            <label class="block-reason-label">Reason <input type="text" id="closure-reason" maxlength="200" placeholder="e.g. Doctor on leave"></label>
+            <label class="block-reason-label">Message to patients <input type="text" id="closure-message" maxlength="300" placeholder="optional"></label>
+          </div>
+          <div class="muted auto-help">Leave both times empty to close whole days.</div>
+          <div class="appt-form-actions"><button type="submit" class="btn-confirm">Review patients</button></div>
+          <div id="closure-error" class="field-note" hidden></div>
+        </form>
+        <div id="closure-review"></div>
+        <h3 class="closure-history-head">Past closures</h3>
+        <div id="closures-list"><p class="muted">No closures yet.</p></div>
+      </div>
+
       <div class="card" id="feed-card">
         <h2>Automated actions <span class="count" id="feed-count"></span></h2>
         <div class="feed-search">
@@ -160,77 +193,24 @@
     </section>
 
     <section class="tab-panel" data-tab="appointments" hidden>
-      {% if cal is not defined %}
-      {# Templates reload on every request, but app.py only changes on a restart:
-         an app started before this tab existed has no `cal` context yet. #}
-      <div class="card"><p class="muted">Restart the app to enable the Appointments tab.</p></div>
-      {% else %}
-      {% macro cal_modes() %}
-      <div class="cal-modes" role="group" aria-label="Calendar view">
-        <button type="button" class="btn-queue cal-mode-btn" data-cal-mode="week">Week</button>
-        <button type="button" class="btn-queue cal-mode-btn" data-cal-mode="month">Month</button>
-        <button type="button" class="btn-queue cal-mode-btn" data-cal-mode="agenda">Agenda</button>
-      </div>
-      {% endmacro %}
-      {% macro cal_frame() %}
-      <iframe id="cal-frame" class="cal-frame" title="Google Calendar"
-              data-src-week="{{ cal.embed_urls.week }}"
-              data-src-month="{{ cal.embed_urls.month }}"
-              data-src-agenda="{{ cal.embed_urls.agenda }}"
-              data-default-mode="{{ cal.default_mode }}"></iframe>
-      {% endmacro %}
-
-      <div class="card cal-card" id="calendar-panel">
-        <h2>Appointments <span class="count">(Google Calendar · {{ cal.calendar_id }})</span></h2>
-        <div id="calendar-status">{% include "_calendar_status.html" %}</div>
-        <div id="cal-flash" class="flash" hidden></div>
-
-        {% if cal.status.configured %}
-        <div class="cal-toolbar">
-          {{ cal_modes() }}
-          <div class="cal-actions">
-            <button type="button" class="btn-queue btn-queue-primary" id="cal-sync-btn">Sync now</button>
-            <a class="btn-queue cal-link" href="{{ cal.open_url }}" target="_blank" rel="noopener">Open in Google Calendar ↗</a>
+      <div class="card cal-card" id="calendar-panel" data-today="{{ today }}">
+        <div class="cv-toolbar">
+          <div class="cv-nav">
+            <button type="button" class="btn-queue" id="cv-prev" aria-label="Previous">&lsaquo;</button>
+            <button type="button" class="btn-queue" id="cv-today">Today</button>
+            <button type="button" class="btn-queue" id="cv-next" aria-label="Next">&rsaquo;</button>
+            <span class="cv-title" id="cv-title"></span>
           </div>
-        </div>
-        {{ cal_frame() }}
-        {% else %}
-        <div class="cal-setup">
-          <h3>Set up the Google Calendar connection</h3>
-          <ol>
-            <li>In the <strong>Google Cloud Console</strong>, create a project (or pick an existing one).</li>
-            <li>Enable the <strong>Google Calendar API</strong> for that project (APIs &amp; Services → Library).</li>
-            <li>Create a <strong>service account</strong> (IAM &amp; Admin → Service Accounts), then add a <strong>JSON key</strong> to it and download the file. Keep it private: anyone with it can edit the calendar.</li>
-            <li>In Google Calendar, open <strong>Settings and sharing</strong> for <code>{{ cal.calendar_id }}</code> and share it with the service account's email address (the <code>client_email</code> in the JSON key, like <code>name@project.iam.gserviceaccount.com</code>) with the permission <strong>Make changes to events</strong>.</li>
-            <li>Put the JSON key file somewhere safe on this computer and add its full path to the <code>.env</code> file: <code>GOOGLE_SERVICE_ACCOUNT_FILE=/full/path/to/key.json</code></li>
-            <li><strong>Restart the app.</strong> This tab will then say "Configured" and appointments are copied within about a minute (or press Sync now).</li>
-          </ol>
-          <div class="cal-toolbar">
-            <div class="cal-actions">
-              <button type="button" class="btn-queue" id="cal-sync-btn" disabled title="Finish the setup above first">Sync now</button>
-              <a class="btn-queue cal-link" href="{{ cal.open_url }}" target="_blank" rel="noopener">Open in Google Calendar ↗</a>
-            </div>
+          <div class="cv-modes" role="group" aria-label="Calendar view">
+            <button type="button" class="btn-queue cal-mode-btn" data-cal-mode="week">Week</button>
+            <button type="button" class="btn-queue cal-mode-btn" data-cal-mode="month">Month</button>
+            <button type="button" class="btn-queue cal-mode-btn" data-cal-mode="agenda">Agenda</button>
           </div>
+          <label class="cv-branch">Branch <select id="cv-branch" aria-label="Branch shown in the calendar"></select></label>
         </div>
-        <details class="cal-preview" id="cal-preview">
-          <summary>View the calendar anyway</summary>
-          <p class="muted cal-preview-note">This shows whatever is on the calendar now. It will <strong>not</strong> contain clinic appointments until the sync above is set up.</p>
-          {{ cal_modes() }}
-          {{ cal_frame() }}
-        </details>
-        {% endif %}
+        <div id="cv-legend" class="cv-legend"></div>
+        <div id="cv-body" class="cv-body"></div>
       </div>
-
-      <div class="card cal-notes">
-        <h2>Good to know</h2>
-        <ul>
-          <li><strong>One-way sync.</strong> The app copies appointments <em>into</em> the calendar. Changes made directly in Google Calendar are not copied back, and are put back to match the app at the next sync.</li>
-          <li><strong>Minimal events.</strong> Each event shows only the token, the patient's first name and last initial, and the time slot (for example "T-04 · Sunita D."). No phone number, age, reason or notes ever go to Google. A token can change when someone books or cancels earlier in the day; the titles update too.</li>
-          <li><strong>Private calendar.</strong> The calendar above only shows in a browser that is signed in to a Google account with access to it; otherwise Google shows its own sign-in screen. Do not make the calendar public: it holds patient-related information.</li>
-          <li><strong>Views.</strong> The embedded Google calendar offers Week, Month and Agenda only (no Day, Quarter or Year). Times are in {{ cal.timezone }}.</li>
-        </ul>
-      </div>
-      {% endif %}
     </section>
 
     <section class="tab-panel" data-tab="patients" hidden>
@@ -359,7 +339,13 @@
          same NAV_TABS + tab-panel mechanism as the real tabs, to prove the
          nav is a one-entry-plus-one-section extension point. -->
     <section class="tab-panel" data-tab="settings" hidden>
-      <div class="card"><p class="muted">Coming soon.</p></div>
+      <div id="settings-flash" class="flash" hidden></div>
+      <div class="card" id="settings-this-computer">
+        <h2>This computer</h2>
+        <p class="muted">Which branch you work at. It sets what the Queue and Appointments tabs show first, and where voice bookings go when you don't name a branch. It is remembered on this browser only.</p>
+        <label>My branch <select id="my-branch"></select></label>
+      </div>
+      <div id="settings-branches"></div>
     </section>
     <section class="tab-panel" data-tab="profile" hidden>
       <div class="card"><p class="muted">Coming soon.</p></div>
@@ -375,8 +361,10 @@
 <script id="staff-data" type="application/json">{{ staff_json|safe }}</script>
 <script id="wa-inbox-data" type="application/json">{{ wa_inbox_json|safe }}</script>
 <script id="wa-threads-data" type="application/json">{{ wa_threads_json|safe }}</script>
+<script id="branches-data" type="application/json">{{ branches_json|safe }}</script>
 <script src="{{ url_for('static', filename='vendor/socket.io.min.js') }}"></script>
 <script src="{{ url_for('static', filename='time.js') }}"></script>
+<script src="{{ url_for('static', filename='branches.js') }}"></script>
 <script src="{{ url_for('static', filename='review_card.js') }}"></script>
 <script src="{{ url_for('static', filename='wa_inbox.js') }}"></script>
 <script src="{{ url_for('static', filename='wa_threads.js') }}"></script>
@@ -384,7 +372,9 @@
 <script src="{{ url_for('static', filename='queue.js') }}"></script>
 <script src="{{ url_for('static', filename='queue_edit.js') }}"></script>
 <script src="{{ url_for('static', filename='automation.js') }}"></script>
-<script src="{{ url_for('static', filename='calendar.js') }}"></script>
+<script src="{{ url_for('static', filename='closures.js') }}"></script>
+<script src="{{ url_for('static', filename='calendar_view.js') }}"></script>
+<script src="{{ url_for('static', filename='settings_branches.js') }}"></script>
 <script src="{{ url_for('static', filename='live_voice.js') }}"></script>
 <script src="{{ url_for('static', filename='nav.js') }}"></script>
 </body>

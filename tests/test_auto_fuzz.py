@@ -145,7 +145,7 @@ class AutoFuzzTests(unittest.TestCase):
     def stale_once(real):
         calls = {"n": 0}
 
-        def fake(conn, iso, now, for_wa_id=None):
+        def fake(conn, iso, now, for_wa_id=None, branch_id=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 return [t for t in cv._slot_starts() if iso > now.date().isoformat() or t > now.strftime("%H:%M")]

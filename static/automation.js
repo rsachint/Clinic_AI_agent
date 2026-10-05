@@ -88,7 +88,10 @@ document.addEventListener("DOMContentLoaded", function () {
   // --- blocks -------------------------------------------------------------
   function describeBlock(b) {
     var days = b.start_date === b.end_date ? b.start_date : b.start_date + " to " + b.end_date;
-    return b.start_time ? days + ", " + b.start_time + "-" + b.end_time : days + " (whole day)";
+    var when = b.start_time ? days + ", " + b.start_time + "-" + b.end_time : days + " (whole day)";
+    if (b.branch) when += " at " + b.branch;
+    if (b.doctor) when += " for " + b.doctor;
+    return when;
   }
 
   function affectedList(affected) {
@@ -137,8 +140,29 @@ document.addEventListener("DOMContentLoaded", function () {
       start_time: document.getElementById("block-start-time").value,
       end_time: document.getElementById("block-end-time").value,
       reason: document.getElementById("block-reason").value,
+      branch_id: blockBranch && blockBranch.value ? parseInt(blockBranch.value, 10) : null,
+      doctor_id: blockDoctor && blockDoctor.value ? parseInt(blockDoctor.value, 10) : null,
     };
   }
+
+  // Who a block applies to: every branch / doctor, or one of them.
+  var blockBranch = document.getElementById("block-branch");
+  var blockDoctor = document.getElementById("block-doctor");
+  function fillBlockScope() {
+    if (!window.Branches || !blockBranch || !blockDoctor) return;
+    [blockBranch, blockDoctor].forEach(function (select) { var l = select.closest(".branch-field"); if (l) l.hidden = !Branches.multi(); });
+    var chosenBranch = blockBranch.value, chosenDoctor = blockDoctor.value;
+    blockBranch.innerHTML = "";
+    blockBranch.appendChild(el("option", { value: "", text: "All branches" }));
+    Branches.list().forEach(function (b) { blockBranch.appendChild(el("option", { value: b.id, text: b.name })); });
+    blockDoctor.innerHTML = "";
+    blockDoctor.appendChild(el("option", { value: "", text: "All doctors" }));
+    (Branches.data().doctors || []).forEach(function (d) { blockDoctor.appendChild(el("option", { value: d.id, text: d.name })); });
+    blockBranch.value = chosenBranch; blockDoctor.value = chosenDoctor;
+  }
+  document.addEventListener("branchdata", fillBlockScope);
+  document.addEventListener("DOMContentLoaded", fillBlockScope);
+  fillBlockScope();
 
   var pendingBlock = null;   // a block waiting for "Add anyway" after the existing-appointments warning
 

@@ -77,6 +77,7 @@ var ReviewCard = (function () {
       { key: "patient_id", label: "Existing patient (if registered)", type: "patient" },
       { key: "patient_name", label: "Patient name (if not registered)", type: "text" },
       { key: "patient_phone", label: "Patient phone (if not registered)", type: "text" },
+      { key: "branch_id", label: "Branch", type: "branch" },
       { key: "appt_date", label: "Date (YYYY-MM-DD)", type: "text" },
       { key: "start_time", label: "Start time (HH:MM)", type: "text" },
       { key: "notes", label: "Notes", type: "text" },
@@ -86,6 +87,7 @@ var ReviewCard = (function () {
     ],
     reschedule_appointment: [
       { key: "appointment_id", label: "Appointment", type: "appointment" },
+      { key: "branch_id", label: "Move to branch", type: "branch", keep: true },
       { key: "appt_date", label: "New date (YYYY-MM-DD)", type: "text" },
       { key: "start_time", label: "New start time (HH:MM)", type: "text" },
     ],
@@ -118,6 +120,10 @@ var ReviewCard = (function () {
 
   function buildFieldInput(spec, slots, resolved, context) {
     var wrap = el("div", { class: "field-row" });
+    if (spec.type === "branch" && !(window.Branches && Branches.multi())) {
+      // One branch: nothing to choose, but keep whatever the request carried.
+      return el("input", { type: "hidden", "data-key": spec.key, value: slots[spec.key] == null ? "" : slots[spec.key] });
+    }
     wrap.appendChild(el("label", { text: spec.label }));
 
     if (spec.type === "patient" || spec.type === "staff") {
@@ -132,6 +138,24 @@ var ReviewCard = (function () {
         select.appendChild(opt);
       });
       wrap.appendChild(select);
+    } else if (spec.type === "branch") {
+      // The branch the request names (a patient's WhatsApp choice, or a
+      // spoken one); otherwise My branch, shown so staff can change it.
+      var branchSelect = el("select", { "data-key": spec.key });
+      var named = slots[spec.key] != null && slots[spec.key] !== "";
+      // A move keeps the appointment's own branch unless another is chosen.
+      var chosen = named ? slots[spec.key] : (spec.keep ? "" : Branches.mine());
+      if (spec.keep) {
+        var keepOpt = el("option", { value: "" }, [document.createTextNode("Same branch as now")]);
+        if (chosen === "") keepOpt.setAttribute("selected", "selected");
+        branchSelect.appendChild(keepOpt);
+      }
+      Branches.list().forEach(function (b) {
+        var opt = el("option", { value: b.id }, [document.createTextNode(b.name)]);
+        if (String(chosen) === String(b.id)) opt.setAttribute("selected", "selected");
+        branchSelect.appendChild(opt);
+      });
+      wrap.appendChild(branchSelect);
     } else if (spec.type === "followup") {
       var fuSelect = el("select", { "data-key": spec.key });
       var followups = (context && context.followups) || [];
@@ -189,7 +213,7 @@ var ReviewCard = (function () {
       var raw = fieldEl.value;
       if (spec.type === "number") {
         slots[spec.key] = raw === "" ? null : parseFloat(raw);
-      } else if (spec.type === "patient" || spec.type === "staff" || spec.type === "followup" || spec.type === "appointment") {
+      } else if (spec.type === "patient" || spec.type === "staff" || spec.type === "followup" || spec.type === "appointment" || spec.type === "branch") {
         slots[spec.key] = raw === "" ? null : parseInt(raw, 10);
       } else {
         slots[spec.key] = raw === "" ? null : raw;

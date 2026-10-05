@@ -39,6 +39,12 @@ def _patient_lookup_text(data, lang):
 
 
 def _check_availability_text(data, lang):
+    if isinstance(data, list):       # "all branches": one row per branch
+        parts = ["{}: {}".format(row["branch"], row["free_slots"]) for row in data]
+        date_str = data[0]["date"] if data else ""
+        if lang == "hi-IN":
+            return "{} ko khaali slot - {}.".format(date_str, "; ".join(parts))
+        return "Free slots on {} - {}.".format(date_str, "; ".join(parts))
     date_str = data["date"]
     slots = data["slots"]
     if not slots:
@@ -53,6 +59,19 @@ def _check_availability_text(data, lang):
     if lang == "hi-IN":
         return "{} ko {} slot khaali hain.".format(date_str, count)
     return "{} free slots on {}.".format(count, date_str)
+
+
+def _patient_count_text(data, lang):
+    total, week, today = data["total_patients"], data["added_this_week"], data["added_today"]
+    if lang == "hi-IN":
+        text = "Total {} patient registered hain".format(total)
+        if week:
+            text += ", jinme se {} is hafte jude (aaj {})".format(week, today)
+        return text + "."
+    text = "{} patient{} registered".format(total, "" if total == 1 else "s")
+    if week:
+        text += " ({} added in the last 7 days, {} today)".format(week, today)
+    return text + "."
 
 
 def _list_appointments_text(data, lang, scope=None, name=None):
@@ -96,6 +115,9 @@ def _next_appointment_text(data, lang):
 
 
 def _queue_status_text(data, lang):
+    if isinstance(data, list):       # "all branches": one entry per branch
+        parts = ["{}: {}".format(row["branch"], _queue_status_text(row, lang)) for row in data]
+        return " ".join(parts)
     if not data["total_today"]:
         return "Aaj koi appointment nahi hai." if lang == "hi-IN" else "No appointments today."
     serving, nxt, waiting = data["now_serving"], data["next_up"], data["waiting"]
@@ -117,6 +139,7 @@ _COMPOSERS = {
     "missed_followups": _missed_followups_text,
     "day_end_cashbook": _day_end_cashbook_text,
     "patient_lookup": _patient_lookup_text,
+    "patient_count": _patient_count_text,
     "check_availability": _check_availability_text,
     "list_appointments": _list_appointments_text,
     "next_appointment": _next_appointment_text,
@@ -135,7 +158,12 @@ def compose_navigation(intent, mode, language_code):
     return "Opening the Appointments calendar{}.".format(view)
 
 
-def compose_answer(intent, data, citation, language_code, scope=None, name=None):
+def _with_branch(body, branch):
+    """'3 appointment(s) on Mon 5 Oct.' -> '3 appointment(s) on Mon 5 Oct (Branch B).'"""
+    return "{} ({}).".format(body.rstrip("."), branch) if branch else body
+
+
+def compose_answer(intent, data, citation, language_code, scope=None, name=None, branch=None):
     # Binary for now: Hindi or English body text. Bulbul itself only speaks
     # 11 languages (clinic/tts.py); this keeps the two in sync rather than
     # trying to support every Saaras-detected code here.
@@ -145,4 +173,4 @@ def compose_answer(intent, data, citation, language_code, scope=None, name=None)
     else:
         body = _COMPOSERS[intent](data, lang)
     tail = " Source: {}, {}.".format(citation.source, citation.as_of)
-    return body + tail
+    return _with_branch(body, branch) + tail

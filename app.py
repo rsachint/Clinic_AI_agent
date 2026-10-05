@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
 from flask_socketio import SocketIO
 
-from clinic import (auto_actions, booking_blocks, conv_runtime, conversation, core, gcal_client, gcal_config,
+from clinic import (auto_actions, booking_blocks, branches, closures, conv_runtime, conversation, core, gcal_client, gcal_config,
                     gcal_sync, notify, patient_activity, scheduler, scheduling, settings, token_queue, whatsapp as wa)
 from clinic.adapters.registry import build_write_handlers, get_adapters
 from clinic.asr import transcribe
@@ -117,6 +117,22 @@ def _json_for_script(value):
 register_realtime_voice(socketio, os.environ.get("SARVAM_API_KEY", ""), get_conn, CLINICAL_ADAPTER, OPS_ADAPTER, DEFERRED_INTENTS)
 
 
+def _registered_suffix(conn, slots, appointment_id):
+    """' -- registered as a new patient' when this booking created the patient record."""
+    if slots.get("patient_id") or not appointment_id:
+        return ""
+    row = conn.execute("SELECT payload_json FROM audit_log WHERE entity_type = 'appointment' AND entity_id = ? "
+                       "ORDER BY id DESC LIMIT 1", (appointment_id,)).fetchone()
+    try:
+        created = json.loads(row["payload_json"]).get("registered_patient_id") if row else None
+    except (ValueError, TypeError):
+        created = None
+    if not created:
+        return ""
+    patient = conn.execute("SELECT name FROM patients WHERE id = ?", (created,)).fetchone()
+    return " -- {} registered as a new patient".format(patient["name"] if patient else "patient")
+
+
 def _token_suffix(conn, appointment_id):
     """' Token T-04' (or ' Token T-07 (provisional)' for a future date) for an
     appointment, or '' if it has none. Read-only, deterministic."""
@@ -160,8 +176,10 @@ def describe_proposal(conn, intent, slots, entity_id=None):
             label = "{} ({})".format(patient["name"], patient["phone"]) if patient else "patient #{}".format(slots["patient_id"])
         else:
             label = slots.get("patient_name") or slots.get("patient_phone") or "unregistered caller"
-        return "appointment for {} on {} at {}{}".format(
-            label, slots.get("appt_date"), slots.get("start_time"), _token_suffix(conn, entity_id)
+        where = " at {}".format(branches.branch_label(conn, slots.get("branch_id"))) if branches.multi_branch(conn) else ""
+        return "appointment for {} on {} at {}{}{}{}".format(
+            label, slots.get("appt_date"), slots.get("start_time"), where, _token_suffix(conn, entity_id),
+            _registered_suffix(conn, slots, entity_id),
         )
     if intent in ("cancel_appointment", "reschedule_appointment"):
         appointment = conn.execute(
@@ -303,17 +321,56 @@ def _valid_day(text):
         return None
 
 
-def queue_panel_context(conn, day=None):
+def branch_context(conn):
+    """Branches, doctors and schedules for the page (the branch switcher, the
+    New / Move forms and Settings -> Branches)."""
+    branch_list = branches.list_branches(conn)
+    return {
+        "branches": branch_list,
+        "default_branch_id": branches.default_branch_id(conn),
+        "multi_branch": len(branch_list) > 1,
+        "doctors": branches.list_doctors(conn),
+        "schedules": branches.list_schedule(conn),
+        "weekday_names": branches.WEEKDAY_NAMES,
+    }
+
+
+def _branch_id_from(conn, raw):
+    """The branch a request names (an id), else the default branch. Raises
+    ValueError for an id that is not a branch."""
+    if raw in (None, ""):
+        return branches.default_branch_id(conn)
+    try:
+        branch_id = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError("Pick a branch.")
+    if branches.get_branch(conn, branch_id) is None:
+        raise ValueError("That branch does not exist.")
+    return branch_id
+
+
+def queue_panel_context(conn, day=None, branch=None):
     """Everything the Queue tab (templates/_queue_panel.html) renders, for
-    `day` (YYYY-MM-DD; today when omitted or invalid)."""
+    `day` (YYYY-MM-DD; today when omitted or invalid). `branch` is a branch id,
+    "all" (one queue per branch, side by side), or None (the default branch)."""
     today = date.today().isoformat()
     day = _valid_day(day) or today
+    if str(branch or "").lower() == "all":
+        shown = branches.list_branches(conn)
+    else:
+        try:
+            shown = [branches.get_branch(conn, _branch_id_from(conn, branch))]
+        except ValueError:
+            shown = [branches.get_branch(conn, branches.default_branch_id(conn))]
+    groups = [{"branch": b, "entries": CLINICAL_ADAPTER.queue_for_date(conn, day, b["id"])} for b in shown if b]
     return {
         "queue_today": today,
         "queue_date": day,
         "queue_is_today": day == today,
         "queue_is_past": day < today,
-        "queue_entries": CLINICAL_ADAPTER.queue_for_date(conn, day),
+        "queue_entries": [e for g in groups for e in g["entries"]],
+        "queue_groups": groups,
+        "queue_multi": branches.multi_branch(conn),
         "notifications": notify.recent_notifications(conn, 15),
     }
 
@@ -374,8 +431,9 @@ def dashboard():
         staff_json=_json_for_script([dict(s) for s in staff]),
         wa_inbox_json=_json_for_script(wa_inbox_rows),
         wa_threads_json=_json_for_script(wa_threads.conversation_threads(conn)),
-        **queue_panel_context(conn),
-        **calendar_panel_context(conn),
+        branches_json=_json_for_script(branch_context(conn)),
+        **branch_context(conn),
+        **queue_panel_context(conn, branch=branches.default_branch_id(conn)),
         # Connectors tab: a plain, deterministic boolean env check -- no
         # NLU/pipeline code involved. Gmail/Calendar/Printer have no
         # backend integration yet, so their cards are hardcoded "not
@@ -776,16 +834,19 @@ def _json_body():
     return body if isinstance(body, dict) else {}
 
 
-def _staff_slot(payload):
-    """(appt_date, start_time, None) from a request body, or (None, None, error)."""
+def _staff_slot(payload, conn=None, branch_id=None):
+    """(appt_date, start_time, None) from a request body, or (None, None, error).
+    With a connection and a branch, the time must be a slot of that branch's
+    doctor on that day."""
     appt_date, start_time = payload.get("appt_date"), payload.get("start_time")
     day = _valid_day(appt_date) if isinstance(appt_date, str) else None
     if day is None:
         return None, None, "Pick a valid date."
     if day < _clinic_now().date().isoformat():
         return None, None, "That date has already passed."
-    if start_time not in scheduling.slot_grid():
-        return None, None, "Pick a time from the list of clinic slots."
+    grid = scheduling.slot_grid(conn, day, branch_id) if conn is not None else scheduling.slot_grid()
+    if start_time not in grid:
+        return None, None, "Pick a time from the list of that branch's slots."
     return day, start_time, None
 
 
@@ -804,22 +865,32 @@ def appointment_slots():
     if day is None:
         return jsonify(ok=False, error="Pick a valid date."), 400
     conn = get_conn()
-    free = scheduling.generate_slots(conn, day)
-    blocked = scheduling.blocked_only_slots(conn, day)
+    try:
+        branch_id = _branch_id_from(conn, request.args.get("branch"))
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    free = scheduling.generate_slots(conn, day, branch_id=branch_id)
+    blocked = scheduling.blocked_only_slots(conn, day, branch_id)
     if day == _clinic_now().date().isoformat():
         hhmm = _clinic_now().strftime("%H:%M")
         free = [t for t in free if t >= hhmm]
         blocked = [t for t in blocked if t >= hhmm]
-    return jsonify(ok=True, date=day, free=free, blocked=blocked)
+    return jsonify(ok=True, date=day, branch_id=branch_id, free=free, blocked=blocked,
+                   hours=branches.hours_summary(conn, branch_id, day),
+                   doctor=branches.doctor_label(conn, branches.doctor_at(conn, branch_id, day, free[0])) if free else None)
 
 
 @app.route("/appointments/new", methods=["POST"])
 def appointment_new():
     payload = _json_body()
-    appt_date, start_time, error = _staff_slot(payload)
+    conn = get_conn()
+    try:
+        branch_id = _branch_id_from(conn, payload.get("branch_id"))
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc))
+    appt_date, start_time, error = _staff_slot(payload, conn, branch_id)
     if error:
         return jsonify(ok=False, error=error)
-    conn = get_conn()
     patient_id = payload.get("patient_id") or None
     name = phone = None
     if patient_id:
@@ -838,7 +909,7 @@ def appointment_new():
         slots_name, slots_phone = name, phone
     slots = {
         "patient_id": patient_id, "patient_name": slots_name, "patient_phone": slots_phone,
-        "appt_date": appt_date, "start_time": start_time, "duration_minutes": None,
+        "appt_date": appt_date, "start_time": start_time, "duration_minutes": None, "branch_id": branch_id,
         "notes": "Booked by staff from the dashboard",
     }
     override = bool(payload.get("override_block"))
@@ -848,19 +919,23 @@ def appointment_new():
         appointment_id, _ = auto_actions.staff_action(
             conn, "book_appointment", slots, HANDLERS, post_write_hooks, _clinic_now(),
             note="New appointment form", event="staff_booked", patient_id=patient_id, patient_name=name,
-            wa_id=wa.phone_to_wa_id(phone), detail="Booked {} {}{}".format(
-                appt_date, start_time, " (inside a booking block -- staff override)" if override else ""),
-            meta={"appt_date": appt_date, "start_time": start_time, "override_block": override})
+            wa_id=wa.phone_to_wa_id(phone), detail="Booked {} {} at {}{}".format(
+                appt_date, start_time, branches.branch_label(conn, branch_id),
+                " (inside a booking block -- staff override)" if override else ""),
+            meta={"appt_date": appt_date, "start_time": start_time, "override_block": override, "branch_id": branch_id})
     except auto_actions.ActionError as exc:
         return _staff_failure(exc)
-    return jsonify(ok=True, message="Booked {} on {} at {}. The patient has been notified.".format(
-        name, appt_date, start_time), appointment_id=appointment_id)
+    where = " at {}".format(branches.branch_label(conn, branch_id)) if branches.multi_branch(conn) else ""
+    registered = bool(_registered_suffix(conn, slots, appointment_id))
+    return jsonify(ok=True, message="Booked {} on {} at {}{}.{} The patient has been notified.".format(
+        name, appt_date, start_time, where, " {} is now a registered patient.".format(name) if registered else ""),
+        appointment_id=appointment_id)
 
 
 def _editable_appointment(conn, appointment_id):
     """(row, None) for an appointment staff may move / cancel, else (None, error)."""
     row = conn.execute(
-        "SELECT a.id, a.patient_id, a.appt_date, a.start_time, a.status, a.queue_state, "
+        "SELECT a.id, a.patient_id, a.appt_date, a.start_time, a.status, a.queue_state, a.branch_id, "
         "COALESCE(p.name, a.patient_name) AS name, COALESCE(a.patient_phone, p.phone) AS phone "
         "FROM appointments a LEFT JOIN patients p ON p.id = a.patient_id WHERE a.id = ?", (appointment_id,)).fetchone()
     if row is None:
@@ -879,10 +954,16 @@ def appointment_move(appointment_id):
     row, error = _editable_appointment(conn, appointment_id)
     if error:
         return jsonify(ok=False, error=error)
-    appt_date, start_time, error = _staff_slot(payload)
+    old_branch = branches.resolve(conn, row["branch_id"])
+    try:   # naming another branch moves the appointment there; otherwise it stays where it is
+        branch_id = _branch_id_from(conn, payload.get("branch_id")) if payload.get("branch_id") not in (None, "") else old_branch
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc))
+    appt_date, start_time, error = _staff_slot(payload, conn, branch_id)
     if error:
         return jsonify(ok=False, error=error)
-    slots = {"appointment_id": appointment_id, "appt_date": appt_date, "start_time": start_time, "require_active": True}
+    slots = {"appointment_id": appointment_id, "appt_date": appt_date, "start_time": start_time, "require_active": True,
+             "branch_id": branch_id}
     override = bool(payload.get("override_block"))
     if override:
         slots["override_block"] = True
@@ -891,15 +972,19 @@ def appointment_move(appointment_id):
             conn, "reschedule_appointment", slots, HANDLERS, post_write_hooks, _clinic_now(),
             note="Queue tab Move", event="staff_rescheduled", patient_id=row["patient_id"], patient_name=row["name"],
             wa_id=wa.phone_to_wa_id(row["phone"]), appointment_id=appointment_id,
-            detail="Moved {} {} to {} {}{}".format(
+            detail="Moved {} {} to {} {}{}{}".format(
                 row["appt_date"], row["start_time"], appt_date, start_time,
+                " ({} -> {})".format(branches.branch_label(conn, old_branch), branches.branch_label(conn, branch_id))
+                if branch_id != old_branch else "",
                 " (inside a booking block -- staff override)" if override else ""),
             meta={"old_date": row["appt_date"], "old_time": row["start_time"], "appt_date": appt_date,
-                  "start_time": start_time, "override_block": override})
+                  "start_time": start_time, "override_block": override, "branch_id": branch_id,
+                  "old_branch_id": old_branch})
     except auto_actions.ActionError as exc:
         return _staff_failure(exc)
-    return jsonify(ok=True, message="Moved {} to {} at {}. The patient has been notified.".format(
-        row["name"] or "the appointment", appt_date, start_time))
+    where = " ({})".format(branches.branch_label(conn, branch_id)) if branch_id != old_branch else ""
+    return jsonify(ok=True, message="Moved {} to {} at {}{}. The patient has been notified.".format(
+        row["name"] or "the appointment", appt_date, start_time, where))
 
 
 @app.route("/appointments/<int:appointment_id>/cancel", methods=["POST"])
@@ -979,7 +1064,9 @@ def automation_block_preview():
         start_date, end_date, start_time, end_time, _ = booking_blocks.normalize(*_block_args(payload), reason=None)
     except booking_blocks.BlockError as exc:
         return jsonify(ok=False, error=str(exc)), 400
-    affected = booking_blocks.appointments_in_window(get_conn(), start_date, end_date, start_time, end_time)
+    branch_id = payload.get("branch_id") or None
+    doctor_id = payload.get("doctor_id") or None
+    affected = booking_blocks.appointments_in_window(get_conn(), start_date, end_date, start_time, end_time, branch_id, doctor_id)
     return jsonify(ok=True, affected=affected, count=len(affected))
 
 
@@ -988,7 +1075,8 @@ def automation_block_add():
     payload = _json_body()
     conn = get_conn()
     try:
-        block = booking_blocks.add_block(conn, *_block_args(payload), reason=payload.get("reason"), now=_clinic_now())
+        block = booking_blocks.add_block(conn, *_block_args(payload), reason=payload.get("reason"), now=_clinic_now(),
+                                         branch_id=payload.get("branch_id"), doctor_id=payload.get("doctor_id"))
     except booking_blocks.BlockError as exc:
         return jsonify(ok=False, error=str(exc)), 400
     return jsonify(ok=True, block=block, count=len(block["affected"]))
@@ -999,6 +1087,179 @@ def automation_block_remove(block_id):
     if not booking_blocks.remove_block(get_conn(), block_id):
         return jsonify(ok=False, error="That block was not found (or is already removed)."), 404
     return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Closures: close a branch (or one doctor) for a stretch of time and move its
+# patients as one reviewed batch (clinic/closures.py). Plan writes nothing;
+# Apply is the human approval of the whole batch.
+# ---------------------------------------------------------------------------
+
+def _closure_scope(payload):
+    return dict(branch_id=payload.get("branch_id"), doctor_id=payload.get("doctor_id"),
+                start_date=payload.get("start_date"), end_date=payload.get("end_date") or payload.get("start_date"),
+                start_time=payload.get("start_time") or None, end_time=payload.get("end_time") or None)
+
+
+@app.route("/closures/plan", methods=["POST"])
+def closures_plan():
+    payload = _json_body()
+    try:
+        plan = closures.plan(get_conn(), now=_clinic_now(), **_closure_scope(payload))
+    except closures.ClosureError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    return jsonify(ok=True, plan=plan)
+
+
+def _notice_summary(conn, closure_id):
+    """How the patient notices of one closure stand: sent now, waiting for
+    WhatsApp's 24-hour window, or failed."""
+    out = {"sent": 0, "waiting": 0, "failed": 0, "recorded": 0}
+    for row in conn.execute(
+            "SELECT n.status FROM notifications n JOIN closure_moves m ON n.dedup_key IN "
+            "('closure_moved:' || m.id, 'closure_cancelled:' || m.id) WHERE m.closure_id = ?", (closure_id,)).fetchall():
+        status = row["status"]
+        key = "sent" if status == "sent" else "recorded" if status == "dry_run" else \
+            "waiting" if status in ("pending", "blocked_no_window") else "failed"
+        out[key] += 1
+    return out
+
+
+@app.route("/closures/apply", methods=["POST"])
+def closures_apply():
+    payload = _json_body()
+    conn = get_conn()
+    try:
+        result = closures.apply(
+            conn, moves=payload.get("moves"), handlers=HANDLERS, after_commit=post_write_hooks, now=_clinic_now(),
+            reason=payload.get("reason"), message=payload.get("message"), **_closure_scope(payload))
+    except closures.ClosureError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    sender, dry_run = notify.resolve_sender(NOTIFY_SENDER)
+    try:
+        notify.flush(conn, sender, dry_run=dry_run)
+    except Exception:
+        _logger.exception("could not send the closure notices right away; the scheduler will retry")
+    result["notices"] = _notice_summary(conn, result["closure_id"])
+    c = result["counts"]
+    result["message"] = "Closure applied: {} moved, {} cancelled, {} left as they were{}.".format(
+        c["moved"], c["cancelled"], c["left"], ", {} could not be changed".format(c["failed"]) if c["failed"] else "")
+    return jsonify(result)
+
+
+@app.route("/closures/<int:closure_id>/undo", methods=["POST"])
+def closures_undo(closure_id):
+    conn = get_conn()
+    result = closures.undo(conn, closure_id, HANDLERS, post_write_hooks, _clinic_now())
+    if not result.get("ok"):
+        return jsonify(result), 400
+    sender, dry_run = notify.resolve_sender(NOTIFY_SENDER)
+    try:
+        notify.flush(conn, sender, dry_run=dry_run)
+    except Exception:
+        _logger.exception("could not send the undo notices right away; the scheduler will retry")
+    skipped = result["skipped"]
+    result["message"] = "Closure undone: {} put back{}.".format(
+        result["restored"],
+        "; left as they are: {}".format("; ".join("{} ({})".format(s["name"], s["why"]) for s in skipped)) if skipped else "")
+    return jsonify(result)
+
+
+@app.route("/closures/data")
+def closures_data():
+    conn = get_conn()
+    items = closures.list_closures(conn)
+    for item in items:
+        item["notices"] = _notice_summary(conn, item["id"])
+    return jsonify(ok=True, closures=items)
+
+
+# ---------------------------------------------------------------------------
+# Settings -> Branches / Doctors / Schedules. Every route returns the full
+# branch context so the page can redraw from one response.
+# ---------------------------------------------------------------------------
+
+def _settings_reply(conn, action):
+    """Run `action()` (which may raise BranchError / ValueError) and answer with
+    the refreshed branch context, or the reason it was refused."""
+    try:
+        result = action()
+    except (branches.BranchError, booking_blocks.BlockError, ValueError) as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    return jsonify(ok=True, id=result, data=branch_context(conn))
+
+
+@app.route("/settings/branches/data")
+def settings_branches_data():
+    return jsonify(ok=True, data=branch_context(get_conn()))
+
+
+@app.route("/settings/branches", methods=["POST"])
+def settings_branch_add():
+    p, conn = _json_body(), get_conn()
+    return _settings_reply(conn, lambda: branches.add_branch(
+        conn, p.get("code"), p.get("name"), p.get("address"), p.get("maps_url"), p.get("phone"), p.get("pin_code"), p.get("color")))
+
+
+@app.route("/settings/branches/<int:branch_id>", methods=["POST"])
+def settings_branch_update(branch_id):
+    p, conn = _json_body(), get_conn()
+    changes = {k: v for k, v in p.items() if k in branches._EDITABLE}
+    return _settings_reply(conn, lambda: branches.update_branch(conn, branch_id, **changes))
+
+
+@app.route("/settings/branches/<int:branch_id>/status", methods=["POST"])
+def settings_branch_status(branch_id):
+    p, conn = _json_body(), get_conn()
+    return _settings_reply(conn, lambda: branches.set_status(conn, branch_id, p.get("status"), p.get("reason"), p.get("message")))
+
+
+@app.route("/settings/branches/<int:branch_id>/deactivate", methods=["POST"])
+def settings_branch_deactivate(branch_id):
+    conn = get_conn()
+    return _settings_reply(conn, lambda: branches.deactivate_branch(conn, branch_id))
+
+
+@app.route("/settings/default-branch", methods=["POST"])
+def settings_default_branch():
+    p, conn = _json_body(), get_conn()
+    return _settings_reply(conn, lambda: branches.set_default_branch(conn, p.get("branch_id")))
+
+
+@app.route("/settings/doctors", methods=["POST"])
+def settings_doctor_add():
+    p, conn = _json_body(), get_conn()
+    return _settings_reply(conn, lambda: branches.add_doctor(conn, p.get("name"), p.get("title"), p.get("specialty")))
+
+
+@app.route("/settings/doctors/<int:doctor_id>", methods=["POST"])
+def settings_doctor_update(doctor_id):
+    p, conn = _json_body(), get_conn()
+    return _settings_reply(conn, lambda: branches.update_doctor(
+        conn, doctor_id, p.get("name"), p.get("title"), p.get("specialty"), p.get("active")))
+
+
+@app.route("/settings/schedules", methods=["POST"])
+def settings_schedule_add():
+    """Add one or more weekday windows: `weekdays` is a list (or `weekday` one number)."""
+    p, conn = _json_body(), get_conn()
+    days = p.get("weekdays") if isinstance(p.get("weekdays"), list) else [p.get("weekday")]
+
+    def add_all():
+        created = []
+        for day in days:
+            created.append(branches.add_schedule(conn, p.get("doctor_id"), p.get("branch_id"), day,
+                                                 p.get("start_time"), p.get("end_time"), p.get("valid_from") or None,
+                                                 p.get("valid_to") or None))
+        return created
+
+    return _settings_reply(conn, add_all)
+
+
+@app.route("/settings/schedules/<int:schedule_id>/remove", methods=["POST"])
+def settings_schedule_remove(schedule_id):
+    conn = get_conn()
+    return _settings_reply(conn, lambda: branches.remove_schedule(conn, schedule_id))
 
 
 @app.route("/automation/undo/<int:activity_id>", methods=["POST"])
@@ -1056,7 +1317,46 @@ def queue_partial():
     static/dashboard_refresh.js) -- much lighter than re-fetching the whole
     dashboard, and it leaves other tabs' in-progress edits alone."""
     conn = get_conn()
-    return render_template("_queue_panel.html", **queue_panel_context(conn, request.args.get("date")))
+    return render_template("_queue_panel.html",
+                           **queue_panel_context(conn, request.args.get("date"), request.args.get("branch")))
+
+
+MAX_CALENDAR_DAYS = 45
+
+
+@app.route("/calendar/data")
+def calendar_data():
+    """Appointments (and branch closures) between two dates for the Appointments tab.
+    `branch` is a branch id or "all"; with no branch it is the default branch."""
+    conn = get_conn()
+    start, end = _valid_day(request.args.get("start")), _valid_day(request.args.get("end"))
+    if start is None or end is None or end < start:
+        return jsonify(ok=False, error="Pick a valid date range."), 400
+    if (date.fromisoformat(end) - date.fromisoformat(start)).days > MAX_CALENDAR_DAYS:
+        return jsonify(ok=False, error="Ask for at most {} days at a time.".format(MAX_CALENDAR_DAYS)), 400
+    raw = request.args.get("branch")
+    if str(raw or "").lower() == "all":
+        branch_id = None
+    else:
+        try:
+            branch_id = _branch_id_from(conn, raw)
+        except ValueError as exc:
+            return jsonify(ok=False, error=str(exc)), 400
+    appointments = CLINICAL_ADAPTER.calendar_appointments(conn, start, end, branch_id)
+    # Token labels (A-T04 ...) come from each branch's day queue.
+    tokens = {}
+    for key in {(a["appt_date"], a["branch_id"]) for a in appointments}:
+        for entry in CLINICAL_ADAPTER.queue_for_date(conn, key[0], key[1]):
+            tokens[entry["id"]] = entry["token_label"]
+    for a in appointments:
+        a["token"] = tokens.get(a["id"])
+        a["end_time"] = scheduling._from_minutes(scheduling._to_minutes(a["start_time"]) + (a["duration_minutes"] or scheduling.SLOT_MINUTES))
+    blocks = [b for b in booking_blocks.list_blocks(conn, today=start)
+              if b["end_date"] >= start and b["start_date"] <= end and (branch_id is None or b["branch_id"] in (None, branch_id))]
+    return jsonify(ok=True, start=start, end=end, branch=("all" if branch_id is None else branch_id),
+                   appointments=appointments,
+                   blocks=[{k: b[k] for k in ("id", "start_date", "end_date", "start_time", "end_time", "reason", "branch_id", "branch", "doctor")}
+                           for b in blocks])
 
 
 @app.route("/calendar/status/partial")
@@ -1116,6 +1416,10 @@ if __name__ == "__main__":
     # reminders) is started here, never at import time, so importing app
     # (e.g. from tests) can never start a background thread.
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    with get_conn() as _startup_conn:   # example Branch B / C + doctors, once; old appointments -> default branch
+        if branches.ensure_seed(_startup_conn):
+            _logger.info("Created the example branches B and C (edit them in Settings -> Branches).")
+        branches.backfill_branch(_startup_conn)
     scheduler.start(get_conn, sender_override=lambda: NOTIFY_SENDER, calendar_client=_gcal_client)
     socketio.run(app, debug=False, port=int(os.environ.get("PORT", "5050")), use_reloader=False,
                  allow_unsafe_werkzeug=True)

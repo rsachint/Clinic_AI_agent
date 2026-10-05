@@ -34,6 +34,24 @@ document.addEventListener("DOMContentLoaded", function () {
   var moveId = null;
 
   var todayIso = dateInput.value;
+  var newBranch = document.getElementById("new-appt-branch");
+  var moveBranch = document.getElementById("move-appt-branch");
+
+  // Fill a branch <select> (shown only when there is more than one branch).
+  function fillBranches(select, chosenId) {
+    if (!select || !window.Branches) return;
+    var label = select.closest(".branch-field");
+    if (label) label.hidden = !Branches.multi();
+    select.innerHTML = "";
+    Branches.list().forEach(function (b) {
+      var o = document.createElement("option");
+      o.value = b.id;
+      o.textContent = b.name + (b.status === "closed" ? " (closed)" : "");
+      select.appendChild(o);
+    });
+    select.value = String(chosenId || Branches.bookingBranch());
+  }
+  function branchValue(select) { return select && select.value ? select.value : (window.Branches ? Branches.bookingBranch() : ""); }
 
   function showFlash(message, ok) {
     if (!flash) return;
@@ -66,14 +84,15 @@ document.addEventListener("DOMContentLoaded", function () {
 
   // Fill a <select> with a date's free slots (plus, separately, the ones a
   // booking block is holding back). Calls back with the slot lists.
-  function loadSlots(select, dateValue, hintEl, done) {
+  function loadSlots(select, dateValue, hintEl, done, branchId) {
     select.innerHTML = "";
     if (!dateValue) {
       select.appendChild(option("", "Pick a date first", true));
       return;
     }
     select.appendChild(option("", "Loading...", true));
-    fetch("/appointments/slots?date=" + encodeURIComponent(dateValue))
+    fetch("/appointments/slots?date=" + encodeURIComponent(dateValue) +
+          (branchId ? "&branch=" + encodeURIComponent(branchId) : ""))
       .then(function (r) { return r.json(); })
       .then(function (data) {
         select.innerHTML = "";
@@ -93,7 +112,10 @@ document.addEventListener("DOMContentLoaded", function () {
           data.blocked.forEach(function (t) { group.appendChild(option(t, t + " (blocked)")); });
           select.appendChild(group);
         }
-        if (hintEl) hintEl.textContent = data.free.length + " free time" + (data.free.length === 1 ? "" : "s");
+        if (hintEl) {
+          hintEl.textContent = data.free.length + " free time" + (data.free.length === 1 ? "" : "s") +
+            (data.doctor ? " with " + data.doctor : "") + (!data.free.length && data.hours === "closed" ? " (branch closed that day)" : "");
+        }
         if (done) done(data);
       })
       .catch(function () {
@@ -123,13 +145,15 @@ document.addEventListener("DOMContentLoaded", function () {
     form.hidden = !open;
     toggleBtn.setAttribute("aria-expanded", open ? "true" : "false");
     if (open) {
+      fillBranches(newBranch);
       apptDate.value = dateInput.value >= todayIso ? dateInput.value : todayIso;
-      loadSlots(apptTime, apptDate.value, hint);
+      loadSlots(apptTime, apptDate.value, hint, null, branchValue(newBranch));
     }
   }
   toggleBtn.addEventListener("click", function () { openForm(form.hidden); });
   closeBtn.addEventListener("click", function () { openForm(false); });
-  apptDate.addEventListener("change", function () { loadSlots(apptTime, apptDate.value, hint); });
+  apptDate.addEventListener("change", function () { loadSlots(apptTime, apptDate.value, hint, null, branchValue(newBranch)); });
+  if (newBranch) newBranch.addEventListener("change", function () { loadSlots(apptTime, apptDate.value, hint, null, branchValue(newBranch)); });
 
   function submitNew(override) {
     var body = {
@@ -138,6 +162,7 @@ document.addEventListener("DOMContentLoaded", function () {
       patient_phone: phoneInput.value,
       appt_date: apptDate.value,
       start_time: apptTime.value,
+      branch_id: branchValue(newBranch) ? parseInt(branchValue(newBranch), 10) : null,
       override_block: !!override,
     };
     submitBtn.disabled = true;
@@ -149,7 +174,7 @@ document.addEventListener("DOMContentLoaded", function () {
           phoneInput.value = "";
           patientSel.value = "";
           syncUnregistered();
-          loadSlots(apptTime, apptDate.value, hint);
+          loadSlots(apptTime, apptDate.value, hint, null, branchValue(newBranch));
           if (apptDate.value) dateInput.value = apptDate.value;
           return refreshQueue();
         }
@@ -178,6 +203,12 @@ document.addEventListener("DOMContentLoaded", function () {
     }
   });
 
+  document.addEventListener("branchchange", function () {
+    refreshQueue();
+    if (!form.hidden) { fillBranches(newBranch); loadSlots(apptTime, apptDate.value, hint, null, branchValue(newBranch)); }
+  });
+  document.addEventListener("branchdata", function () { refreshQueue(); });
+
   // --- Move / Cancel buttons on queue rows -------------------------------
   function openMove(btn) {
     moveId = btn.getAttribute("data-appointment-id");
@@ -186,16 +217,19 @@ document.addEventListener("DOMContentLoaded", function () {
     moveDate.value = btn.getAttribute("data-date");
     moveHint.textContent = "";
     movePanel.hidden = false;
-    loadSlots(moveTime, moveDate.value, moveHint);
+    fillBranches(moveBranch, btn.getAttribute("data-branch"));
+    loadSlots(moveTime, moveDate.value, moveHint, null, branchValue(moveBranch));
     movePanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }
-  moveDate.addEventListener("change", function () { loadSlots(moveTime, moveDate.value, moveHint); });
+  moveDate.addEventListener("change", function () { loadSlots(moveTime, moveDate.value, moveHint, null, branchValue(moveBranch)); });
+  if (moveBranch) moveBranch.addEventListener("change", function () { loadSlots(moveTime, moveDate.value, moveHint, null, branchValue(moveBranch)); });
   moveClose.addEventListener("click", function () { movePanel.hidden = true; moveId = null; });
 
   function submitMove(override) {
     moveSubmit.disabled = true;
     return postJson("/appointments/" + moveId + "/move", {
       appt_date: moveDate.value, start_time: moveTime.value, override_block: !!override,
+      branch_id: moveBranch && moveBranch.value ? parseInt(moveBranch.value, 10) : null,
     })
       .then(function (result) {
         if (result.ok) {

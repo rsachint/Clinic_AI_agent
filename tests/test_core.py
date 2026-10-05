@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import sys
 import unittest
@@ -166,16 +167,53 @@ class AppointmentWorkflowTests(unittest.TestCase):
         self.assertEqual(row["start_time"], "09:00")
         self.assertEqual(row["status"], "booked")
 
-    def test_book_appointment_without_a_registered_patient_keeps_fallback_fields(self):
-        bid = core.propose(self.conn, "book_appointment", {
-            "patient_name": "Walk-in Ramesh", "patient_phone": "9998887776",
-            "appt_date": "2026-10-01", "start_time": "09:30", "duration_minutes": 15,
-        })
+    def book_raw(self, start="09:30", **who):
+        bid = core.propose(self.conn, "book_appointment", dict(who, appt_date="2026-10-01", start_time=start,
+                                                               duration_minutes=15))
         _, appt_id = core.confirm(self.conn, bid, HANDLERS)
-        row = self.conn.execute("SELECT * FROM appointments WHERE id = ?", (appt_id,)).fetchone()
+        return self.conn.execute("SELECT * FROM appointments WHERE id = ?", (appt_id,)).fetchone(), bid
+
+    def patients(self):
+        return [tuple(r) for r in self.conn.execute("SELECT name, phone FROM patients ORDER BY id")]
+
+    def test_a_walk_in_with_a_name_only_keeps_fallback_fields(self):
+        row, _ = self.book_raw(patient_name="Walk-in Ramesh")
         self.assertIsNone(row["patient_id"])
         self.assertEqual(row["patient_name"], "Walk-in Ramesh")
-        self.assertEqual(row["patient_phone"], "9998887776")
+        self.assertEqual(self.patients(), [("Sunita Devi", "9876543210")])
+
+    def test_booking_a_new_person_with_name_and_phone_registers_them_as_a_patient(self):
+        row, bid = self.book_raw(patient_name="Kavita", patient_phone="9876500301")
+        self.assertEqual(self.patients()[-1], ("Kavita", "9876500301"))
+        new_id = self.conn.execute("SELECT id FROM patients WHERE name = 'Kavita'").fetchone()[0]
+        self.assertEqual((row["patient_id"], row["patient_name"], row["patient_phone"]), (new_id, None, None))
+        audit = self.conn.execute("SELECT payload_json FROM audit_log WHERE proposal_id = ?", (bid,)).fetchone()[0]
+        self.assertEqual(json.loads(audit)["registered_patient_id"], new_id)     # the audit trail says the booking made them
+
+    def test_the_same_person_on_the_same_phone_is_not_registered_twice(self):
+        self.book_raw(patient_name="Kavita", patient_phone="9876500301")
+        row, bid = self.book_raw("10:00", patient_name="Kavitha", patient_phone="+91 98765 00301")   # misheard, same phone
+        self.assertEqual(len(self.patients()), 2)
+        self.assertEqual(row["patient_id"], self.conn.execute("SELECT id FROM patients WHERE name = 'Kavita'").fetchone()[0])
+        audit = self.conn.execute("SELECT payload_json FROM audit_log WHERE proposal_id = ?", (bid,)).fetchone()[0]
+        self.assertNotIn("registered_patient_id", json.loads(audit))
+
+    def test_a_relative_on_a_shared_phone_gets_their_own_record(self):
+        self.book_raw(patient_name="Kavita", patient_phone="9876500301")
+        self.book_raw("10:00", patient_name="Ravi Kumar", patient_phone="9876500301")
+        self.assertEqual([p[0] for p in self.patients()], ["Sunita Devi", "Kavita", "Ravi Kumar"])
+
+    def test_a_phone_that_is_not_ten_digits_does_not_make_a_patient(self):
+        row, _ = self.book_raw(patient_name="Short Number", patient_phone="12345")
+        self.assertIsNone(row["patient_id"])
+        self.assertEqual(row["patient_phone"], "12345")
+        self.assertEqual(len(self.patients()), 1)
+
+    def test_an_unattended_booking_never_registers_anyone(self):
+        row, _ = self.book_raw(patient_name="Auto Caller", patient_phone="9111122223", unattended=True)
+        self.assertIsNone(row["patient_id"])
+        self.assertEqual((row["patient_name"], row["patient_phone"]), ("Auto Caller", "9111122223"))
+        self.assertEqual(len(self.patients()), 1)
 
     def test_double_booking_is_rejected_at_confirm_time(self):
         first = core.propose(self.conn, "book_appointment", {
@@ -252,13 +290,17 @@ class AppointmentWorkflowTests(unittest.TestCase):
             core.confirm(self.conn, rid, HANDLERS)
 
     def test_next_appointment_for_patient_query(self):
+        # "Upcoming" is judged against the real clock, so book a day ahead: a fixed
+        # date would stop counting as upcoming once its time of day had passed.
+        from datetime import date, timedelta
+        tomorrow = (date.today() + timedelta(days=1)).isoformat()
         core.confirm(self.conn, core.propose(self.conn, "book_appointment", {
-            "patient_id": self.patient_id, "appt_date": "2026-10-05", "start_time": "11:00",
+            "patient_id": self.patient_id, "appt_date": tomorrow, "start_time": "11:00",
             "duration_minutes": 15,
         }), HANDLERS)
 
         row = queries.next_appointment_for_patient(self.conn, self.patient_id)
-        self.assertEqual(row["appt_date"], "2026-10-05")
+        self.assertEqual(row["appt_date"], tomorrow)
         self.assertEqual(row["start_time"], "11:00")
 
     def test_scheduled_appointments_query(self):

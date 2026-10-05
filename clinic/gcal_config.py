@@ -31,6 +31,14 @@ EMBED_MODES = ("WEEK", "MONTH", "AGENDA")
 DEFAULT_EMBED_MODE = "WEEK"
 
 
+def sync_enabled():
+    """Google sync is OFF unless GOOGLE_CALENDAR_SYNC is set to 1/true/yes/on: the
+    in-app calendar (the Appointments tab) is the calendar now. The integration
+    code stays in the repo, dormant, and the events already on that calendar are
+    never touched when it is off."""
+    return (os.environ.get("GOOGLE_CALENDAR_SYNC") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def calendar_id():
     return (os.environ.get("GOOGLE_CALENDAR_ID") or "").strip() or DEFAULT_CALENDAR_ID
 
@@ -56,6 +64,8 @@ def is_configured():
     and a service-account key file at the configured path -- and this is not a
     scratch-database copy of the app (see uses_scratch_database). Only the path
     is checked; the file is not opened."""
+    if not sync_enabled():
+        return False
     if uses_scratch_database() and os.environ.get("GOOGLE_SYNC_ALLOW_SCRATCH_DB") != "1":
         return False
     path = service_account_file()

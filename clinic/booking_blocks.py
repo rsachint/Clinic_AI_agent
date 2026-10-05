@@ -13,7 +13,7 @@ staff how many there are so they can deal with them.
 import re
 from datetime import date, datetime
 
-from clinic import scheduling
+from clinic import branches, scheduling
 
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _TIME = re.compile(r"^\d{2}:\d{2}$")
@@ -67,16 +67,25 @@ def normalize(start_date, end_date=None, start_time=None, end_time=None, reason=
     return start_date, end_date, start_time, end_time, reason
 
 
-def appointments_in_window(conn, start_date, end_date, start_time=None, end_time=None):
+def appointments_in_window(conn, start_date, end_date, start_time=None, end_time=None, branch_id=None, doctor_id=None):
     """Active (booked/confirmed) appointments that fall inside the window --
-    the ones a new block would NOT automatically move or cancel."""
+    the ones a new block would NOT automatically move or cancel. `branch_id` /
+    `doctor_id` limit it to the branch / doctor a block applies to (None = all)."""
+    default = branches.default_branch_id(conn)
+    where, params = ["a.status IN ('booked', 'confirmed')", "a.appt_date >= ?", "a.appt_date <= ?"], [start_date, end_date]
+    if branch_id is not None:
+        where.append("COALESCE(a.branch_id, ?) = ?")
+        params += [default, int(branch_id)]
+    if doctor_id is not None:
+        where.append("a.doctor_id = ?")
+        params.append(int(doctor_id))
     rows = conn.execute(
         "SELECT a.id, a.appt_date, a.start_time, a.duration_minutes, "
-        "COALESCE(p.name, a.patient_name) AS name, COALESCE(a.patient_phone, p.phone) AS phone "
+        "COALESCE(p.name, a.patient_name) AS name, COALESCE(a.patient_phone, p.phone) AS phone, "
+        "COALESCE(a.branch_id, ?) AS branch_id "
         "FROM appointments a LEFT JOIN patients p ON p.id = a.patient_id "
-        "WHERE a.status IN ('booked', 'confirmed') AND a.appt_date >= ? AND a.appt_date <= ? "
-        "ORDER BY a.appt_date, a.start_time, a.id",
-        (start_date, end_date),
+        "WHERE " + " AND ".join(where) + " ORDER BY a.appt_date, a.start_time, a.id",
+        [default] + params,
     ).fetchall()
     out = []
     for row in rows:
@@ -85,25 +94,39 @@ def appointments_in_window(conn, start_date, end_date, start_time=None, end_time
             end = start + row["duration_minutes"]
             if not (start < scheduling._to_minutes(end_time) and scheduling._to_minutes(start_time) < end):
                 continue
-        out.append({k: row[k] for k in ("id", "appt_date", "start_time", "name", "phone")})
+        out.append({k: row[k] for k in ("id", "appt_date", "start_time", "name", "phone", "branch_id")})
     return out
 
 
-def add_block(conn, start_date, end_date=None, start_time=None, end_time=None, reason=None, now=None):
+def _scope(conn, branch_id, doctor_id):
+    branch_id = int(branch_id) if branch_id not in (None, "") else None
+    doctor_id = int(doctor_id) if doctor_id not in (None, "") else None
+    if branch_id is not None and branches.get_branch(conn, branch_id) is None:
+        raise BlockError("That branch does not exist.")
+    if doctor_id is not None and branches.get_doctor(conn, doctor_id) is None:
+        raise BlockError("That doctor does not exist.")
+    return branch_id, doctor_id
+
+
+def add_block(conn, start_date, end_date=None, start_time=None, end_time=None, reason=None, now=None,
+              branch_id=None, doctor_id=None):
     """Create a block. Returns {'id', ..., 'affected': [existing appointments
-    inside it]} -- the caller shows that list."""
+    inside it]} -- the caller shows that list. `branch_id` limits it to one
+    branch and `doctor_id` to one doctor's slots (None = every branch / every
+    doctor, e.g. a brand-wide holiday)."""
     start_date, end_date, start_time, end_time, reason = normalize(start_date, end_date, start_time, end_time, reason)
+    branch_id, doctor_id = _scope(conn, branch_id, doctor_id)
     stamp = (now or datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
     cur = conn.execute(
-        "INSERT INTO booking_blocks (start_date, end_date, start_time, end_time, reason, active, created_at) "
-        "VALUES (?, ?, ?, ?, ?, 1, ?)",
-        (start_date, end_date, start_time, end_time, reason, stamp),
+        "INSERT INTO booking_blocks (start_date, end_date, start_time, end_time, reason, active, created_at, branch_id, doctor_id) "
+        "VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
+        (start_date, end_date, start_time, end_time, reason, stamp, branch_id, doctor_id),
     )
     conn.commit()
     return {
         "id": cur.lastrowid, "start_date": start_date, "end_date": end_date, "start_time": start_time,
-        "end_time": end_time, "reason": reason,
-        "affected": appointments_in_window(conn, start_date, end_date, start_time, end_time),
+        "end_time": end_time, "reason": reason, "branch_id": branch_id, "doctor_id": doctor_id,
+        "affected": appointments_in_window(conn, start_date, end_date, start_time, end_time, branch_id, doctor_id),
     }
 
 
@@ -125,8 +148,13 @@ def list_blocks(conn, today=None, include_past=False):
         if row["end_date"] < today and not include_past:
             continue
         block = {k: row[k] for k in ("id", "start_date", "end_date", "start_time", "end_time", "reason")}
+        block["branch_id"] = row["branch_id"] if "branch_id" in row.keys() else None
+        block["doctor_id"] = row["doctor_id"] if "doctor_id" in row.keys() else None
+        block["branch"] = branches.branch_label(conn, block["branch_id"]) if block["branch_id"] else None
+        block["doctor"] = branches.doctor_label(conn, block["doctor_id"]) if block["doctor_id"] else None
         block["affected"] = appointments_in_window(
-            conn, row["start_date"], row["end_date"], row["start_time"], row["end_time"])
+            conn, row["start_date"], row["end_date"], row["start_time"], row["end_time"],
+            block["branch_id"], block["doctor_id"])
         blocks.append(block)
     return blocks
 
@@ -139,6 +167,11 @@ def describe(block):
         days = "{} {} {}".format(first.day, months[first.month - 1], first.year)
     else:
         days = "{} {} - {} {} {}".format(first.day, months[first.month - 1], last.day, months[last.month - 1], last.year)
+    where = ""
+    if block.get("branch"):
+        where += " at " + block["branch"]
+    if block.get("doctor"):
+        where += " for " + block["doctor"]
     if block.get("start_time"):
-        return "{}, {}-{}".format(days, block["start_time"], block["end_time"])
-    return days + " (whole day)"
+        return "{}, {}-{}{}".format(days, block["start_time"], block["end_time"], where)
+    return days + " (whole day)" + where

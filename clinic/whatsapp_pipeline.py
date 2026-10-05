@@ -39,7 +39,7 @@ def sender_appointments(conn, wa_id, patient_id=None, now=None):
     target = last10_digits(wa_id or "")
     rows = conn.execute(
         """
-        SELECT a.id, a.patient_id, a.appt_date, a.start_time, a.duration_minutes,
+        SELECT a.id, a.patient_id, a.appt_date, a.start_time, a.duration_minutes, a.branch_id,
                COALESCE(a.patient_phone, p.phone) AS phone
         FROM appointments a LEFT JOIN patients p ON p.id = a.patient_id
         WHERE a.status IN ('booked', 'confirmed') AND a.appt_date >= ?
@@ -52,8 +52,32 @@ def sender_appointments(conn, wa_id, patient_id=None, now=None):
         by_patient = patient_id is not None and row["patient_id"] == patient_id
         by_phone = len(target) == 10 and last10_digits(row["phone"] or "") == target
         if by_patient or by_phone:
-            mine.append({k: row[k] for k in ("id", "appt_date", "start_time", "duration_minutes")})
+            mine.append({k: row[k] for k in ("id", "appt_date", "start_time", "duration_minutes", "branch_id")})
     return mine
+
+
+def last_branch_id(conn, wa_id, patient_id=None, today=None):
+    """The branch of the sender's most recent PAST appointment (anything but
+    cancelled; an upcoming booking is not a visit), or None: the branch to
+    suggest first next time. Matched
+    the same way as sender_appointments (patient id or phone), so it never
+    reveals anyone else's."""
+    target = last10_digits(wa_id or "")
+    rows = conn.execute(
+        """
+        SELECT a.patient_id, a.branch_id, COALESCE(a.patient_phone, p.phone) AS phone
+        FROM appointments a LEFT JOIN patients p ON p.id = a.patient_id
+        WHERE a.status != 'cancelled' AND a.branch_id IS NOT NULL AND a.appt_date <= ?
+        ORDER BY a.appt_date DESC, a.start_time DESC, a.id DESC
+        """,
+        ((today or datetime.now().date().isoformat()),),
+    ).fetchall()
+    for row in rows:
+        by_patient = patient_id is not None and row["patient_id"] == patient_id
+        by_phone = len(target) == 10 and last10_digits(row["phone"] or "") == target
+        if by_patient or by_phone:
+            return row["branch_id"]
+    return None
 
 
 def _free_slots(conn, day, today, hhmm):

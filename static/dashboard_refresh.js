@@ -31,9 +31,6 @@ window.DashboardRefresh = (function () {
         // The Queue panel follows the date picker (which may not be today),
         // so it is re-fetched for that date rather than copied from "/".
         refreshQueue();
-        // Only the status strip: never the Appointments tab's iframe, which
-        // a re-render would reload and reset to the default view.
-        copyContent(doc, "calendar-status");
 
         var patientsData = doc.getElementById("patients-data");
         var staffData = doc.getElementById("staff-data");
@@ -67,15 +64,22 @@ window.DashboardRefresh = (function () {
   // fragment route (not the whole dashboard): safe to call every ~15s
   // because it can't disturb the Patient messages inbox or the Assistant
   // conversation feed. See static/queue.js, the caller.
+  var queueRequest = 0;   // only the newest request may draw (a slower, older one must not overwrite it)
+
   function refreshQueue() {
     var picker = document.getElementById("queue-date");
-    var url = "/queue/partial" + (picker && picker.value ? "?date=" + encodeURIComponent(picker.value) : "");
+    var mine = ++queueRequest;
+    var query = [];
+    if (picker && picker.value) query.push("date=" + encodeURIComponent(picker.value));
+    if (window.Branches) query.push(Branches.viewQuery());
+    var url = "/queue/partial" + (query.length ? "?" + query.join("&") : "");
     return fetch(url, { headers: { "X-Requested-With": "XMLHttpRequest" } })
       .then(function (r) {
         if (!r.ok) throw new Error("HTTP " + r.status);
         return r.text();
       })
       .then(function (html) {
+        if (mine !== queueRequest) return;
         var panel = document.getElementById("queue-panel");
         if (panel) panel.innerHTML = html;
       })

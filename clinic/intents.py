@@ -1,6 +1,30 @@
 from datetime import date, timedelta
 
-from clinic import scheduling, token_queue
+from clinic import branches, entity_resolution, scheduling, token_queue
+
+# A booking under a name and phone that are already registered reuses that
+# patient instead of registering a second copy (a heard "Kavitha" for a
+# registered "Kavita" is the same person on the same phone).
+_SAME_PERSON = 0.8
+
+
+def _patient_for_new_booking(conn, name, phone):
+    """(patient_id, registered_now) for a booking made under a raw name and phone.
+    Both a name and a 10-digit phone are needed to make a patient record;
+    without them (a walk-in known by name only) there is none: (None, False).
+    The same person on the same phone is reused; anyone else (a relative on a
+    shared phone) is registered as a new patient."""
+    name = (name or "").strip()
+    phone = (phone or "").strip()
+    digits = entity_resolution.last10_digits(phone)
+    if not name or len(digits) != 10:
+        return None, False
+    for row in conn.execute("SELECT id, name, phone FROM patients").fetchall():
+        if entity_resolution.last10_digits(row["phone"]) == digits \
+                and entity_resolution.similarity(name, row["name"]) >= _SAME_PERSON:
+            return row["id"], False
+    cur = conn.execute("INSERT INTO patients (name, phone) VALUES (?, ?)", (name, phone))
+    return cur.lastrowid, True
 
 
 def register_patient(conn, slots):
@@ -60,14 +84,26 @@ def reschedule_followup(conn, slots):
     return "followup", followup_id, {"due_date": new_due_date}
 
 
-def _check_slot(conn, appt_date, start_time, duration_minutes, override_block, exclude_appointment_id=None):
+def _check_slot(conn, appt_date, start_time, duration_minutes, override_block, exclude_appointment_id=None,
+                branch_id=None, check_hours=False):
     """The confirm-time slot guard shared by book / reschedule / restore.
     A slot inside a staff-defined booking block is refused unless the caller
     passed the explicit override flag (a staff member who confirmed "Book
     anyway?"); a taken slot is always refused. Returns True when the block
-    was overridden, so the audit payload can say so."""
-    reason = scheduling.block_reason(conn, appt_date, start_time, duration_minutes)
+    was overridden, so the audit payload can say so.
+
+    With several branches the guard runs against ONE branch's bookings, blocks
+    and doctor schedule. `check_hours` (set when the caller named a branch)
+    also refuses a time at which the branch has no doctor on duty -- an
+    overridable refusal, like a block."""
     overridden = False
+    if check_hours and scheduling.within_doctor_hours(conn, appt_date, start_time, duration_minutes, branch_id) is None:
+        if not override_block:
+            raise scheduling.SlotBlockedError(
+                "{} has no doctor on duty on {} at {} -- pick another slot.".format(
+                    branches.branch_label(conn, branch_id), appt_date, start_time))
+        overridden = True
+    reason = scheduling.block_reason(conn, appt_date, start_time, duration_minutes, branch_id)
     if reason is not None:
         if not override_block:
             raise scheduling.SlotBlockedError(
@@ -76,7 +112,8 @@ def _check_slot(conn, appt_date, start_time, duration_minutes, override_block, e
             )
         overridden = True
     if not scheduling.is_slot_free(conn, appt_date, start_time, duration_minutes,
-                                   exclude_appointment_id=exclude_appointment_id, ignore_blocks=True):
+                                   exclude_appointment_id=exclude_appointment_id, ignore_blocks=True,
+                                   branch_id=branch_id):
         raise scheduling.SlotConflictError(
             "{} at {} is no longer free -- pick another slot.".format(appt_date, start_time)
         )
@@ -84,11 +121,16 @@ def _check_slot(conn, appt_date, start_time, duration_minutes, override_block, e
 
 
 def book_appointment(conn, slots):
-    # A caller who isn't a registered patient yet can still book: patient_id
-    # is None and the raw patient_name/patient_phone are kept as fallback
-    # display fields (same "not found -> keep the raw text" convention
-    # register_patient's own review-card flow already relies on).
+    # A caller who isn't a registered patient yet can still book. With a name
+    # AND a phone they are registered as a patient by this booking (or matched
+    # to the patient already on that phone), unless nobody reviewed it (the
+    # automatic WhatsApp path passes `unattended`). With a name only (a walk-in),
+    # patient_id stays None and the raw patient_name/patient_phone are kept as
+    # display fields.
     patient_id = slots.get("patient_id")
+    registered_now = False
+    if not patient_id and not slots.get("unattended"):
+        patient_id, registered_now = _patient_for_new_booking(conn, slots.get("patient_name"), slots.get("patient_phone"))
     patient_name = slots.get("patient_name") if not patient_id else None
     patient_phone = slots.get("patient_phone") if not patient_id else None
     appt_date = slots["appt_date"]
@@ -100,13 +142,17 @@ def book_appointment(conn, slots):
     # same transaction core.confirm() wraps this call in) against whatever
     # is booked *right now* -- not just what was free when the review card
     # was first shown to the human.
-    overridden = _check_slot(conn, appt_date, start_time, duration_minutes, bool(slots.get("override_block")))
+    named_branch = slots.get("branch_id")
+    branch_id = branches.resolve(conn, named_branch)
+    overridden = _check_slot(conn, appt_date, start_time, duration_minutes, bool(slots.get("override_block")),
+                             branch_id=branch_id, check_hours=named_branch not in (None, ""))
+    doctor_id = branches.doctor_at(conn, branch_id, appt_date, start_time)
 
     cur = conn.execute(
         "INSERT INTO appointments "
-        "(patient_id, patient_name, patient_phone, appt_date, start_time, duration_minutes, notes) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (patient_id, patient_name, patient_phone, appt_date, start_time, duration_minutes, notes),
+        "(patient_id, patient_name, patient_phone, appt_date, start_time, duration_minutes, notes, branch_id, doctor_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (patient_id, patient_name, patient_phone, appt_date, start_time, duration_minutes, notes, branch_id, doctor_id),
     )
     appointment_id = cur.lastrowid
     payload = {
@@ -117,7 +163,11 @@ def book_appointment(conn, slots):
         "start_time": start_time,
         "duration_minutes": duration_minutes,
         "notes": notes,
+        "branch_id": branch_id,
+        "doctor_id": doctor_id,
     }
+    if registered_now:
+        payload["registered_patient_id"] = patient_id        # the audit trail shows this booking created the patient
     if overridden:
         payload["override_block"] = True
     return "appointment", appointment_id, payload
@@ -156,22 +206,31 @@ def reschedule_appointment(conn, slots):
         _require_active(conn, appointment_id)
 
     row = conn.execute(
-        "SELECT duration_minutes FROM appointments WHERE id = ?", (appointment_id,)
+        "SELECT duration_minutes, branch_id FROM appointments WHERE id = ?", (appointment_id,)
     ).fetchone()
     duration_minutes = row["duration_minutes"] if row else scheduling.SLOT_MINUTES
+    # Moving to another branch is just a reschedule that names a different one;
+    # otherwise the appointment keeps its own branch.
+    named_branch = slots.get("branch_id")
+    branch_id = branches.resolve(conn, named_branch if named_branch not in (None, "") else (row["branch_id"] if row else None))
 
     # Same confirm-time re-check as book_appointment, excluding this
     # appointment's own current row from the conflict check (rescheduling a
     # slot to the same time it already occupies must not count as
     # conflicting with itself).
     overridden = _check_slot(conn, new_date, new_time, duration_minutes, bool(slots.get("override_block")),
-                             exclude_appointment_id=appointment_id)
+                             exclude_appointment_id=appointment_id, branch_id=branch_id,
+                             # `restore` (an Undo): putting an appointment back where it was is never refused
+                             # for the doctor's hours; it may have been booked outside them in the first place.
+                             check_hours=named_branch not in (None, "") and not slots.get("restore"))
+    doctor_id = branches.doctor_at(conn, branch_id, new_date, new_time)
 
     conn.execute(
-        "UPDATE appointments SET appt_date = ?, start_time = ?, updated_at = datetime('now') WHERE id = ?",
-        (new_date, new_time, appointment_id),
+        "UPDATE appointments SET appt_date = ?, start_time = ?, branch_id = ?, doctor_id = ?, "
+        "updated_at = datetime('now') WHERE id = ?",
+        (new_date, new_time, branch_id, doctor_id, appointment_id),
     )
-    payload = {"appt_date": new_date, "start_time": new_time}
+    payload = {"appt_date": new_date, "start_time": new_time, "branch_id": branch_id, "doctor_id": doctor_id}
     if overridden:
         payload["override_block"] = True
     return "appointment", appointment_id, payload
@@ -186,14 +245,14 @@ def restore_appointment(conn, slots):
     if status not in ("booked", "confirmed"):
         raise ValueError("An appointment can only be restored as booked or confirmed.")
     row = conn.execute(
-        "SELECT appt_date, start_time, duration_minutes, status FROM appointments WHERE id = ?", (appointment_id,)
+        "SELECT appt_date, start_time, duration_minutes, status, branch_id FROM appointments WHERE id = ?", (appointment_id,)
     ).fetchone()
     if row is None:
         raise ValueError("Appointment #{} not found.".format(appointment_id))
     if row["status"] != "cancelled":
         raise ValueError("Appointment #{} is {}, not cancelled.".format(appointment_id, row["status"]))
     _check_slot(conn, row["appt_date"], row["start_time"], row["duration_minutes"], False,
-                exclude_appointment_id=appointment_id)
+                exclude_appointment_id=appointment_id, branch_id=row["branch_id"])
     conn.execute(
         "UPDATE appointments SET status = ?, queue_state = NULL, updated_at = datetime('now') WHERE id = ?",
         (status, appointment_id),

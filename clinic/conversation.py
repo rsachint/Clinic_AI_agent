@@ -47,12 +47,13 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
+from clinic import branches, closures
 from clinic import conv_templates as ct
 from clinic import notify, scheduling, whatsapp
 from clinic.entity_resolution import last10_digits, resolve_patient_by_phone
 from clinic.nlu import classify_patient
 from clinic.nlu.datetime_extract import extract_appt_date, extract_appt_time
-from clinic.whatsapp_pipeline import sender_appointments
+from clinic.whatsapp_pipeline import last_branch_id, sender_appointments
 
 _logger = logging.getLogger(__name__)
 
@@ -90,7 +91,7 @@ def agent_enabled(environ=None):
 @dataclass
 class Reply:
     """One outbound message. `buttons` = reply buttons [(id, title)] (max 3);
-    `rows` = list-message rows [(id, title)] (max 10) with `list_button` as the
+    `rows` = list-message rows [(id, title[, description])] (max 10) with `list_button` as the
     label of the button that opens the list. kind='status' means "answer with
     the existing my_status template for `appointment_id`" -- the caller
     enqueues it through notify.notify_status_reply."""
@@ -108,7 +109,8 @@ class Reply:
             return {"type": "button", "buttons": [{"id": i, "title": t} for i, t in self.buttons]}
         if self.rows:
             return {"type": "list", "button": self.list_button or "Choose",
-                    "rows": [{"id": i, "title": t} for i, t in self.rows]}
+                    "rows": [dict({"id": r[0], "title": r[1]}, **({"description": r[2]} if len(r) > 2 and r[2] else {}))
+                             for r in self.rows]}
         return None
 
 
@@ -152,6 +154,7 @@ class Result:
 #   menu:book | menu:reschedule | menu:cancel | menu:status
 #   day:YYYY-MM-DD            slot:YYYY-MM-DDTHH:MM
 #   appt:<appointment id>     confirm:yes | confirm:no | confirm:change
+#   branch:<branch id>        closure:accept:<move id> | closure:change:<move id>
 # ---------------------------------------------------------------------------
 
 _CHOICE = re.compile(
@@ -159,7 +162,9 @@ _CHOICE = re.compile(
     r"|(day):(\d{4}-\d{2}-\d{2})"
     r"|(slot):(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})"
     r"|(appt):(\d{1,9})"
-    r"|(confirm):(yes|no|change))$"
+    r"|(confirm):(yes|no|change)"
+    r"|(branch):(\d{1,9})"
+    r"|(closure):((?:accept|change):\d{1,9}))$"
 )
 
 
@@ -183,9 +188,13 @@ def confirm_choice(answer):
     return "confirm:" + answer
 
 
+def branch_choice(branch_id):
+    return "branch:{}".format(branch_id)
+
+
 def parse_choice(choice_id):
     """('menu', 'book') / ('day', '2026-10-02') / ('slot', '2026-10-02T09:15')
-    / ('appt', '12') / ('confirm', 'yes') -- or None for anything else."""
+    / ('appt', '12') / ('confirm', 'yes') / ('branch', '2') -- or None for anything else."""
     if not choice_id:
         return None
     m = _CHOICE.match(str(choice_id).strip())
@@ -510,10 +519,12 @@ def _in_hours(hhmm):
     )
 
 
-def parse_time(text, allow_bare_hour=False):
+def parse_time(text, allow_bare_hour=False, is_open=None):
     """'HH:MM' for a time reference, or None. datetime_extract.extract_appt_time
     first; at a time question only, a bare hour ("4") counts if exactly one of
-    its AM/PM readings falls inside clinic hours."""
+    its AM/PM readings falls inside clinic hours (`is_open(hhmm)` says so for
+    the branch being booked; the fixed clinic hours when not given)."""
+    is_open = is_open or _in_hours
     norm = normalize(text)
     found = extract_appt_time(norm)
     if found:
@@ -523,7 +534,7 @@ def parse_time(text, allow_bare_hour=False):
         if m:
             hour = int(m.group(1))
             if 1 <= hour <= 12:
-                options = [h for h in {hour, (hour % 12) + 12 if hour != 12 else 12} if _in_hours("{:02d}:00".format(h))]
+                options = [h for h in {hour, (hour % 12) + 12 if hour != 12 else 12} if is_open("{:02d}:00".format(h))]
                 if len(options) == 1:
                     return "{:02d}:00".format(options[0])
                 return "{:02d}:00".format(hour)
@@ -614,6 +625,42 @@ def set_mode(conn, wa_id, mode, now=None):
 
 
 # ---------------------------------------------------------------------------
+# Naming a branch in a message
+# ---------------------------------------------------------------------------
+
+_PIN = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+
+
+def find_pin(text):
+    """A 6-digit PIN code typed in a message, or None."""
+    m = _PIN.search(text or "")
+    return m.group(1) if m else None
+
+
+def match_branch(text, candidates, bare_code=False):
+    """The ONE branch `text` names -- by its name ("Branch B", "Sector 56
+    clinic") or "branch B" -- or None when it names none or several. With
+    `bare_code`, a short reply that is just the code ("B", "B please") also
+    counts (only used when the patient is answering "which branch?")."""
+    norm = normalize(text)
+    if not norm:
+        return None
+    tokens = norm.split()
+    found = {}
+    for b in candidates:
+        name = normalize(b["name"])
+        code = normalize(b["code"] or "")
+        hit = bool(name) and re.search(r"(?<![\w])" + re.escape(name) + r"(?![\w])", norm) is not None
+        if not hit and code:
+            hit = re.search(r"(?<![\w])branch\s+" + re.escape(code) + r"(?![\w])", norm) is not None
+            if not hit and bare_code and len(tokens) <= 3 and code in tokens:
+                hit = True
+        if hit:
+            found[b["id"]] = b
+    return next(iter(found.values())) if len(found) == 1 else None
+
+
+# ---------------------------------------------------------------------------
 # Slot holds
 # ---------------------------------------------------------------------------
 
@@ -621,11 +668,12 @@ def purge_expired_holds(conn, now):
     conn.execute("DELETE FROM slot_holds WHERE expires_at <= ?", (_ts(now),))
 
 
-def create_hold(conn, wa_id, appt_date, start_time, now, wa_message_id=None):
+def create_hold(conn, wa_id, appt_date, start_time, now, wa_message_id=None, branch_id=None):
     conn.execute(
-        "INSERT INTO slot_holds (wa_id, wa_message_id, appt_date, start_time, created_at, expires_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (wa_id, wa_message_id, appt_date, start_time, _ts(now), _ts(now + timedelta(hours=HOLD_HOURS))),
+        "INSERT INTO slot_holds (wa_id, wa_message_id, appt_date, start_time, created_at, expires_at, branch_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (wa_id, wa_message_id, appt_date, start_time, _ts(now), _ts(now + timedelta(hours=HOLD_HOURS)),
+         branches.resolve(conn, branch_id)),
     )
 
 
@@ -639,12 +687,16 @@ def release_holds(conn, wa_message_id):
     return cur.rowcount
 
 
-def held_times(conn, appt_date, now, exclude_wa_id=None):
-    """Start times on `appt_date` held for someone OTHER than `exclude_wa_id`."""
+def held_times(conn, appt_date, now, exclude_wa_id=None, branch_id=None):
+    """Start times on `appt_date` at one branch held for someone OTHER than
+    `exclude_wa_id`. (A hold with no branch belongs to the default branch.)"""
     mine = last10_digits(exclude_wa_id) if exclude_wa_id else None
+    branch_id = branches.resolve(conn, branch_id)
+    default_id = branches.default_branch_id(conn)
     held = set()
     for row in conn.execute(
-        "SELECT wa_id, start_time FROM slot_holds WHERE appt_date = ? AND expires_at > ?", (appt_date, _ts(now))
+        "SELECT wa_id, start_time FROM slot_holds WHERE appt_date = ? AND expires_at > ? "
+        "AND COALESCE(branch_id, ?) = ?", (appt_date, _ts(now), default_id, branch_id)
     ).fetchall():
         own = exclude_wa_id is not None and (row["wa_id"] == exclude_wa_id or last10_digits(row["wa_id"]) == mine)
         if not own:
@@ -652,15 +704,16 @@ def held_times(conn, appt_date, now, exclude_wa_id=None):
     return held
 
 
-def free_times(conn, appt_date, now, for_wa_id=None):
+def free_times(conn, appt_date, now, for_wa_id=None, branch_id=None):
     """The free slot start times that may be OFFERED to `for_wa_id` on
-    `appt_date`: not booked, not already past today, not held for someone
-    else. (The confirm-time guard in clinic/intents.py stays the final word.)"""
-    slots = scheduling.generate_slots(conn, appt_date)
+    `appt_date` at one branch (the default when none is given): not booked,
+    not already past today, not held for someone else. (The confirm-time guard
+    in clinic/intents.py stays the final word.)"""
+    slots = scheduling.generate_slots(conn, appt_date, branch_id=branch_id)
     if appt_date == now.date().isoformat():
         hhmm = now.strftime("%H:%M")
         slots = [t for t in slots if t > hhmm]
-    held = held_times(conn, appt_date, now, exclude_wa_id=for_wa_id)
+    held = held_times(conn, appt_date, now, exclude_wa_id=for_wa_id, branch_id=branch_id)
     return [t for t in slots if t not in held]
 
 
@@ -696,8 +749,9 @@ class _Turn:
     def slots(self):
         return self.s["slots"]
 
-    def say(self, key, buttons=None, rows=None, list_button=None, **values):
-        self.result.replies.append(Reply(ct.text(key, self.lang, **values), buttons, rows, list_button))
+    def say(self, key, buttons=None, rows=None, list_button=None, head="", tail="", **values):
+        """One fixed-template reply; `head` / `tail` are extra lines (the branch)."""
+        self.result.replies.append(Reply(head + ct.text(key, self.lang, **values) + tail, buttons, rows, list_button))
 
     def fdate(self, iso):
         return notify.format_date(iso, self.lang)
@@ -709,7 +763,59 @@ class _Turn:
         return ct.button(key, self.lang)
 
     def free(self, iso):
-        return free_times(self.conn, iso, self.now, for_wa_id=self.wa_id)
+        return free_times(self.conn, iso, self.now, for_wa_id=self.wa_id, branch_id=self.slots.get("branch_id"))
+
+    # -- branches (all of this is silent when the clinic has one branch) -----------
+    def multi(self):
+        return branches.multi_branch(self.conn)
+
+    def eligible_branches(self):
+        """Branches the patient may be offered: open, with a doctor scheduled
+        at some point, and not one already found to have no free times."""
+        skip = set(self.slots.get("skip_branches") or [])
+        return [b for b in branches.list_branches(self.conn)
+                if b["status"] == "open" and b["id"] not in skip and branches.list_schedule(self.conn, b["id"])]
+
+    def picks_branch(self):
+        """A booking chooses its branch; so does a reschedule the patient started
+        from a closure notice ("Choose another"). Any other reschedule stays at
+        the appointment's own branch."""
+        return self.s["goal"] == "book" or bool(self.slots.get("pick_branch"))
+
+    def branch_name(self, branch_id):
+        return branches.branch_label(self.conn, branch_id)
+
+    def is_open_at(self, iso=None):
+        """A bare-hour checker for the branch being booked."""
+        branch_id = self.slots.get("branch_id")
+        day = iso or self.slots.get("appt_date")
+        if day is None:
+            return _in_hours
+        return lambda hhmm: scheduling.within_doctor_hours(
+            self.conn, day, hhmm, scheduling.SLOT_MINUTES, branch_id) is not None
+
+    def where_head(self):
+        """'📍 Branch B' line above the day / time questions."""
+        if not self.multi() or self.slots.get("branch_id") is None:
+            return ""
+        return "\U0001F4CD {}\n".format(self.branch_name(self.slots["branch_id"]))
+
+    def where_text(self, branch_id, iso=None, hhmm=None):
+        """'\nBranch: ..\nDoctor: ..\n📍 address' for a confirmation, or ''."""
+        if not self.multi():
+            return ""
+        branch = branches.get_branch(self.conn, branches.resolve(self.conn, branch_id))
+        if branch is None:
+            return ""
+        out = "\n" + ct.text("where_branch", self.lang, branch=branch["name"])
+        doctor = None
+        if iso and hhmm:
+            doctor = branches.doctor_label(self.conn, branches.doctor_at(self.conn, branch["id"], iso, hhmm))
+        if doctor:
+            out += "\n" + ct.text("where_doctor", self.lang, doctor=doctor)
+        if (branch.get("address") or "").strip():
+            out += "\n\U0001F4CD " + branch["address"].strip()
+        return out
 
     def patient_name(self):
         if self.patient is None:
@@ -844,6 +950,10 @@ class _Turn:
             return self.start_goal(_INTENT_TO_GOAL[det], self.text)
         if det == "register":
             return self.escalate("register")
+        if parse_yes_no(self.text) == "yes":
+            pending = closures.pending_for_sender(self.conn, self.wa_id)
+            if pending is not None:                  # "ok" to a closure notice means Accept
+                return self.on_closure_choice("accept:{}".format(pending["id"]))
         if _is_thanks(norm):
             return self.say("thanks")
         if parse_yes_no(self.text) is not None:
@@ -908,6 +1018,8 @@ class _Turn:
         step = s["step"]
         if step == "name":
             return self.answer_name()
+        if step == "branch":
+            return self.answer_branch()
         if step == "which":
             return self.answer_which()
         if step == "day":
@@ -937,6 +1049,8 @@ class _Turn:
     def on_choice(self):
         s = self.s
         kind, value = self.choice
+        if kind == "closure":
+            return self.on_closure_choice(value)
         if kind == "menu":
             if value == "status":
                 return self.answer_status()
@@ -961,6 +1075,11 @@ class _Turn:
                 self.slots["appt_date"], self.slots["start_time"] = iso, hhmm
             s["confusion_count"] = 0
             return self.advance()
+        if kind == "branch" and self.picks_branch() and step in ("branch", "day", "time", "confirm") and self.multi():
+            chosen = next((b for b in self.eligible_branches() if b["id"] == int(value)), None)
+            if chosen is None:
+                return self.reprompt()
+            return self.pick_branch(chosen["id"])
         if kind == "appt" and step == "which":
             appt = self.find_own(int(value))
             if appt is None:
@@ -970,6 +1089,30 @@ class _Turn:
             return self.on_confirm(value)
         # A button from an older question: just ask the current one again.
         return self.reprompt()
+
+    # -- a closure notice: Accept / Choose another ---------------------------------
+    def on_closure_choice(self, value):
+        action, move_id = value.split(":")
+        move = closures.respond(self.conn, int(move_id), self.wa_id, "accepted" if action == "accept" else "changed", self.now)
+        appt = self.find_own(move["appointment_id"]) if move is not None else None
+        if appt is None:
+            self.reset_flow()
+            return self.say("closure_gone", buttons=self.menu_buttons())
+        branch_id = branches.resolve(self.conn, appt.get("branch_id"))
+        date_text, time_text = self.fdate(appt["appt_date"]), self.ftime(appt["start_time"])
+        if action == "accept":
+            self.reset_flow(step="done")
+            self.note_activity("closure_accepted", "Accepted the new slot {} {}".format(appt["appt_date"], appt["start_time"]),
+                               code="closure_accepted", appointment_id=appt["id"])
+            return self.say("closure_accepted", date=date_text, time=time_text,
+                            tail=self.where_text(branch_id, appt["appt_date"], appt["start_time"]))
+        self.reset_flow()
+        self.s["goal"] = "reschedule"
+        self.slots.update(appointment_id=appt["id"], old_date=appt["appt_date"], old_time=appt["start_time"],
+                          old_branch_id=branch_id, pick_branch=True)
+        self.note_activity("closure_changed", "Chose to pick another slot", code="closure_changed", appointment_id=appt["id"])
+        self.say("closure_choose_another", date=date_text, time=time_text)
+        self.advance()
 
     # -- goals: entering ---------------------------------------------------------
     def start_goal(self, goal, trigger_text):
@@ -988,6 +1131,13 @@ class _Turn:
     def prefill(self, text):
         if not text:
             return
+        if self.s["goal"] == "book" and self.multi():
+            named = match_branch(text, self.eligible_branches())
+            if named:
+                self.slots["branch_id"] = named["id"]
+            pin = find_pin(text)
+            if pin:
+                self.slots["pin"] = pin
         day = parse_day(text, self.today)
         hhmm = parse_time(text)
         if day:
@@ -1067,7 +1217,9 @@ class _Turn:
 
     def ask_which(self, appts, key="which_appt"):
         self.s["step"] = "which"
-        rows = [(appt_choice(a["id"]), self.appt_title(a)) for a in appts[:10]]
+        multi = self.multi()
+        rows = [(appt_choice(a["id"]), self.appt_title(a)) + ((self.branch_name(a.get("branch_id")),) if multi else ())
+                for a in appts[:10]]
         self.say(key, rows=rows, list_button=self.btn("choose"))
 
     def answer_which(self):
@@ -1083,12 +1235,17 @@ class _Turn:
             if intent in ("cancel_appointment", "reschedule_appointment") and slots.get("appointment_id") == appt["id"]:
                 self.reset_flow()
                 return self.say("dup_request")
-        self.slots.update(appointment_id=appt["id"], old_date=appt["appt_date"], old_time=appt["start_time"])
+        branch_id = branches.resolve(self.conn, appt.get("branch_id"))
+        self.slots.update(appointment_id=appt["id"], old_date=appt["appt_date"], old_time=appt["start_time"],
+                          old_branch_id=branch_id)
+        if s["goal"] == "reschedule":
+            self.slots["branch_id"] = branch_id    # a reschedule stays at the appointment's own branch
         s["confusion_count"] = 0
         if s["goal"] == "cancel":
             s["step"] = "confirm"
             return self.say(
                 "confirm_cancel", date=self.fdate(appt["appt_date"]), time=self.ftime(appt["start_time"]),
+                tail=self.where_text(branch_id, appt["appt_date"], appt["start_time"]),
                 buttons=[(confirm_choice("yes"), self.btn("yes")), (confirm_choice("no"), self.btn("no"))],
             )
         self.advance()
@@ -1124,18 +1281,85 @@ class _Turn:
                 return day.isoformat()
         return None
 
+    def no_availability(self):
+        """Nothing free in the whole booking window. With several branches the
+        patient is first offered the others; only when none is left does it
+        go to a person."""
+        sl = self.slots
+        if self.s["goal"] == "book" and self.multi() and sl.get("branch_id") is not None:
+            name = self.branch_name(sl["branch_id"])
+            sl.setdefault("skip_branches", []).append(sl.pop("branch_id"))
+            sl.pop("start_time", None)
+            if self.eligible_branches():
+                return self.ask_branch("branch_no_slots", branch=name, days=BOOKING_HORIZON_DAYS)
+        return self.escalate("no_availability", key="no_availability")
+
+    # -- which branch (book only, and only with more than one branch) -------------
+    def ordered_branches(self):
+        """Eligible branches, nearest first when the patient gave a PIN, else
+        their last-visited branch first and the rest in the clinic's order."""
+        eligible = {b["id"] for b in self.eligible_branches()}
+        pin = self.slots.get("pin")
+        ordered = [b for b in branches.nearest_branches(self.conn, pin) if b["id"] in eligible]
+        last = last_branch_id(self.conn, self.wa_id, self.patient_id, today=self.today.isoformat())
+        if last is not None and not pin:
+            ordered.sort(key=lambda b: 0 if b["id"] == last else 1)    # stable: keeps the clinic's order otherwise
+        return ordered, last
+
+    def ask_branch(self, key=None, **values):
+        s = self.s
+        s["step"] = "branch"
+        ordered, last = self.ordered_branches()
+        if not ordered:
+            return self.escalate("no_availability", key="no_availability")
+        pin = self.slots.get("pin")
+        if key is None:
+            key, values = ("ask_branch_nearest", {"pin": pin}) if pin else ("ask_branch", {})
+        rows = []
+        for b in ordered[:10]:
+            notes = []
+            if b["id"] == last:
+                notes.append(ct.row_note("last_visit", self.lang))
+            if pin and b.get("near"):
+                notes.append(ct.row_note(b["near"], self.lang))
+            if (b.get("address") or "").strip():
+                notes.append(b["address"].strip())
+            rows.append((branch_choice(b["id"]), b["name"][:24], " \u00b7 ".join(notes)[:72] or None))
+        self.say(key, rows=rows, list_button=self.btn("choose_branch"), **values)
+
+    def pick_branch(self, branch_id):
+        """The patient chose a branch (tap or typed): remember it and carry on.
+        A different branch drops the chosen time, which was for the old one."""
+        sl = self.slots
+        if sl.get("branch_id") != branch_id:
+            sl.pop("start_time", None)
+        sl["branch_id"] = branch_id
+        self.s["confusion_count"] = 0
+        self.advance()
+
+    def answer_branch(self):
+        pin = find_pin(self.text)
+        named = match_branch(self.text, self.eligible_branches(), bare_code=True)
+        if named:
+            return self.pick_branch(named["id"])
+        if pin:
+            self.slots["pin"] = pin
+            self.s["confusion_count"] = 0
+            return self.ask_branch()
+        self.confused(lambda: self.ask_branch("ask_branch_retry"))
+
     def ask_day(self, key=None, **values):
         s = self.s
         s["step"] = "day"
         options = self.day_options()
         if not options and self.next_day_with_slots() is None:
-            return self.escalate("no_availability", key="no_availability")
+            return self.no_availability()
         if key is None:
             key = "ask_day_resched" if s["goal"] == "reschedule" else "ask_day"
         if key == "ask_day_resched":
             values = {"date": self.fdate(self.slots["old_date"]), "time": self.ftime(self.slots["old_time"])}
         buttons = [(day_choice(d), self.day_label(d)) for d in options] or None
-        self.say(key, buttons=buttons, **values)
+        self.say(key, buttons=buttons, head=self.where_head(), **values)
 
     def offer(self, key, iso, **values):
         """Up to SLOT_OFFERS free times on `iso`, as buttons (<=3) or a list."""
@@ -1144,13 +1368,20 @@ class _Turn:
         self.s["step"] = "time"
         values.setdefault("date", self.fdate(iso))
         pairs = [(slot_choice(iso, t), self.ftime(t)) for t in picks]
+        head = self.where_head()
         if len(pairs) <= 3:
-            self.say(key, buttons=pairs, **values)
+            self.say(key, buttons=pairs, head=head, **values)
         else:
-            self.say(key, rows=pairs, list_button=self.btn("choose_time"), **values)
+            self.say(key, rows=pairs, list_button=self.btn("choose_time"), head=head, **values)
 
-    def hours_text(self):
-        spans = ["{}-{}".format(self.ftime(a), self.ftime(b)) for a, b in scheduling.CLINIC_HOURS]
+    def hours_text(self, iso=None):
+        """The branch's doctor hours on `iso` ("9:00 AM-1:00 PM and 4:00 PM-8:00 PM")."""
+        day = iso or self.slots.get("appt_date")
+        windows = [(a, b) for a, b, _ in scheduling._windows(self.conn, day, self.slots.get("branch_id"))] if day else []
+        if not windows:
+            windows = [(scheduling._to_minutes(a), scheduling._to_minutes(b)) for a, b in scheduling.CLINIC_HOURS]
+        spans = ["{}-{}".format(self.ftime(scheduling._from_minutes(a)), self.ftime(scheduling._from_minutes(b)))
+                 for a, b in windows]
         return ct.text("and", self.lang).join(spans)
 
     def date_problem(self, iso):
@@ -1161,11 +1392,11 @@ class _Turn:
         return None
 
     def time_problem(self, iso, hhmm):
-        if not _in_hours(hhmm):
+        if not self.is_open_at(iso)(hhmm):
             return "time_closed"
         if iso == self.today.isoformat() and hhmm <= self.now.strftime("%H:%M"):
             return "time_past"
-        if scheduling.is_slot_blocked(self.conn, iso, hhmm):
+        if scheduling.is_slot_blocked(self.conn, iso, hhmm, branch_id=self.slots.get("branch_id")):
             return "time_blocked"
         return "time_taken"
 
@@ -1177,6 +1408,15 @@ class _Turn:
         if s["goal"] == "book" and self.patient is None and not sl.get("name"):
             s["step"] = "name"
             return self.say("ask_name")
+
+        if self.picks_branch() and self.multi():
+            eligible = {b["id"] for b in self.eligible_branches()}
+            if sl.get("branch_id") not in eligible:
+                sl.pop("branch_id", None)
+                if len(eligible) == 1:
+                    sl["branch_id"] = next(iter(eligible))     # only one branch can take bookings: no need to ask
+                else:
+                    return self.ask_branch()
 
         iso = sl.get("appt_date")
         if iso:
@@ -1193,7 +1433,7 @@ class _Turn:
         if not free:
             nxt = self.next_day_with_slots(after_iso=iso)
             if nxt is None:
-                return self.escalate("no_availability", key="no_availability")
+                return self.no_availability()
             sl["appt_date"] = nxt
             sl.pop("start_time", None)
             if scheduling.day_blocked(self.conn, iso):
@@ -1210,7 +1450,7 @@ class _Turn:
             problem = self.time_problem(iso, hhmm)
             values = {}
             if problem == "time_closed":
-                values = {"hours": self.hours_text()}
+                values = {"hours": self.hours_text(iso)}
             elif problem in ("time_taken", "time_blocked"):
                 values = {"time": self.ftime(hhmm)}
             if problem == "time_blocked":
@@ -1236,11 +1476,12 @@ class _Turn:
     def summary(self):
         sl = self.slots
         buttons = [(confirm_choice("yes"), self.btn("confirm")), (confirm_choice("change"), self.btn("change"))]
+        where = self.where_text(sl.get("branch_id"), sl["appt_date"], sl["start_time"])
         if self.s["goal"] == "book":
-            self.say("confirm_book", buttons=buttons, name=self.patient_name() or "-",
+            self.say("confirm_book", buttons=buttons, tail=where, name=self.patient_name() or "-",
                      date=self.fdate(sl["appt_date"]), time=self.ftime(sl["start_time"]))
         else:
-            self.say("confirm_reschedule", buttons=buttons, old_date=self.fdate(sl["old_date"]),
+            self.say("confirm_reschedule", buttons=buttons, tail=where, old_date=self.fdate(sl["old_date"]),
                      old_time=self.ftime(sl["old_time"]), date=self.fdate(sl["appt_date"]),
                      time=self.ftime(sl["start_time"]))
 
@@ -1268,7 +1509,7 @@ class _Turn:
 
     def answer_time(self):
         iso = parse_day(self.text, self.today)
-        hhmm = parse_time(self.text, allow_bare_hour=iso is None)
+        hhmm = parse_time(self.text, allow_bare_hour=iso is None, is_open=self.is_open_at(iso))
         if iso is None and hhmm is None:
             return self.confused(lambda: self.reoffer("offer_retry"))
         if iso is not None and iso != self.slots.get("appt_date"):
@@ -1287,9 +1528,14 @@ class _Turn:
 
     def answer_confirm_text(self):
         """Typed something other than yes/no at the summary: a new day or
-        time changes the request; anything else is a confused turn."""
+        time changes the request, and so does naming another branch (when
+        booking); anything else is a confused turn."""
+        if self.picks_branch() and self.multi():
+            named = match_branch(self.text, self.eligible_branches())
+            if named and named["id"] != self.slots.get("branch_id"):
+                return self.pick_branch(named["id"])
         iso = parse_day(self.text, self.today)
-        hhmm = parse_time(self.text, allow_bare_hour=iso is None)
+        hhmm = parse_time(self.text, allow_bare_hour=iso is None, is_open=self.is_open_at(iso))
         if iso is None and hhmm is None:
             return self.confused(self.reask_confirm)
         if iso is not None and iso != self.slots.get("appt_date"):
@@ -1315,6 +1561,8 @@ class _Turn:
             return self.say("ask_name")
         if step == "which":
             return self.ask_which(self.own_upcoming())
+        if step == "branch":
+            return self.ask_branch()
         if step == "day":
             return self.ask_day()
         if step == "time":
@@ -1328,6 +1576,7 @@ class _Turn:
     def select_appointment_summary(self):
         sl = self.slots
         self.say("confirm_cancel", date=self.fdate(sl["old_date"]), time=self.ftime(sl["old_time"]),
+                 tail=self.where_text(sl.get("old_branch_id"), sl["old_date"], sl["old_time"]),
                  buttons=[(confirm_choice("yes"), self.btn("yes")), (confirm_choice("no"), self.btn("no"))])
 
     # -- confirmation -------------------------------------------------------------
@@ -1369,6 +1618,9 @@ class _Turn:
             }
             note = "Collected by the WhatsApp assistant: {} asked for {} at {}. ".format(
                 self.patient_name() or "the patient", sl["appt_date"], sl["start_time"])
+            if self.multi() and sl.get("branch_id") is not None:
+                slots["branch_id"] = sl["branch_id"]
+                note = note.rstrip() + " at {}. ".format(self.branch_name(sl["branch_id"]))
         else:
             if self.find_own(sl.get("appointment_id")) is None:
                 self.reset_flow()
@@ -1377,6 +1629,9 @@ class _Turn:
                      "start_time": sl["start_time"]}
             note = "Collected by the WhatsApp assistant: move the appointment from {} {} to {} {}. ".format(
                 sl["old_date"], sl["old_time"], sl["appt_date"], sl["start_time"])
+            if sl.get("pick_branch") and sl.get("branch_id") is not None and sl["branch_id"] != sl.get("old_branch_id"):
+                slots["branch_id"] = sl["branch_id"]            # the patient chose another branch
+                note = note.rstrip() + " at {}. ".format(self.branch_name(sl["branch_id"]))
         slots["via"] = "conversation"
         self.complete(_HANDOFF_INTENT[goal], slots, note)
 
@@ -1410,7 +1665,8 @@ class _Turn:
         # Escalated (or no automatic path): the request goes to the staff
         # inbox; the patient's slot is held for them meanwhile.
         if intent != "cancel_appointment":
-            create_hold(self.conn, self.wa_id, slots["appt_date"], slots["start_time"], self.now, self.msg_id)
+            create_hold(self.conn, self.wa_id, slots["appt_date"], slots["start_time"], self.now, self.msg_id,
+                        branch_id=self.slots.get("branch_id"))
             note += "The slot is held for the patient for {} hours.".format(HOLD_HOURS)
         slots["agent_note"] = note
         if outcome is not None and outcome.reason and outcome.code != "switch_off":

@@ -8,7 +8,7 @@ import re
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -83,6 +83,14 @@ class AgentRouteCase(RouteTestCase):
         clinic_app.NOTIFY_SENDER = self.sender
         clinic_app.BACKGROUND = lambda fn, *args: fn(*args)       # inline: deterministic tests
         clinic_app.CLOCK = lambda: CLOCK_NOW
+        # The notification code reads its own clock. Freeze only its LOCAL day / time (what decides
+        # "today", reminders and token wording) so these tests do not depend on what day it really
+        # is; the UTC half stays real because message timestamps and the 24-hour window use it.
+        real_now = mock.patch.object(
+            notify.Now, "real",
+            classmethod(lambda cls: cls(clinic_app._clinic_now(), datetime.now(timezone.utc).replace(tzinfo=None))))
+        real_now.start()
+        self.addCleanup(real_now.stop)
         clinic_app.AGENT_PICKER = self.picker
         self.addCleanup(setattr, clinic_app, "BACKGROUND", None)
         self.addCleanup(setattr, clinic_app, "CLOCK", None)

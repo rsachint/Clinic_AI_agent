@@ -52,35 +52,35 @@ class LocalSQLiteAdapter:
     def mark_no_show(self, conn, slots):
         return intents.queue_mark_no_show(conn, slots)
 
-    def queue_for_date(self, conn, appt_date):
-        return token_queue.day_queue(conn, appt_date)
+    def queue_for_date(self, conn, appt_date, branch_id=None):
+        return token_queue.day_queue(conn, appt_date, branch_id)
 
     def queue_entry(self, conn, appointment_id):
         return token_queue.queue_entry(conn, appointment_id)
 
-    def queue_options(self, conn, appt_date):
-        return token_queue.queue_options(conn, appt_date)
+    def queue_options(self, conn, appt_date, branch_id=None):
+        return token_queue.queue_options(conn, appt_date, branch_id)
 
-    def find_by_token(self, conn, appt_date, number):
-        return token_queue.find_by_token(conn, appt_date, number)
+    def find_by_token(self, conn, appt_date, number, branch_id=None):
+        return token_queue.find_by_token(conn, appt_date, number, branch_id)
 
-    def next_to_call(self, conn, appt_date):
-        return token_queue.next_to_call(conn, appt_date)
+    def next_to_call(self, conn, appt_date, branch_id=None):
+        return token_queue.next_to_call(conn, appt_date, branch_id)
 
-    def queue_snapshot(self, conn, appt_date):
-        return token_queue.queue_snapshot(conn, appt_date)
+    def queue_snapshot(self, conn, appt_date, branch_id=None):
+        return token_queue.queue_snapshot(conn, appt_date, branch_id)
 
-    def available_slots(self, conn, appt_date):
-        return scheduling.generate_slots(conn, appt_date)
+    def available_slots(self, conn, appt_date, branch_id=None):
+        return scheduling.generate_slots(conn, appt_date, branch_id=branch_id)
 
     def upcoming_appointments_for_patient(self, conn, patient_id):
         return queries.upcoming_appointments_for_patient(conn, patient_id)
 
-    def upcoming_appointments_named(self, conn, name):
-        return queries.upcoming_appointments_named(conn, name)
+    def upcoming_appointments_named(self, conn, name, branch_id=None):
+        return queries.upcoming_appointments_named(conn, name, branch_id=branch_id)
 
-    def appointments_named(self, conn, name, start_date=None, end_date=None):
-        return queries.appointments_named(conn, name, start_date, end_date)
+    def appointments_named(self, conn, name, start_date=None, end_date=None, branch_id=None):
+        return queries.appointments_named(conn, name, start_date, end_date, branch_id=branch_id)
 
     def appointment_option(self, conn, appointment_id):
         return queries.appointment_option(conn, appointment_id)
@@ -88,8 +88,11 @@ class LocalSQLiteAdapter:
     def next_appointment_for_patient(self, conn, patient_id):
         return queries.next_appointment_for_patient(conn, patient_id)
 
-    def scheduled_appointments(self, conn, start_date, end_date=None):
-        return queries.scheduled_appointments(conn, start_date, end_date)
+    def calendar_appointments(self, conn, start_date, end_date, branch_id=None):
+        return queries.calendar_appointments(conn, start_date, end_date, branch_id)
+
+    def scheduled_appointments(self, conn, start_date, end_date=None, branch_id=None):
+        return queries.scheduled_appointments(conn, start_date, end_date, branch_id)
 
     def resolve_patient(self, conn, query, top_n=3):
         return entity_resolution.resolve_patient(conn, query, top_n)
@@ -99,6 +102,9 @@ class LocalSQLiteAdapter:
 
     def missed_followups(self, conn, as_of=None):
         return queries.missed_followups(conn, as_of)
+
+    def patient_counts(self, conn):
+        return queries.patient_counts(conn)
 
     def patient_lookup(self, conn, patient_id):
         row = conn.execute(

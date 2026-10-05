@@ -90,7 +90,7 @@ class AutoCase(AgentRouteCase):
         real = cv.free_times
         state = {"calls": 0}
 
-        def fake(conn, iso, now, for_wa_id=None):
+        def fake(conn, iso, now, for_wa_id=None, branch_id=None):
             state["calls"] += 1
             return list(times) if state["calls"] == 1 else real(conn, iso, now, for_wa_id=for_wa_id)
 
@@ -815,8 +815,12 @@ class StaffDirectEditTests(AutoCase):
         self.open_window("919000000001")
         result = self.new()
         self.assertTrue(result["ok"], result)
+        # A staff-entered booking with a name and phone registers the person.
         appt = self.rows("SELECT * FROM appointments")[0]
-        self.assertEqual((appt["patient_id"], appt["patient_name"], appt["patient_phone"]), (None, "Walk In", "9000000001"))
+        patient = self.rows("SELECT * FROM patients WHERE name = 'Walk In'")[0]
+        self.assertEqual((appt["patient_id"], appt["patient_name"], appt["patient_phone"]), (patient["id"], None, None))
+        self.assertEqual(patient["phone"], "9000000001")
+        self.assertIn("Walk In is now a registered patient.", result["message"])
         self.assertEqual(self.sender.calls[0][0], "919000000001")
 
     def test_staff_booking_validation(self):
@@ -949,6 +953,7 @@ class HooksAndIsolationTests(AutoCase):
 
     def test_token_changes_for_other_patients_are_announced_after_an_automatic_booking(self):
         today = date.today().isoformat()
+        clinic_app.CLOCK = lambda: datetime.combine(date.today(), datetime.min.time()).replace(hour=6)     # 6 am, today
         self.patient(WA2, "Bhavna")
         pid2 = self.conn.execute("SELECT id FROM patients WHERE phone=?", (WA2[-10:],)).fetchone()[0]
         later = self.appt(pid2, today, "19:00")
@@ -956,7 +961,6 @@ class HooksAndIsolationTests(AutoCase):
         notify.notify_appointment(self.conn, "booking_confirmed", later, today)           # Bhavna was told: token T-01
         notify.flush(self.conn, self.sender)
         self.sender.calls.clear()
-        clinic_app.CLOCK = lambda: datetime.combine(date.today(), datetime.min.time()).replace(hour=6)
         self.say("book today 6 pm")
         self.say("Sunita Devi")
         self.tap("confirm:yes", "Confirm request")

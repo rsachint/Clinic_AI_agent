@@ -39,7 +39,7 @@ import time
 from collections import namedtuple
 from datetime import date, datetime, timedelta, timezone
 
-from clinic import token_queue, whatsapp
+from clinic import branches, token_queue, whatsapp
 from clinic.entity_resolution import last10_digits
 
 _logger = logging.getLogger(__name__)
@@ -64,6 +64,8 @@ EVENTS = (
     "conv_reply", "staff_message", "request_declined",
     # Automatic / staff-direct appointment actions and their Undo:
     "appointment_cancelled_by_clinic", "appointment_reinstated",
+    # A branch closure moved or cancelled the appointment (clinic/closure_notify.py):
+    "closure_moved", "closure_cancelled",
 )
 
 # Events whose text states the patient's token. Sending one updates
@@ -262,20 +264,21 @@ TEMPLATES = {
 
 
 def render(template_key, language, name=None, token=None, old_token=None,
-           date=None, time=None, ahead=None):
+           date=None, time=None, ahead=None, branch_code=None):
     """Fill a fixed template. `language` is en / hi / hinglish / bilingual
-    (bilingual = the English text followed by the Hinglish text)."""
+    (bilingual = the English text followed by the Hinglish text). `branch_code`
+    puts the branch on the token ("B-T04") when there is more than one branch."""
     if language not in LANGUAGES:
         return "{}\n\n{}".format(
-            render(template_key, "en", name, token, old_token, date, time, ahead),
-            render(template_key, "hinglish", name, token, old_token, date, time, ahead),
+            render(template_key, "en", name, token, old_token, date, time, ahead, branch_code),
+            render(template_key, "hinglish", name, token, old_token, date, time, ahead, branch_code),
         )
     template = TEMPLATES[template_key][language]
     values = {
         "greet": _greet(language, name),
         "name_comma": ", {}".format(name) if name else "",
-        "token": token_queue.format_token(token) if token is not None else "",
-        "old_token": token_queue.format_token(old_token) if old_token is not None else "",
+        "token": token_queue.format_token(token, branch_code) if token is not None else "",
+        "old_token": token_queue.format_token(old_token, branch_code) if old_token is not None else "",
         "date": format_date(date, language) if date else "",
         "time": format_time(time, language) if time else "",
         "ahead": ahead_line(language, ahead),
@@ -356,11 +359,44 @@ def in_window(conn, wa_id, now_utc):
     return now_utc - _parse_ts(row["last"]) <= timedelta(hours=WINDOW_HOURS)
 
 
+# Events that tell the patient WHEN their visit is: with several branches they
+# also say WHERE (the branch name, address and map link).
+_WHERE_EVENTS = frozenset((
+    "booking_confirmed", "appointment_rescheduled", "appointment_reinstated", "status_reply",
+    "reminder_day_before", "reminder_morning",
+))
+
+
+def branch_line(conn, branch_id, doctor_id=None):
+    """'📍 Branch B, Sector 56 ...' (the map link on the next line, then the
+    doctor's name) when there is more than one branch, else ''. Plain text, the
+    same in every language."""
+    if not branches.multi_branch(conn):
+        return ""
+    branch = branches.get_branch(conn, branches.resolve(conn, branch_id))
+    if not branch:
+        return ""
+    line = "\U0001F4CD " + ", ".join(part for part in (branch["name"], (branch.get("address") or "").strip()) if part)
+    if branch.get("maps_url"):
+        line += "\n" + branch["maps_url"].strip()
+    doctor = branches.doctor_label(conn, doctor_id) if doctor_id else None
+    if doctor:
+        line += "\n\U0001FA7A " + doctor
+    return line
+
+
+def _all_branch_ids(conn):
+    """Every branch to sweep for reminders and token changes (retired ones too:
+    they may still hold an appointment)."""
+    ids = [b["id"] for b in branches.list_branches(conn, include_inactive=True)]
+    return ids or [None]
+
+
 def _appointment_context(conn, appointment_id):
     row = conn.execute(
         """
-        SELECT a.id, a.appt_date, a.start_time, a.status, a.queue_state, a.last_notified_token,
-               COALESCE(p.name, a.patient_name) AS name,
+        SELECT a.id, a.appt_date, a.start_time, a.status, a.queue_state, a.last_notified_token, a.branch_id,
+               a.doctor_id, COALESCE(p.name, a.patient_name) AS name,
                COALESCE(a.patient_phone, p.phone) AS phone
         FROM appointments a LEFT JOIN patients p ON p.id = a.patient_id
         WHERE a.id = ?
@@ -441,12 +477,17 @@ def notify_appointment(conn, event, appointment_id, discriminator, now=None, *,
             key = "status_reply_in_consultation"
 
     language = language or patient_language(conn, wa_id)
+    code = token_queue._label_code(conn, branches.resolve(conn, ctx["branch_id"]))
     body = render(
         key, language, name=ctx["name"],
         token=entry["token"] if entry else None, old_token=old_token,
         date=ctx["appt_date"], time=ctx["start_time"],
         ahead=entry["ahead"] if entry and is_today else None,
+        branch_code=code,
     )
+    where = branch_line(conn, ctx["branch_id"], ctx["doctor_id"]) if event in _WHERE_EVENTS else ""
+    if where:
+        body = "{}\n{}".format(body, where)
     row_id = enqueue(
         conn, event=event, dedup_key="{}:{}:{}".format(event, appointment_id, discriminator),
         body=body, wa_id=wa_id, appointment_id=appointment_id, language=language, now=now,
@@ -531,23 +572,24 @@ def fanout_queue_changes(conn, now=None, include_two_ahead=True):
     last_notified_token and the dedup_key stop repeats."""
     now = now or Now.real()
     today = now.today.isoformat()
-    entries = token_queue.day_queue(conn, today)
-    started = _queue_has_started(entries)
-    for entry in entries:
-        if not entry["outstanding"] or entry["queue_state"] == "in_consultation":
-            continue
-        told = entry["last_notified_token"]
-        if told is not None and told != entry["token"]:
-            seq = conn.execute(
-                "SELECT COUNT(*) AS n FROM notifications WHERE appointment_id = ? AND event = 'token_changed'",
-                (entry["id"],),
-            ).fetchone()["n"]
-            notify_appointment(
-                conn, "token_changed", entry["id"], "{}>{}#{}".format(told, entry["token"], seq),
-                now, old_token=told, record_skip=False,
-            )
-        if include_two_ahead and started and entry["ahead"] == 2:
-            notify_appointment(conn, "queue_two_ahead", entry["id"], today, now, record_skip=False)
+    for branch_id in _all_branch_ids(conn):          # every branch has its own queue
+        entries = token_queue.day_queue(conn, today, branch_id)
+        started = _queue_has_started(entries)
+        for entry in entries:
+            if not entry["outstanding"] or entry["queue_state"] == "in_consultation":
+                continue
+            told = entry["last_notified_token"]
+            if told is not None and told != entry["token"]:
+                seq = conn.execute(
+                    "SELECT COUNT(*) AS n FROM notifications WHERE appointment_id = ? AND event = 'token_changed'",
+                    (entry["id"],),
+                ).fetchone()["n"]
+                notify_appointment(
+                    conn, "token_changed", entry["id"], "{}>{}#{}".format(told, entry["token"], seq),
+                    now, old_token=told, record_skip=False,
+                )
+            if include_two_ahead and started and entry["ahead"] == 2:
+                notify_appointment(conn, "queue_two_ahead", entry["id"], today, now, record_skip=False)
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +610,13 @@ def after_write(conn, intent, slots, entity_id, now=None, wa_id=None, language=N
     the message to the patient whose request this was; otherwise it is
     inferred from their last message."""
     now = now or Now.real()
+
+    if slots.get("quiet"):
+        # A closure moved / cancelled this appointment and sends its own notice
+        # (clinic/closure_notify.py): no "moved" / "cancelled" message here, but
+        # the queue tokens of everyone else still get refreshed.
+        fanout_queue_changes(conn, now, include_two_ahead=False)
+        return
 
     if intent == "book_appointment":
         notify_appointment(conn, "booking_confirmed", entity_id, slots.get("appt_date"), now, language=language)
@@ -848,15 +897,17 @@ def generate_reminders(conn, now=None):
     if now.local.hour >= REMINDER_MORNING_FROM_HOUR:
         today = now.today.isoformat()
         hhmm = now.local.strftime("%H:%M")
-        for entry in token_queue.day_queue(conn, today):
-            if entry["outstanding"] and entry["queue_state"] is None and entry["start_time"] >= hhmm:
-                if notify_appointment(conn, "reminder_morning", entry["id"], today, now, record_skip=False):
-                    created += 1
+        for branch_id in _all_branch_ids(conn):
+            for entry in token_queue.day_queue(conn, today, branch_id):
+                if entry["outstanding"] and entry["queue_state"] is None and entry["start_time"] >= hhmm:
+                    if notify_appointment(conn, "reminder_morning", entry["id"], today, now, record_skip=False):
+                        created += 1
 
     if now.local.hour >= REMINDER_DAY_BEFORE_FROM_HOUR:
         tomorrow = (now.today + timedelta(days=1)).isoformat()
         recent_cutoff = _ts(now.utc - timedelta(hours=RECENT_CONTACT_SKIP_HOURS))
-        for entry in token_queue.day_queue(conn, tomorrow):
+        tomorrow_entries = [e for branch_id in _all_branch_ids(conn) for e in token_queue.day_queue(conn, tomorrow, branch_id)]
+        for entry in tomorrow_entries:
             if not entry["outstanding"]:
                 continue
             just_told = conn.execute(

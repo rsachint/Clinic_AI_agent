@@ -496,3 +496,45 @@ class BareDayAndWordedTimeTests(unittest.TestCase):
         self.assertFalse(datetime_extract.mentions_unreadable_date("सात तारीख के अपॉइंटमेंट", today))
         self.assertFalse(datetime_extract.mentions_unreadable_date("show appointments", today))
         self.assertFalse(datetime_extract.mentions_unreadable_date("may I see the appointments", today))
+
+
+class EnglishWordedTimeTests(unittest.TestCase):
+    """Times spoken in English words ("one PM"), which the digit and Hindi
+    patterns used to miss, so the voice flow asked "What time?" again."""
+
+    def time(self, text):
+        return datetime_extract.extract_appt_time(text)
+
+    def test_the_reported_sentence(self):
+        text = "Create an appointment for a patient called Naman on 6th of October at one PM."
+        self.assertEqual(self.time(text), "13:00")
+
+    def test_hour_words_with_am_pm(self):
+        for text, expected in (
+            ("at two pm", "14:00"), ("at one p.m.", "13:00"), ("at ten am", "10:00"),
+            ("at twelve pm", "12:00"), ("at twelve am", "00:00"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.time(text), expected)
+
+    def test_minutes_and_part_of_day(self):
+        for text, expected in (
+            ("at one thirty PM", "13:30"), ("one forty-five pm", "13:45"),
+            ("one in the afternoon", "13:00"), ("six in the evening", "18:00"),
+            ("nine in the morning", "09:00"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.time(text), expected)
+
+    def test_half_and_quarter(self):
+        for text, expected in (
+            ("quarter to five pm", "16:45"), ("quarter past nine in the morning", "09:15"),
+            ("half past four pm", "16:30"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.time(text), expected)
+
+    def test_a_number_word_that_is_not_a_time_is_left_alone(self):
+        for text in ("book one patient tomorrow", "ten patients are waiting", "at one", "two appointments"):
+            with self.subTest(text=text):
+                self.assertIsNone(self.time(text))

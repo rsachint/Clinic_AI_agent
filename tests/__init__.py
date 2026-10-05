@@ -7,6 +7,8 @@ os.environ.pop("GOOGLE_SERVICE_ACCOUNT_FILE", None)
 # The app has no built-in calendar address (it comes from GOOGLE_CALENDAR_ID in
 # .env), so the suite uses a neutral demo one -- never a developer's real one.
 os.environ["GOOGLE_CALENDAR_ID"] = "clinic-demo@example.com"
+# Google sync is off by default in the app; its own tests exercise it with a fake client.
+os.environ["GOOGLE_CALENDAR_SYNC"] = "1"
 
 # The intent router calls a local model (Ollama). Unit tests must never wait on
 # it: switch it off here; the tests that exercise it patch the call or turn it

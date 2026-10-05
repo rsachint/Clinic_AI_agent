@@ -274,6 +274,105 @@ test("Notes is always the last table column", () => {
   assert.deepStrictEqual(orderColumns(["Notes", "id"]), ["id", "Notes"]);
 });
 
+test("branch and doctor columns show only with several branches; their ids and code never do", () => {
+  const { orderColumns } = window;
+  const keys = ["id", "appt_date", "branch_id", "doctor_id", "branch", "branch_code", "doctor", "notes"];
+  assert.deepStrictEqual(orderColumns(keys), ["id", "appt_date", "notes"]);
+  assert.deepStrictEqual(orderColumns(keys, false), ["id", "appt_date", "notes"]);
+  assert.deepStrictEqual(orderColumns(keys, true), ["id", "appt_date", "branch", "doctor", "notes"]);
+});
+
+// ---- branches.js (pure helpers) ---------------------------------------------
+require("../static/branches.js");
+const BR = [{ id: 1, name: "Branch A" }, { id: 2, name: "Branch B" }, { id: 3, name: "Branch C" }];
+test("pickBranchId keeps a valid stored branch and falls back otherwise", () => {
+  assert.strictEqual(window.pickBranchId("2", BR, 1), 2);
+  assert.strictEqual(window.pickBranchId(3, BR, 1), 3);
+  assert.strictEqual(window.pickBranchId("9", BR, 1), 1);
+  assert.strictEqual(window.pickBranchId(null, BR, 1), 1);
+  assert.strictEqual(window.pickBranchId("all", BR, 1), 1);
+});
+test("pickViewBranch allows 'all' only when there is more than one branch", () => {
+  assert.strictEqual(window.pickViewBranch("all", BR, 1), "all");
+  assert.strictEqual(window.pickViewBranch("all", [BR[0]], 1), 1);
+  assert.strictEqual(window.pickViewBranch("3", BR, 1), 3);
+  assert.strictEqual(window.pickViewBranch("junk", BR, 2), 2);
+});
+test("Branches falls back to defaults when the page carries no data", () => {
+  assert.strictEqual(window.Branches.multi(), false);
+  assert.strictEqual(window.Branches.mine(), 1);
+  assert.strictEqual(window.Branches.view(), 1);
+  assert.strictEqual(window.Branches.viewQuery(), "branch=1");
+});
+
+// ---- calendar_view.js (pure date helpers) -----------------------------------
+require("../static/calendar_view.js");
+test("week starts on the Monday on or before the date", () => {
+  assert.strictEqual(window.cvWeekStart("2026-10-05"), "2026-10-05");   // a Monday
+  assert.strictEqual(window.cvWeekStart("2026-10-11"), "2026-10-05");   // the Sunday after
+  assert.strictEqual(window.cvWeekStart("2026-10-07"), "2026-10-05");
+  assert.deepStrictEqual(window.cvRange("week", "2026-10-07"), { start: "2026-10-05", end: "2026-10-11" });
+});
+test("month range covers whole weeks, across year ends too", () => {
+  assert.deepStrictEqual(window.cvMonthRange("2026-10-15"), { start: "2026-09-28", end: "2026-11-01" });
+  assert.deepStrictEqual(window.cvMonthRange("2026-12-10"), { start: "2026-11-30", end: "2027-01-03" });
+});
+test("agenda is two weeks from the anchor", () => {
+  assert.deepStrictEqual(window.cvRange("agenda", "2026-10-05"), { start: "2026-10-05", end: "2026-10-18" });
+});
+test("previous / next move by the right amount", () => {
+  assert.strictEqual(window.cvShift("week", "2026-10-05", 1), "2026-10-12");
+  assert.strictEqual(window.cvShift("week", "2026-10-05", -1), "2026-09-28");
+  assert.strictEqual(window.cvShift("agenda", "2026-10-05", 1), "2026-10-19");
+  assert.strictEqual(window.cvShift("month", "2026-10-31", 1), "2026-11-01");
+  assert.strictEqual(window.cvShift("month", "2026-01-15", -1), "2025-12-01");
+});
+test("date arithmetic never slips a day across month ends", () => {
+  assert.strictEqual(window.cvAddDays("2026-02-28", 1), "2026-03-01");
+  assert.strictEqual(window.cvAddDays("2028-02-28", 1), "2028-02-29");
+  assert.strictEqual(window.cvAddDays("2026-12-31", 1), "2027-01-01");
+});
+test("titles and day labels", () => {
+  assert.strictEqual(window.cvTitle("month", "2026-10-05"), "October 2026");
+  assert.strictEqual(window.cvTitle("week", "2026-10-07"), "5 Oct - 11 Oct 2026");
+  assert.strictEqual(window.cvDayLabel("2026-10-07"), "Wed 7 Oct");
+});
+test("the week grid widens only when an appointment falls outside 08:00-20:00", () => {
+  assert.deepStrictEqual(window.cvHourBounds([{ start_time: "09:00", end_time: "09:30" }]), { start: 480, end: 1200 });
+  assert.deepStrictEqual(window.cvHourBounds([{ start_time: "07:30", end_time: "08:00" }, { start_time: "20:30", end_time: "21:15" }]), { start: 420, end: 1320 });
+});
+test("appointments are grouped by day", () => {
+  const g = window.cvGroupByDay([{ appt_date: "2026-10-05", id: 1 }, { appt_date: "2026-10-06", id: 2 }, { appt_date: "2026-10-05", id: 3 }]);
+  assert.deepStrictEqual(g["2026-10-05"].map((a) => a.id), [1, 3]);
+});
+
+// ---- closures.js (pure helpers) -----------------------------------------------
+require("../static/closures.js");
+test("a closure option round-trips through its select value", () => {
+  const option = { branch_id: 2, date: "2026-10-06", time: "10:30" };
+  assert.strictEqual(window.closureOptionValue(option), "2|2026-10-06|10:30");
+  assert.deepStrictEqual(window.closureParseValue("2|2026-10-06|10:30"), { to_branch_id: 2, to_date: "2026-10-06", to_time: "10:30" });
+  assert.strictEqual(window.closureOptionValue(null), "");
+  for (const bad of ["", "2|2026-10-06", "||", "a|b", null, undefined]) assert.strictEqual(window.closureParseValue(bad), null);
+});
+
+test("a closure row sends a target only for a move", () => {
+  assert.deepStrictEqual(window.closureRowPayload(7, "move", "3|2026-10-06|09:00"),
+    { appointment_id: 7, action: "move", to_branch_id: 3, to_date: "2026-10-06", to_time: "09:00" });
+  assert.deepStrictEqual(window.closureRowPayload(7, "cancel", "3|2026-10-06|09:00"), { appointment_id: 7, action: "cancel" });
+  assert.deepStrictEqual(window.closureRowPayload(7, "leave", ""), { appointment_id: 7, action: "leave" });
+  // a move with nothing chosen carries no target, so the card can tell and ask
+  assert.strictEqual(window.closureRowPayload(7, "move", "").to_branch_id, undefined);
+});
+
+test("the closure summary says what happened and what the patients were told", () => {
+  const counts = { moved: 5, cancelled: 1, failed: 1, left: 2 };
+  assert.strictEqual(window.closureSummaryLine(counts, null), "5 moved, 1 cancelled, 2 left as they were, 1 could not be changed.");
+  assert.strictEqual(window.closureSummaryLine({ moved: 2, cancelled: 0, failed: 0, left: 0 }, { sent: 1, waiting: 1, recorded: 0, failed: 0 }),
+    "2 moved. 1 told on WhatsApp; 1 waiting to be sent (outside WhatsApp's 24-hour window).");
+  assert.strictEqual(window.closureSummaryLine({ moved: 0, cancelled: 0, failed: 0, left: 0 }, null), "No appointments were touched.");
+});
+
 if (failures.length) {
   console.error(failures.length + " failed, " + passed + " passed");
   failures.forEach((f) => console.error("  FAIL " + f));

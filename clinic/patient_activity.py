@@ -23,6 +23,7 @@ _logger = logging.getLogger(__name__)
 EVENTS = (
     "requested", "auto_booked", "auto_cancelled", "auto_rescheduled", "escalated", "blocked", "conflict",
     "undone", "staff_booked", "staff_cancelled", "staff_rescheduled",
+    "closure_moved", "closure_cancelled", "closure_undone", "closure_accepted", "closure_changed",
 )
 SOURCES = ("whatsapp-agent", "staff")
 AUTO_EVENTS = ("auto_booked", "auto_cancelled", "auto_rescheduled")
@@ -42,6 +43,11 @@ LABELS = {
     "staff_booked": "Booked by staff",
     "staff_cancelled": "Cancelled by staff",
     "staff_rescheduled": "Rescheduled by staff",
+    "closure_moved": "Moved because a branch closed",
+    "closure_cancelled": "Cancelled because a branch closed",
+    "closure_undone": "Put back after a closure was undone",
+    "closure_accepted": "Accepted the new slot after a closure",
+    "closure_changed": "Chose another slot after a closure",
 }
 
 

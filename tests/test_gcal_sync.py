@@ -707,8 +707,18 @@ class ConfigTests(unittest.TestCase):
             # a key file alone is not enough: the calendar address must be set too
             with patch.dict(os.environ, {"GOOGLE_SERVICE_ACCOUNT_FILE": str(key)}, clear=True):
                 self.assertFalse(gcal_config.is_configured())
-            with patch.dict(os.environ, {"GOOGLE_SERVICE_ACCOUNT_FILE": str(key), "GOOGLE_CALENDAR_ID": CAL}, clear=True):
+            with patch.dict(os.environ, {"GOOGLE_SERVICE_ACCOUNT_FILE": str(key), "GOOGLE_CALENDAR_ID": CAL, "GOOGLE_CALENDAR_SYNC": "1"}, clear=True):
                 self.assertTrue(gcal_config.is_configured())
+
+    def test_sync_is_off_unless_switched_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            key = Path(tmp) / "key.json"
+            key.write_text("{}")
+            base = {"GOOGLE_SERVICE_ACCOUNT_FILE": str(key), "GOOGLE_CALENDAR_ID": CAL}
+            for flag, expected in ((None, False), ("", False), ("0", False), ("no", False), ("1", True), ("true", True), ("ON", True)):
+                env = dict(base, **({"GOOGLE_CALENDAR_SYNC": flag} if flag is not None else {}))
+                with patch.dict(os.environ, env, clear=True):
+                    self.assertEqual(gcal_config.is_configured(), expected, flag)
 
     def test_the_key_file_is_never_opened_to_decide(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -716,7 +726,7 @@ class ConfigTests(unittest.TestCase):
             key.write_text("not read")
             key.chmod(0)
             try:
-                with patch.dict(os.environ, {"GOOGLE_SERVICE_ACCOUNT_FILE": str(key), "GOOGLE_CALENDAR_ID": CAL}, clear=True):
+                with patch.dict(os.environ, {"GOOGLE_SERVICE_ACCOUNT_FILE": str(key), "GOOGLE_CALENDAR_ID": CAL, "GOOGLE_CALENDAR_SYNC": "1"}, clear=True):
                     self.assertTrue(gcal_config.is_configured())
             finally:
                 key.chmod(0o600)

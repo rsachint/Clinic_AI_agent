@@ -1,7 +1,7 @@
 from collections import namedtuple
 from datetime import date, datetime, timedelta
 
-from clinic import core, entity_resolution
+from clinic import branches, closures, core, entity_resolution, scheduling, voice_branch, voice_closure
 from clinic.nlu.answer import compose_answer, compose_navigation
 from clinic.nlu.parser import QUEUE_WRITE_INTENTS, UnrecognizedCommand, parse
 from clinic.queries import registered_names
@@ -30,6 +30,12 @@ ParsedResult = namedtuple("ParsedResult", ["intent", "slots", "resolved"])
 # A navigation command (open_calendar): the dashboard switches tab / view and
 # nothing is read or written. `mode` is "week" / "month" / "agenda" or None.
 NavigateResult = namedtuple("NavigateResult", ["intent", "tab", "mode", "answer_text"])
+# "Switch to Branch C": the page changes this computer's My branch (and the
+# branch it is viewing). Nothing is read from or written to the clinic's data.
+SwitchBranchResult = namedtuple("SwitchBranchResult", ["intent", "branch_id", "branch_name", "answer_text"])
+# "Close Branch A tomorrow": the batch review card (clinic/closures.py). It is only a plan --
+# nothing is closed, moved or sent until a person presses Apply on the card.
+ClosurePlanResult = namedtuple("ClosurePlanResult", ["intent", "plan", "reason", "answer_text"])
 
 
 def _local_now():
@@ -87,16 +93,17 @@ def _resolve_queue_command(conn, intent, slots, clinical_adapter):
     Nothing here raises or writes; a wrong or missing guess is a blank/wrong
     dropdown for the human to fix before approving."""
     today = date.today().isoformat()
-    options = clinical_adapter.queue_options(conn, today)
+    branch_id = slots.get("branch_id")        # the branch whose queue is meant (None: the only / default one)
+    options = clinical_adapter.queue_options(conn, today, branch_id)
     outstanding_ids = {o["id"] for o in options}
-    entries = clinical_adapter.queue_for_date(conn, today)
+    entries = clinical_adapter.queue_for_date(conn, today, branch_id)
 
     appointment_id = None
     note = None
     token = slots.get("token")
     name = slots.get("patient_name")
     if token:
-        entry = clinical_adapter.find_by_token(conn, today, token)
+        entry = clinical_adapter.find_by_token(conn, today, token, branch_id)
         if entry and entry["id"] in outstanding_ids:
             appointment_id = entry["id"]
         else:
@@ -117,7 +124,7 @@ def _resolve_queue_command(conn, intent, slots, clinical_adapter):
         else:
             note = "No one named '{}' is waiting in today's queue.".format(name)
     elif intent == "queue_call_next":
-        nxt = clinical_adapter.next_to_call(conn, today)
+        nxt = clinical_adapter.next_to_call(conn, today, branch_id)
         if nxt:
             appointment_id = nxt["id"]
         else:
@@ -140,10 +147,27 @@ def transcript_to_response(conn, text, clinical_adapter, ops_adapter, language_c
     `context` (a clinic.voice_context.VoiceContext, voice flow only) lets a
     follow-up lean on what was just discussed, and lets the assistant ask for
     a missing patient / day / time instead of opening a half-empty card."""
-    try:
-        intent, slots = parse(text, known_names=registered_names(conn), context=context)
-    except UnrecognizedCommand:
-        raise PipelineError("Could not classify this into a known command.")
+    mention = voice_branch.find(conn, text)
+    if mention.branch is None and voice_branch.is_switch_command(text):
+        mention = voice_branch.find(conn, text, tail=True)        # "change my branch to b"
+    if voice_branch.is_switch_command(text):
+        intent, slots = "set_my_branch", {"branch_id": mention.branch["id"] if mention.branch else None}
+    elif voice_closure.is_close_command(conn, text, mention):
+        intent, slots = "close_branch", voice_closure.parse(conn, text, mention.text, mention, today=date.today())
+    else:
+        try:
+            intent, slots = parse(mention.text, known_names=registered_names(conn), context=context)
+        except UnrecognizedCommand:
+            raise PipelineError("Could not classify this into a known command.")
+        if mention.branch:
+            slots["branch_id"] = mention.branch["id"]
+        elif mention.every:
+            slots["all_branches"] = True
+    if context is not None and intent not in ("set_my_branch", "close_branch"):
+        if mention.branch:
+            context.remember_branch(mention.branch["id"])     # later commands stay at it
+        elif mention.mine:
+            context.remember_branch(None)
     return respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, language_code,
                              defer_intents, context=context)
 
@@ -172,6 +196,118 @@ def _appointment_options(clinical_adapter, conn, appointment_id, name=None):
     return options, suggested
 
 
+def _branch_scope(conn, slots):
+    """(branch_id, all_branches, branch_name) for a read. With one branch: (None,
+    False, None) so nothing mentions branches; a branch id filters to it; "all
+    branches" lists every one."""
+    if not branches.multi_branch(conn):
+        return None, False, None
+    if slots.get("all_branches"):
+        return None, True, None
+    branch_id = slots.get("branch_id")
+    return branch_id, False, (branches.branch_label(conn, branch_id) if branch_id else None)
+
+
+def _switch_branch(conn, slots, context, language_code):
+    """"Switch to Branch C": tell the page which branch this computer works for."""
+    items = branches.list_branches(conn)
+    if len(items) < 2:
+        from clinic.voice_context import Note
+        return Note("There is only one branch, so there is nothing to switch.")
+    branch_id = slots.get("branch_id")
+    if not branch_id:
+        from clinic.voice_context import AskResult, question_text
+        options = [{"label": b["name"], "branch_id": b["id"]} for b in items]
+        return AskResult("set_my_branch", slots, "branch", question_text("branch", language_code), options)
+    name = branches.branch_label(conn, branch_id)
+    if context is not None:
+        context.my_branch = int(branch_id)
+        context.branch = None
+    if language_code == "hi-IN":
+        text = "Theek hai, ab aap {} par kaam kar rahe hain.".format(name)
+    else:
+        text = "Done. This computer now works for {}.".format(name)
+    return SwitchBranchResult("set_my_branch", int(branch_id), name, text)
+
+
+def _close_branch(conn, slots, context, language_code):
+    """"Close Branch A tomorrow": ask for whatever is missing, then show the batch plan."""
+    from clinic.voice_context import AskResult, Note, question_text
+    if not branches.multi_branch(conn):
+        return Note("Closing a branch needs more than one branch. Use a booking block to stop bookings.")
+    if slots.get("date_unreadable"):
+        raise PipelineError("I couldn't read the day. Please say it again, for example 'tomorrow', 'Monday' or '9 October'.")
+    start = slots.get("appt_date")
+    if not start:
+        return AskResult("close_branch", slots, "date", question_text("date", language_code), [])
+    branch_id = slots.get("branch_id")
+    if not branch_id and slots.get("doctor_id"):
+        branch_id = voice_closure.doctor_branch(conn, slots["doctor_id"], start)
+    if not branch_id and context is not None and not slots.get("doctor_id"):
+        branch_id = context.current_branch()
+    if not branch_id:
+        options = [{"label": b["name"], "branch_id": b["id"]} for b in branches.list_branches(conn)]
+        return AskResult("close_branch", slots, "branch", question_text("branch", language_code), options)
+    try:
+        plan = closures.plan(conn, branch_id, start, slots.get("end_date") or start, doctor_id=slots.get("doctor_id"),
+                             now=_local_now())
+    except closures.ClosureError as exc:
+        raise PipelineError(str(exc))
+    if context is not None:
+        context.remember_date(start)
+    counts = plan["counts"]
+    if language_code == "hi-IN":
+        text = "{} mein {} mareez booked hain. Neeche dekhkar Apply dabayein; tab tak kuch nahi badlega.".format(
+            plan["scope"]["branch"], counts["total"])
+    else:
+        text = "{} patient{} booked at {} in that window. Review the batch below; nothing changes until you press Apply.".format(
+            counts["total"], "" if counts["total"] == 1 else "s", plan["scope"]["branch"])
+    return ClosurePlanResult("close_branch", plan, slots.get("reason") or "", text)
+
+
+def _slot_notes(conn, intent, slots):
+    """What staff should know about the time on a booking / move card before
+    approving: the doctor on duty, or why the time cannot be had at that
+    branch (no doctor then, already taken) and what is free instead. Advisory
+    only: the check at approval time is the real one."""
+    notes = []
+    appointment_id = slots.get("appointment_id")
+    branch_id = slots.get("branch_id")
+    if intent == "reschedule_appointment":
+        row = conn.execute("SELECT branch_id FROM appointments WHERE id = ?", (appointment_id,)).fetchone() \
+            if appointment_id else None
+        current = branches.resolve(conn, row["branch_id"]) if row else None
+        if branch_id in (None, ""):
+            branch_id = current
+        elif current is not None and int(branch_id) != current:
+            notes.append("Moving from {} to {}.".format(branches.branch_label(conn, current),
+                                                        branches.branch_label(conn, branch_id)))
+    branch_id = branches.resolve(conn, branch_id)
+    name = branches.branch_label(conn, branch_id)
+    appt_date, start = slots.get("appt_date"), slots.get("start_time")
+    if not (appt_date and start):
+        return notes
+    try:
+        doctor_id = scheduling.within_doctor_hours(conn, appt_date, start, scheduling.SLOT_MINUTES, branch_id)
+        problem = None
+        if doctor_id is None:
+            problem = "{} has no doctor on duty at {} on {} (that day: {}).".format(
+                name, start, appt_date, branches.hours_summary(conn, branch_id, appt_date))
+        elif not scheduling.is_slot_free(conn, appt_date, start, scheduling.SLOT_MINUTES,
+                                         exclude_appointment_id=appointment_id, branch_id=branch_id):
+            problem = "{} is already booked or blocked at {}.".format(start, name)
+        if problem:
+            free = scheduling.generate_slots(conn, appt_date, branch_id=branch_id)
+            notes.append(problem)
+            notes.append("Free at {} that day: {}.".format(name, ", ".join(free[:6]) if free else "nothing"))
+        else:
+            doctor = branches.doctor_label(conn, doctor_id or None)
+            notes.append("{}{}.".format(name, " \u00b7 {}".format(doctor) if doctor else ""))
+    except ValueError:
+        pass          # an unreadable date: the card's own field check says so
+    return notes
+
+
 def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, language_code="hi-IN",
                       defer_intents=frozenset(), context=None, skipped=(), fresh=True):
     """Everything after the transcript has become an (intent, slots) pair.
@@ -180,6 +316,14 @@ def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, 
     if intent == "open_calendar":
         mode = slots.get("mode")
         return NavigateResult(intent, "appointments", mode, compose_navigation(intent, mode, language_code))
+
+    if intent == "set_my_branch":
+        return _switch_branch(conn, slots, context, language_code)
+
+    if intent == "close_branch":
+        return _close_branch(conn, slots, context, language_code)
+
+    slots = voice_branch.default_branch(conn, intent, slots, context)
 
     if context is not None:
         try:
@@ -224,6 +368,10 @@ def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, 
             staff = _best_effort_staff(ops_adapter, conn, slots.get("staff_name"))
             if staff:
                 resolved = {"staff_id": staff.id, "staff_label": staff.label}
+        if intent in ("book_appointment", "reschedule_appointment") and branches.multi_branch(conn):
+            notes = _slot_notes(conn, intent, slots)
+            if notes:
+                resolved = dict(resolved, notes=notes)
         return ParsedResult(intent, slots, resolved)
 
     if intent == "register_patient":
@@ -323,10 +471,22 @@ def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, 
         pid = core.propose(conn, intent, slots, source_text=text)
         return WriteResult(pid, intent, "expense: Rs {} -- {}".format(slots["amount_rupees"], slots["description"]))
 
-    if intent == "queue_status":
-        data = clinical_adapter.queue_snapshot(conn, date.today().isoformat())
+    if intent == "patient_count":
+        data = clinical_adapter.patient_counts(conn)
         citation = clinical_adapter.citation()
         return ReadResult(intent, data, citation, compose_answer(intent, data, citation, language_code))
+
+    if intent == "queue_status":
+        branch_id, every, branch_name = _branch_scope(conn, slots)
+        today_iso = date.today().isoformat()
+        if every:
+            data = [dict(clinical_adapter.queue_snapshot(conn, today_iso, b["id"]), branch=b["name"])
+                    for b in branches.list_branches(conn)]
+        else:
+            data = clinical_adapter.queue_snapshot(conn, today_iso, branch_id)
+        citation = clinical_adapter.citation()
+        return ReadResult(intent, data, citation,
+                          compose_answer(intent, data, citation, language_code, branch=None if every else branch_name))
 
     if intent == "missed_followups":
         data = clinical_adapter.missed_followups(conn)
@@ -348,11 +508,22 @@ def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, 
 
     if intent == "check_availability":
         appt_date = slots.get("appt_date") or date.today().isoformat()
-        data = {"date": appt_date, "slots": clinical_adapter.available_slots(conn, appt_date)}
+        branch_id, every, branch_name = _branch_scope(conn, slots)
+        if every:
+            data = []
+            for b in branches.list_branches(conn):
+                free = clinical_adapter.available_slots(conn, appt_date, b["id"])
+                data.append({"branch": b["name"], "date": appt_date, "free_slots": len(free),
+                             "times": ", ".join(free[:8]) + (" ..." if len(free) > 8 else "")})
+        else:
+            data = {"date": appt_date, "slots": clinical_adapter.available_slots(conn, appt_date, branch_id)}
+            if branch_name:
+                data["branch"] = branch_name
         if context is not None:
             context.remember_date(appt_date)
         citation = clinical_adapter.citation()
-        return ReadResult(intent, data, citation, compose_answer(intent, data, citation, language_code))
+        return ReadResult(intent, data, citation,
+                          compose_answer(intent, data, citation, language_code, branch=branch_name))
 
     if intent == "list_appointments":
         today = date.today()
@@ -375,11 +546,16 @@ def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, 
             # A person and no day: every date, past and upcoming.
             start = end = scope = None
             when = "all dates"
+        # A named person is looked up at every branch unless a branch was named;
+        # a day list is one branch's (My branch by default) or, on request, all.
+        branch_id, every, branch_name = _branch_scope(conn, slots)
         if name:
-            data = [dict(row) for row in clinical_adapter.appointments_named(conn, name, start, end)]
+            data = [dict(row) for row in clinical_adapter.appointments_named(conn, name, start, end, branch_id)]
             caption = "Appointments for {} \u00b7 {}".format(name, when)
         else:
-            data = [dict(row) for row in clinical_adapter.scheduled_appointments(conn, start, end)]
+            data = [dict(row) for row in clinical_adapter.scheduled_appointments(conn, start, end, branch_id)]
+        if branch_name:
+            caption = "{} \u00b7 {}".format(caption or scope or when, branch_name)
         if is_week:
             # A forward-looking list: today's appointments whose time has
             # already passed are not "coming up". (A one-day list keeps the
@@ -391,7 +567,8 @@ def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, 
         citation = clinical_adapter.citation()
         # Nothing matching a heard name says so (compose_answer) -- never today's list instead.
         return ReadResult(intent, data, citation,
-                          compose_answer(intent, data, citation, language_code, scope=scope, name=name or None),
+                          compose_answer(intent, data, citation, language_code, scope=scope, name=name or None,
+                                         branch=branch_name),
                           caption)
 
     if intent == "next_appointment":

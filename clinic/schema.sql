@@ -53,14 +53,19 @@ CREATE TABLE IF NOT EXISTS appointments (
     -- The token number last communicated to this patient, so a token_changed
     -- notification fires only when the number actually changed for them.
     -- (Tokens themselves are NOT stored: see clinic/token_queue.py.)
-    last_notified_token INTEGER
+    last_notified_token INTEGER,
+    -- Which branch and which doctor this appointment is with (multi-branch).
+    -- NULL = the default branch (older rows are back-filled by db.py).
+    branch_id INTEGER REFERENCES branches(id),
+    doctor_id INTEGER REFERENCES doctors(id)
 );
 
 CREATE TABLE IF NOT EXISTS staff (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     role TEXT,
-    phone TEXT
+    phone TEXT,
+    branch_id INTEGER                -- where this person normally works (NULL = any)
 );
 
 CREATE TABLE IF NOT EXISTS attendance (
@@ -193,7 +198,8 @@ CREATE TABLE IF NOT EXISTS slot_holds (
     appt_date TEXT NOT NULL,
     start_time TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL
+    expires_at TEXT NOT NULL,
+    branch_id INTEGER                      -- NULL = the default branch
 );
 
 -- Google Calendar one-way sync (clinic/gcal_sync.py). All additive; none of
@@ -256,7 +262,12 @@ CREATE TABLE IF NOT EXISTS booking_blocks (
     end_time TEXT,
     reason TEXT,
     active INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    -- Who the block applies to. NULL branch = every branch (a brand-wide
+    -- holiday); NULL doctor = every doctor. A branch closure sets branch_id;
+    -- a doctor's leave sets doctor_id.
+    branch_id INTEGER,
+    doctor_id INTEGER
 );
 
 -- Every time a patient initiates an appointment event (and every staff direct
@@ -295,3 +306,108 @@ BEFORE DELETE ON audit_log
 BEGIN
     SELECT RAISE(ABORT, 'audit_log is immutable');
 END;
+
+
+-- ---------------------------------------------------------------------------
+-- Multi-branch (one brand, several branches, doctors who can work at more than
+-- one of them). Branch A is always present, so a single-clinic database keeps
+-- behaving exactly as before; B and C (and example doctors) are created once by
+-- clinic/branches.py's ensure_seed() when the app opens a real database.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS branches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,            -- short, shown on tokens: 'A'
+    name TEXT NOT NULL,
+    address TEXT,
+    maps_url TEXT,
+    phone TEXT,
+    pin_code TEXT,                        -- used to rank "nearest branch"
+    latitude REAL,                        -- optional, for later (not used yet)
+    longitude REAL,
+    status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
+    closed_reason TEXT,
+    closed_message TEXT,                  -- what patients are told while closed
+    color TEXT,                           -- calendar colour
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS doctors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    title TEXT,
+    specialty TEXT,
+    active INTEGER NOT NULL DEFAULT 1
+);
+
+-- When a doctor is at a branch: one row per weekday window (0 = Monday ...
+-- 6 = Sunday). A branch is open exactly when one of its doctors is scheduled
+-- there; at most one doctor per branch at any time (checked in code).
+CREATE TABLE IF NOT EXISTS doctor_schedules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    doctor_id INTEGER NOT NULL REFERENCES doctors(id),
+    branch_id INTEGER NOT NULL REFERENCES branches(id),
+    weekday INTEGER NOT NULL CHECK (weekday BETWEEN 0 AND 6),
+    start_time TEXT NOT NULL,
+    end_time TEXT NOT NULL,
+    valid_from TEXT,
+    valid_to TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_doctor_schedules_branch ON doctor_schedules (branch_id, weekday);
+
+INSERT OR IGNORE INTO branches (id, code, name, address, pin_code, color, sort_order)
+VALUES (1, 'A', 'Branch A', 'Main clinic (edit the address in Settings)', '122001', '#1a6dd6', 1);
+
+INSERT OR IGNORE INTO doctors (id, name, title, specialty) VALUES (1, 'Dr. Mehta', 'Dr.', 'General physician');
+
+-- Branch A keeps today's hours (09:00-13:00 and 16:00-20:00, every day), staffed by doctor 1.
+INSERT INTO doctor_schedules (doctor_id, branch_id, weekday, start_time, end_time)
+SELECT 1, 1, w.weekday, h.start_time, h.end_time
+FROM (SELECT 0 AS weekday UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5 UNION SELECT 6) AS w,
+     (SELECT '09:00' AS start_time, '13:00' AS end_time UNION SELECT '16:00', '20:00') AS h
+WHERE NOT EXISTS (SELECT 1 FROM doctor_schedules WHERE branch_id = 1);
+
+-- A closure: a branch (or one doctor at it) is unavailable for a date range and
+-- its existing appointments were moved to other branches or cancelled in one
+-- reviewed batch (clinic/closures.py). It wraps the booking block that stops
+-- new bookings. Only an APPLIED closure is stored: the plan a person reviews
+-- before applying is computed on demand. closure_moves has one row per
+-- appointment the batch touched, with where it came from, where it went, and
+-- what the patient answered ("Accept" / "Choose another").
+CREATE TABLE IF NOT EXISTS closures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch_id INTEGER NOT NULL REFERENCES branches(id),
+    doctor_id INTEGER,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    start_time TEXT,
+    end_time TEXT,
+    reason TEXT,
+    message TEXT,
+    block_id INTEGER,
+    status TEXT NOT NULL DEFAULT 'applied' CHECK (status IN ('applied', 'undone')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    undone_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS closure_moves (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    closure_id INTEGER NOT NULL REFERENCES closures(id),
+    appointment_id INTEGER NOT NULL REFERENCES appointments(id),
+    action TEXT NOT NULL CHECK (action IN ('move', 'cancel')),
+    from_branch_id INTEGER,
+    from_date TEXT NOT NULL,
+    from_time TEXT NOT NULL,
+    to_branch_id INTEGER,
+    to_date TEXT,
+    to_time TEXT,
+    -- done: applied; failed: refused at apply time (see error); undone: put back; skipped: undo left it
+    result TEXT NOT NULL DEFAULT 'pending' CHECK (result IN ('pending', 'done', 'failed', 'undone', 'skipped')),
+    error TEXT,
+    -- what the patient answered to the WhatsApp notice
+    response TEXT NOT NULL DEFAULT 'none' CHECK (response IN ('none', 'accepted', 'changed')),
+    responded_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_closure_moves_closure ON closure_moves (closure_id);
+CREATE INDEX IF NOT EXISTS idx_closure_moves_appointment ON closure_moves (appointment_id);

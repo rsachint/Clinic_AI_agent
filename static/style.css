@@ -302,3 +302,101 @@ details.card table { margin-top: 12px; }
 
 .tab-panel[data-tab="assistant"]:not([hidden]) { display: flex; flex-direction: column; height: calc(100vh - 48px); }
 .list-caption { font-size: 13px; color: var(--muted); margin: 0 0 6px; }
+
+/* ===== Multi-branch, in-app calendar and closures ===================================
+   Restored on top of the redesign: same class names the JS and templates already use,
+   written with the design tokens above (no fixed colours). */
+
+/* A table answer in the Assistant uses the whole row, keeps each value on one line and
+   scrolls sideways on a narrow screen; only the free-text Notes column wraps. */
+.bubble-assistant.bubble-wide { align-self: stretch; max-width: 100%; overflow-x: auto; }
+.bubble-assistant table th, .bubble-assistant table td { white-space: nowrap; }
+.bubble-assistant table td.cell-notes { white-space: normal; min-width: 180px; }
+
+/* ---- branches: sidebar switcher, Settings, per-branch queue ---- */
+.branch-switcher { margin: 0 6px 14px; padding: 10px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; display: flex; flex-direction: column; gap: 6px; }
+.branch-switcher[hidden] { display: none; }
+.branch-switcher label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.branch-switcher select { width: 100%; font: inherit; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--border); background: #fff; }
+.branch-switcher select:focus, .cv-branch select:focus { outline: 2px solid var(--accent-line); border-color: var(--accent); }
+.branch-field[hidden] { display: none; }
+.queue-branch-name { color: var(--accent-dark); }
+.settings-table td, .settings-table th { text-align: left; vertical-align: top; padding: 10px 12px; }
+.settings-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.settings-edit-row td { background: var(--accent-soft); }
+.weekday-picks { display: flex; flex-wrap: wrap; gap: 14px; margin: 10px 0; }
+.weekday-pick { display: inline-flex; align-items: center; gap: 4px; }
+#settings-this-computer select { margin-top: 6px; font: inherit; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--border); background: #fff; }
+
+/* ---- in-app calendar (Appointments tab) ---- */
+.cv-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; justify-content: space-between; margin-bottom: 12px; }
+.cv-nav { display: flex; align-items: center; gap: 6px; }
+.cv-title { font-weight: 600; font-size: 17px; margin-left: 8px; letter-spacing: -.005em; }
+.cv-modes { display: flex; gap: 6px; }
+.cv-branch { display: flex; align-items: center; gap: 8px; font-size: 13.5px; color: var(--muted); }
+.cv-branch[hidden] { display: none; }
+.cv-branch select { font: inherit; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--border); background: #fff; color: var(--text); }
+.cv-legend { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 10px; font-size: 12.5px; color: var(--muted); }
+.cv-legend-chip { display: inline-flex; align-items: center; gap: 6px; }
+.cv-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.cv-body { overflow-x: auto; }
+
+.cv-week { display: grid; grid-template-columns: 52px repeat(7, minmax(110px, 1fr)); min-width: 860px; border-top: 1px solid var(--border); }
+.cv-corner, .cv-dayhead { border-bottom: 1px solid var(--border); padding: 8px 6px; font-weight: 600; font-size: 12.5px; text-align: center; background: var(--bg); }
+.cv-dayhead.cv-today, .cv-agenda-date.cv-today { color: var(--accent-dark); background: var(--accent-soft); }
+.cv-gutter { position: relative; border-right: 1px solid var(--border); }
+.cv-hour { position: absolute; right: 6px; transform: translateY(-7px); font-size: 11px; color: var(--muted); }
+.cv-daycol { position: relative; border-left: 1px solid var(--border); background-image: linear-gradient(to bottom, var(--border) 1px, transparent 1px); background-size: 100% 52px; }
+.cv-daycol.cv-today { background-color: rgba(63, 82, 188, .04); }
+.cv-appt { display: flex; gap: 6px; align-items: baseline; text-align: left; width: 100%; overflow: hidden; background: var(--accent-soft); border: 1px solid var(--accent-line); border-left: 4px solid var(--accent); border-radius: 6px; padding: 2px 6px; margin: 1px 0; font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; color: var(--text); }
+.cv-daycol .cv-appt { position: absolute; left: 2px; right: 2px; width: auto; z-index: 1; }
+.cv-appt:hover { background: var(--accent-line); }
+.cv-appt-time { font-weight: 700; flex: none; }
+.cv-appt-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cv-closure { position: absolute; inset: 0 0 auto 0; z-index: 0; height: 100%; pointer-events: none; padding: 2px 4px; font-size: 11px; color: var(--danger-dark);
+  background: repeating-linear-gradient(45deg, var(--danger-soft), var(--danger-soft) 8px, #fff 8px, #fff 16px); }
+
+.cv-month { display: grid; grid-template-columns: repeat(7, minmax(110px, 1fr)); min-width: 780px; border-top: 1px solid var(--border); border-left: 1px solid var(--border); }
+.cv-month .cv-dayhead { border-right: 1px solid var(--border); }
+.cv-cell { min-height: 104px; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); padding: 4px; cursor: pointer; display: flex; flex-direction: column; gap: 2px; }
+.cv-cell:hover { background: var(--bg); }
+.cv-cell.cv-today { background: var(--accent-soft); }
+.cv-cell.cv-other { background: var(--bg); color: var(--muted); }
+.cv-cell.cv-closed { background: repeating-linear-gradient(45deg, var(--danger-soft), var(--danger-soft) 8px, #fff 8px, #fff 16px); }
+.cv-celldate { font-size: 12px; font-weight: 600; }
+.cv-more { font-size: 11px; color: var(--muted); }
+
+.cv-agenda-day { margin-bottom: 14px; }
+.cv-agenda-date { font-weight: 600; padding: 7px 10px; border-radius: 8px; background: var(--bg); margin-bottom: 4px; }
+.cv-closure-row { position: static; height: auto; display: block; margin: 2px 0 4px; border-radius: 6px; padding: 4px 8px; }
+.cv-agenda-row { display: flex; gap: 14px; align-items: baseline; width: 100%; text-align: left; background: var(--card); border: 1px solid var(--border); border-left: 4px solid var(--accent); border-radius: 8px; padding: 7px 12px; margin: 3px 0; font: inherit; font-weight: 400; cursor: pointer; color: var(--text); }
+.cv-agenda-row:hover { background: var(--bg); }
+.cv-agenda-time { font-weight: 700; min-width: 96px; }
+.cv-agenda-name { min-width: 160px; }
+.cv-status { margin-left: auto; font-size: 12px; color: var(--muted); text-transform: capitalize; }
+
+/* the floating details card shown on hover */
+.cv-tip { position: fixed; z-index: 1000; min-width: 190px; max-width: 280px; padding: 10px 14px; background: var(--card); border: 1px solid var(--accent-line); border-radius: 10px; box-shadow: var(--shadow-lg); display: flex; flex-direction: column; gap: 3px; pointer-events: none; font-size: 13px; }
+.cv-tip[hidden] { display: none; }
+.cv-tip-hint { margin-top: 4px; font-size: 11px; color: var(--muted); }
+
+/* ---- closures: the batch review card and the history ---- */
+.closure-card { border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; margin-top: 14px; background: var(--card); box-shadow: var(--shadow); }
+.closure-title { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
+.closure-fields { display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0; }
+.closure-fields label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; font-weight: 600; color: var(--muted); flex: 1 1 260px; }
+.closure-fields input { font: inherit; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: #fff; color: var(--text); }
+.closure-fields input:focus, .closure-table select:focus { outline: 2px solid var(--accent-line); border-color: var(--accent); }
+.closure-table-wrap { overflow-x: auto; }
+.closure-table td, .closure-table th { white-space: nowrap; vertical-align: top; }
+.closure-table select { font: inherit; padding: 6px 8px; max-width: 300px; border: 1px solid var(--border); border-radius: 8px; background: #fff; }
+.closure-table tr.closure-leave { background: var(--bg); color: var(--muted); }
+.closure-note { white-space: normal; max-width: 300px; font-size: 12px; }
+.closure-actions { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+.closure-status { margin-top: 12px; padding: 9px 12px; border-radius: 8px; font-size: 13.5px; }
+.closure-ok { background: var(--ok-soft); border: 1px solid var(--ok-line); color: var(--ok-text); }
+.closure-bad { background: var(--danger-soft); border: 1px solid var(--danger-line); color: var(--danger-dark); }
+.closure-fail { color: var(--danger-dark); margin-top: 4px; }
+.closure-history-head { margin: 20px 0 6px; font-size: 13px; font-weight: 600; }
+.closure-history-row { border-top: 1px solid var(--border); padding: 10px 0; }
+.closure-history-title { font-weight: 600; }

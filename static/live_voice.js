@@ -130,12 +130,18 @@ var SENTENCE_REDUNDANT_WITH_TABLE = {
   patient_lookup: true, list_appointments: true, missed_followups: true, next_appointment: true,
 };
 
-// Columns never shown: every appointment is 30 minutes, so the length says nothing.
-var HIDDEN_COLUMNS = { duration_minutes: true };
+// Columns never shown: every appointment is 30 minutes, so the length says nothing;
+// the branch / doctor ids and the branch code duplicate the names beside them.
+var HIDDEN_COLUMNS = { duration_minutes: true, branch_id: true, doctor_id: true, branch_code: true };
+// Only worth a column when the clinic has more than one branch.
+var BRANCH_COLUMNS = { branch: true, doctor: true };
 
 // Table columns in display order: hidden ones dropped, free-text Notes always last.
-window.orderColumns = function (keys) {
-  keys = keys.filter(function (k) { return !HIDDEN_COLUMNS[String(k).toLowerCase()]; });
+window.orderColumns = function (keys, multiBranch) {
+  keys = keys.filter(function (k) {
+    var name = String(k).toLowerCase();
+    return !HIDDEN_COLUMNS[name] && (multiBranch || !BRANCH_COLUMNS[name]);
+  });
   var rest = keys.filter(function (k) { return String(k).toLowerCase() !== "notes"; });
   var notes = keys.filter(function (k) { return String(k).toLowerCase() === "notes"; });
   return rest.concat(notes);
@@ -308,7 +314,8 @@ document.addEventListener("DOMContentLoaded", function () {
         },
         // resolved.note: why the best-guess dropdown was left blank, e.g.
         // "Token 9 is not waiting in today's queue."
-        notes: data.resolved && data.resolved.note ? [data.resolved.note] : [],
+        notes: [].concat(data.resolved && data.resolved.note ? [data.resolved.note] : [],
+                         (data.resolved && data.resolved.notes) || []),
         buildApprovePayload: function (slots) {
           return { intent: data.intent, slots: slots, transcript: data.transcript, language: data.language };
         },
@@ -373,13 +380,18 @@ document.addEventListener("DOMContentLoaded", function () {
       var rows = Array.isArray(data.data) ? data.data : [data.data];
       if (rows.length && typeof rows[0] === "object") {
         var table = el("table");
+        bubble.classList.add("bubble-wide");      // a table gets the whole row, not 92% of it
         var headerRow = el("tr");
-        var columns = window.orderColumns(Object.keys(rows[0]));
+        var columns = window.orderColumns(Object.keys(rows[0]), !!(window.Branches && Branches.multi()));
         columns.forEach(function (k) { headerRow.appendChild(el("th", { text: k })); });
         table.appendChild(headerRow);
         rows.forEach(function (row) {
           var tr = el("tr");
-          columns.forEach(function (k) { tr.appendChild(el("td", { text: row[k] === null || row[k] === undefined ? "-" : row[k] })); });
+          columns.forEach(function (k) {
+            var cell = el("td", { text: row[k] === null || row[k] === undefined ? "-" : row[k] });
+            if (String(k).toLowerCase() === "notes") cell.className = "cell-notes";   // the one column allowed to wrap
+            tr.appendChild(cell);
+          });
           table.appendChild(tr);
         });
         bubble.appendChild(table);
@@ -640,7 +652,16 @@ document.addEventListener("DOMContentLoaded", function () {
     if (!machine.isHeld()) setState("idle");
   }
 
+  // Tell the server which branch this computer works for (My branch) and which one
+  // the switcher shows, so "book Amit tomorrow" lands in the right branch.
+  function syncBranch() {
+    if (!window.Branches || !socket.connected) return;
+    socket.emit("set_branch", { mine: Branches.mine(), view: Branches.view() });
+  }
+  document.addEventListener("branchchange", syncBranch);
+
   socket.on("connect", function () {
+    syncBranch();
     connected = true;
     if (!machine.isHeld()) setState("idle");
   });
@@ -734,6 +755,27 @@ document.addEventListener("DOMContentLoaded", function () {
   socket.on("assistant_note", function (data) {
     var bubble = takeBubble(data.transcript);
     bubble.appendChild(el("div", { class: "assistant-note", text: data.message }));
+    afterResult();
+  });
+
+  // "Switch to Branch C": this computer's My branch (and what it views) changes.
+  socket.on("switch_branch", function (data) {
+    var bubble = takeBubble(data.transcript);
+    if (window.Branches) {
+      Branches.setMine(data.branch_id);
+      Branches.setView(data.branch_id);
+    }
+    bubble.appendChild(el("div", { style: "font-size:16px;", text: data.answer_text }));
+    afterResult();
+  });
+
+  // "Close Branch A tomorrow": the batch review card, a plan only. The Apply button
+  // on it (a person's tap) is what closes the branch and moves anyone.
+  socket.on("closure_plan", function (data) {
+    var bubble = takeBubble(data.transcript);
+    bubble.classList.add("bubble-wide");
+    bubble.appendChild(el("div", { style: "font-size:16px;margin-bottom:10px;", text: data.answer_text }));
+    if (window.ClosureCard) bubble.appendChild(ClosureCard.build(data.plan, { reason: data.reason }));
     afterResult();
   });
 

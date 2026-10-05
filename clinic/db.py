@@ -11,6 +11,8 @@ SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 _APPOINTMENT_COLUMNS = (
     ("queue_state", "TEXT"),
     ("last_notified_token", "INTEGER"),
+    ("branch_id", "INTEGER"),
+    ("doctor_id", "INTEGER"),
 )
 
 # Same idea for the WhatsApp conversation agent: table -> [(column, decl)].
@@ -20,6 +22,9 @@ _ADDED_COLUMNS = {
     "appointments": _APPOINTMENT_COLUMNS,
     "wa_messages": (("agent_handled", "INTEGER DEFAULT 0"),),
     "notifications": (("interactive_json", "TEXT"),),
+    "booking_blocks": (("branch_id", "INTEGER"), ("doctor_id", "INTEGER")),
+    "staff": (("branch_id", "INTEGER"),),
+    "slot_holds": (("branch_id", "INTEGER"),),
 }
 
 

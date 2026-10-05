@@ -15,7 +15,7 @@ Checks, in order
 ----------------
 all intents   automation switched on; staff have not taken over the chat
 book          valid slot on the slot grid; not in the past; within 30
-              days; inside clinic hours; not in a staff block; slot free;
+              days; inside the chosen branch's doctor hours; not in a staff block; slot free;
               fewer than 3 active bookings for this number; a name for an
               unregistered number; daily automation cap not reached
 cancel        the appointment exists, is the SENDER'S OWN (matched by
@@ -29,7 +29,7 @@ reschedule    the same ownership / state checks, then the new slot passes the
 from collections import namedtuple
 from datetime import date, datetime, timedelta
 
-from clinic import patient_activity, scheduling, settings
+from clinic import branches, patient_activity, scheduling, settings
 from clinic.entity_resolution import last10_digits, resolve_patient_by_phone
 from clinic.whatsapp_pipeline import sender_appointments
 
@@ -58,9 +58,10 @@ def _sender_mode(conn, wa_id):
     return row["mode"] if row else "agent"
 
 
-def _slot_checks(conn, appt_date, start_time, now, exclude_appointment_id=None):
+def _slot_checks(conn, appt_date, start_time, now, exclude_appointment_id=None, branch_id=None):
     """Shared by book and reschedule: is this exact slot one automation may
-    use? Returns a Decision (auto=True when it may)."""
+    use at that branch (the default when none is named)? Returns a Decision
+    (auto=True when it may)."""
     try:
         day = date.fromisoformat(str(appt_date))
         scheduling._to_minutes(str(start_time))
@@ -74,14 +75,15 @@ def _slot_checks(conn, appt_date, start_time, now, exclude_appointment_id=None):
         return _no("past", "the requested time has already passed")
     if day > today + timedelta(days=MAX_DAYS_AHEAD):
         return _no("too_far", "the requested date is more than {} days ahead".format(MAX_DAYS_AHEAD))
-    if start_time not in scheduling.slot_grid():
-        return _no("outside_hours", "the requested time is outside clinic hours")
-    reason = scheduling.block_reason(conn, str(appt_date), start_time, scheduling.SLOT_MINUTES)
+    if start_time not in scheduling.slot_grid(conn, str(appt_date), branch_id):
+        return _no("outside_hours", "the requested time is outside clinic hours" if not branches.multi_branch(conn)
+                   else "the requested time is outside the branch's doctor hours")
+    reason = scheduling.block_reason(conn, str(appt_date), start_time, scheduling.SLOT_MINUTES, branch_id)
     if reason is not None:
         return _no("blocked", "the requested time is inside a booking block{}".format(
             " ({})".format(reason) if reason else ""))
     if not scheduling.is_slot_free(conn, str(appt_date), start_time, scheduling.SLOT_MINUTES,
-                                   exclude_appointment_id=exclude_appointment_id):
+                                   exclude_appointment_id=exclude_appointment_id, branch_id=branch_id):
         return _no("slot_taken", "the requested slot is already booked")
     return _ok()
 
@@ -90,7 +92,7 @@ def _own_appointment(conn, appointment_id, wa_id, patient_id):
     """(row, None) when `appointment_id` is the sender's own; (None, Decision)
     when it is missing or someone else's."""
     row = conn.execute(
-        "SELECT a.id, a.patient_id, a.appt_date, a.start_time, a.status, a.queue_state, "
+        "SELECT a.id, a.patient_id, a.appt_date, a.start_time, a.status, a.queue_state, a.branch_id, "
         "COALESCE(a.patient_phone, p.phone) AS phone "
         "FROM appointments a LEFT JOIN patients p ON p.id = a.patient_id WHERE a.id = ?",
         (appointment_id,),
@@ -130,7 +132,8 @@ def evaluate(conn, intent, slots, wa_id, now):
     patient_id = patient.id if patient else None
 
     if intent == "book_appointment":
-        decision = _slot_checks(conn, slots.get("appt_date"), slots.get("start_time"), now)
+        branch_id = branches.resolve(conn, slots.get("branch_id"))
+        decision = _slot_checks(conn, slots.get("appt_date"), slots.get("start_time"), now, branch_id=branch_id)
         if not decision.auto:
             return decision
         # Active = booked/confirmed and not yet started (the same notion the
@@ -159,5 +162,7 @@ def evaluate(conn, intent, slots, wa_id, now):
         return decision
     if intent == "cancel_appointment":
         return _ok()
+    # A reschedule stays at the appointment's own branch unless the request names another.
+    target_branch = slots.get("branch_id") if slots.get("branch_id") not in (None, "") else row["branch_id"]
     return _slot_checks(conn, slots.get("appt_date"), slots.get("start_time"), now,
-                        exclude_appointment_id=row["id"])
+                        exclude_appointment_id=row["id"], branch_id=branches.resolve(conn, target_branch))

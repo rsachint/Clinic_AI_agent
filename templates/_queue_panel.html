@@ -6,12 +6,16 @@
 {% set queue_is_past = queue_is_past if queue_is_past is defined else false %}
 {% set queue_date = queue_date if queue_date is defined else queue_today %}
 {% set state_labels = {'booked': 'Not arrived', 'checked_in': 'Checked in', 'in_consultation': 'In consultation', 'done': 'Done', 'no_show': 'No-show'} %}
-<div class="card" id="queue-card">
-  <h2>{% if queue_is_today %}Today's queue{% else %}Queue for {{ queue_date }}{% endif %} <span class="count">({{ queue_entries|length }} · {{ queue_date }})</span></h2>
-  {% if queue_entries %}
+{# One card per branch shown (a single card unless the switcher says "All branches"). #}
+{% set queue_groups_or_default = queue_groups if queue_groups is defined else [{'branch': none, 'entries': queue_entries}] %}
+{% set queue_multi = queue_multi if queue_multi is defined else false %}
+{% for group in queue_groups_or_default %}
+<div class="card queue-card" {% if loop.first %}id="queue-card"{% endif %}>
+  <h2>{% if queue_is_today %}Today's queue{% else %}Queue for {{ queue_date }}{% endif %}{% if queue_multi and group.branch %} · <span class="queue-branch-name">{{ group.branch.name }}</span>{% endif %} <span class="count">({{ group.entries|length }} · {{ queue_date }})</span></h2>
+  {% if group.entries %}
   <table class="queue-table">
     <tr><th>Token</th><th>Patient</th><th>Slot</th><th>State</th><th>N ahead</th><th>Actions</th></tr>
-    {% for e in queue_entries %}
+    {% for e in group.entries %}
     {% set state = 'done' if e.status == 'completed' else ('no_show' if e.status == 'no_show' else (e.queue_state or 'booked')) %}
     <tr class="queue-row state-{{ state }}">
       <td class="queue-token">{{ e.token_label }}</td>
@@ -34,7 +38,7 @@
         {% endif %}
         {# Staff direct edits: the click is the approval (no review card); the patient is notified automatically. #}
         {% if new_backend and e.outstanding and not queue_is_past and state != 'in_consultation' %}
-          <button type="button" class="btn-queue" data-queue-edit="move" data-appointment-id="{{ e.id }}" data-name="{{ e.name or '' }}" data-date="{{ e.appt_date }}" data-time="{{ e.start_time }}">Move</button>
+          <button type="button" class="btn-queue" data-queue-edit="move" data-appointment-id="{{ e.id }}" data-branch="{{ e.branch_id }}" data-name="{{ e.name or '' }}" data-date="{{ e.appt_date }}" data-time="{{ e.start_time }}">Move</button>
           <button type="button" class="btn-queue btn-queue-danger" data-queue-edit="cancel" data-appointment-id="{{ e.id }}" data-name="{{ e.name or '' }}" data-date="{{ e.appt_date }}" data-time="{{ e.start_time }}">Cancel</button>
         {% endif %}
       </div></td>
@@ -45,6 +49,7 @@
   <p class="muted">No appointments {% if queue_is_today %}today{% else %}on {{ queue_date }}{% endif %}.</p>
   {% endif %}
 </div>
+{% endfor %}
 
 <div class="card" id="notifications-card">
   <h2>Recent notifications <span class="count">(WhatsApp messages to patients)</span></h2>

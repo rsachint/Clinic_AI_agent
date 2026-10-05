@@ -94,7 +94,7 @@ class SchemaUpgradeTests(unittest.TestCase):
     def test_new_table_shapes(self):
         conn = db.connect(":memory:")
         cols = lambda t: {r[1] for r in conn.execute("PRAGMA table_info({})".format(t))}
-        self.assertEqual(cols("booking_blocks"), {"id", "start_date", "end_date", "start_time", "end_time", "reason", "active", "created_at"})
+        self.assertEqual(cols("booking_blocks"), {"id", "start_date", "end_date", "start_time", "end_time", "reason", "active", "created_at", "branch_id", "doctor_id"})  # + branch / doctor scope (multi-branch)
         self.assertTrue({"id", "patient_id", "wa_id", "patient_name", "appointment_id", "event", "source", "detail", "created_at"} <= cols("patient_activity"))
         self.assertTrue({"key", "value"} <= cols("app_settings"))
         conn.execute("INSERT INTO booking_blocks (start_date, end_date) VALUES ('2026-10-06', '2026-10-06')")

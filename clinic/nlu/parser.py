@@ -1,7 +1,7 @@
 import logging
 
 from clinic.nlu import extract
-from clinic.nlu.classify import calendar_mode, classify
+from clinic.nlu.classify import calendar_mode, classify, is_move_command, is_patient_count
 from clinic.nlu.datetime_extract import extract_appt_date, extract_appt_time, mentions_unreadable_date
 from clinic.nlu.intent_llm import llm_enabled, pick_intent
 from clinic.voice_context import contextual_intent, spoken_time
@@ -26,7 +26,7 @@ def parse(text, known_names=None, context=None):
 # Intents that never use a name: no point looking one up in the background.
 _NAMELESS_INTENTS = frozenset((
     "check_availability", "day_end_cashbook", "missed_followups",
-    "queue_status", "open_calendar", "log_expense",
+    "queue_status", "open_calendar", "log_expense", "patient_count",
 ))
 
 
@@ -69,6 +69,10 @@ def _parse(text, context=None):
         if rules_intent not in (None, contextual):
             _logger.info("Context rule: %s overrides rules=%s for transcript=%r", contextual, rules_intent, text)
         intent = contextual
+    elif is_move_command(text):
+        intent = rules_intent      # an explicit "move / shift ... appointment": no need to ask the model
+    elif is_patient_count(text):
+        intent = "patient_count"   # "how many patients are registered": a count, never a registration
     else:
         if llm_enabled() and rules_intent not in _NAMELESS_INTENTS:
             prefetch_name(text)  # runs while the intent model below is thinking
@@ -171,7 +175,7 @@ def _parse(text, context=None):
         return intent, slots
     if intent == "next_appointment":
         return intent, {"patient_name": extract_name(text)}
-    if intent in ("missed_followups", "day_end_cashbook", "queue_status"):
+    if intent in ("missed_followups", "day_end_cashbook", "queue_status", "patient_count"):
         return intent, {}
     if intent == "open_calendar":
         # Read-only navigation: which embed view (week / month / agenda), or

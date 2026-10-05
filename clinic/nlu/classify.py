@@ -221,6 +221,8 @@ def _classify_queue_related(normalized):
 _APPT_NOUN = ["appointment", "अपॉइंटमेंट", "booking", "बुकिंग", "slot", "स्लॉट"]
 _CANCEL_WORDS = ["cancel", "कैंसिल", "रद्द"]
 _RESCHEDULE_WORDS = ["reschedule", "रीशेड्यूल", "postpone", "date badlo", "दूसरे दिन", "किसी और दिन", "shift karo"]
+# "move Amit to Branch B at 3", "shift his appointment": whole words only ("remove" is not "move").
+_MOVE_WORD = re.compile(r"(?<![a-z])(?:move|moved|transfer|transferred|shift|shifted)(?![a-z])|शिफ्ट|ट्रांसफर")
 _AVAILABILITY_WORDS = ["free", "available", "उपलब्ध", "khaali", "खाली", "khali", "vacant"]
 _DATE_WORDS = ["kal", "आज", "aaj", "today", "tomorrow"]
 _NEXT_APPOINTMENT_PHRASES = [
@@ -269,6 +271,35 @@ def _has_appt_noun(normalized):
     return _any(normalized, _APPT_NOUN)
 
 
+# "How many patients have been registered so far?", "total patients", "kitne patients hain":
+# a COUNT of patient records. Must beat the bare "register" keyword (the word "registered"
+# is in the question), so it is decided by this precise rule before the keyword list is read,
+# and the parser trusts it over the model. Queue and appointment questions ("how many
+# patients are waiting", "how many appointments") are not claimed.
+_COUNT_WORD = re.compile(
+    r"how\s+many|(?<![a-z])(?:total|count|number\s+of|kitne|kitni|kul)(?![a-z])|कितने|कितनी|कुल|संख्या")
+_PATIENT_NOUN = re.compile(r"(?<![a-z])(?:patients?|mareez|marij|patient\s+records)(?![a-z])|मरीज|पेशेंट|रोगी")
+_NOT_A_PATIENT_COUNT = re.compile(
+    r"waiting|queue|appointment|booked|booking|slot|token|follow\s*up|visit|consultation|fee|today's\s+cash|expense"
+    r"|इंतज़ार|इंतजार|कतार|अपॉइंटमेंट|फॉलो|फीस|खर्च|intezaar|intezar|baaki|baki|बाकी|aaye|आए|आये")
+
+
+def is_patient_count(text):
+    normalized = _normalize(text)
+    return bool(_COUNT_WORD.search(normalized) and _PATIENT_NOUN.search(normalized)
+                and not _NOT_A_PATIENT_COUNT.search(normalized))
+
+
+def is_move_command(text):
+    """"move Amit to Branch B at 3", "Amit ko shift karo kal 11 baje": an explicit
+    move/shift word AND the keyword rules read it as a reschedule. Precise
+    enough to route without asking the model (which reads "move" as a booking
+    and "shift karo" as attendance)."""
+    normalized = _normalize(text)
+    return (bool(_MOVE_WORD.search(normalized)) or "shift karo" in normalized) \
+        and _classify_appointment_related(normalized) == "reschedule_appointment"
+
+
 def _classify_appointment_related(normalized):
     is_appt_context = _has_appt_noun(normalized) or _has_time_hint(normalized)
 
@@ -276,7 +307,7 @@ def _classify_appointment_related(normalized):
     if cancel_word and is_appt_context:
         return "cancel_appointment"
 
-    reschedule_word = _any(normalized, _RESCHEDULE_WORDS)
+    reschedule_word = _any(normalized, _RESCHEDULE_WORDS) or bool(_MOVE_WORD.search(normalized))
     if reschedule_word and is_appt_context:
         return "reschedule_appointment"
 
@@ -336,6 +367,9 @@ def _classify_legacy(normalized):
     appt_intent = _classify_appointment_related(normalized)
     if appt_intent:
         return appt_intent
+
+    if is_patient_count(normalized):
+        return "patient_count"
 
     for intent, keywords in _RULES:
         for kw in keywords:

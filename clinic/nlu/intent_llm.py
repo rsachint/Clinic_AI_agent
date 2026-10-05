@@ -54,7 +54,7 @@ _INTENT_DESCRIPTIONS = {
     "patient_lookup": "Look up a registered patient's phone number by name.",
     "book_appointment": "Book / fix / make a NEW appointment for a patient (the staff member asks for an appointment to be created).",
     "cancel_appointment": "Cancel a patient's already-booked appointment.",
-    "reschedule_appointment": "Move a patient's booked appointment to a different date or time.",
+    "reschedule_appointment": "Move or shift a patient's booked appointment to a different date, time or clinic branch.",
     "check_availability": "Check which appointment slots are free on a given date.",
     "list_appointments": "Show / list / fetch the appointments scheduled for a day (today, tomorrow, a named day or date) or this week. A READ -- nothing is booked.",
     "next_appointment": "Find when a specific patient's next appointment is.",

@@ -176,7 +176,11 @@ class CancelRescheduleTests(FlowCase):
         self.assertIsNone(self.classify("cancel karo")["intent"])
 
     def test_unregistered_sender_can_cancel_an_appointment_booked_under_their_phone(self):
-        appt = self.book(TOMORROW, "11:00", patient_name="Walk In", patient_phone="9876543210")
+        # Bookings made before name + phone registered people (and walk-ins entered by hand) have no patient row.
+        appt = self.conn.execute(
+            "INSERT INTO appointments (patient_name, patient_phone, appt_date, start_time, status) VALUES (?, ?, ?, ?, 'booked')",
+            ("Walk In", "9876543210", TOMORROW, "11:00")).lastrowid
+        self.conn.commit()
         r = self.classify("cancel karo")
         self.assertEqual((r["patient_id"], r["intent"], r["slots"]), (None, "cancel_appointment", {"appointment_id": appt}))
 

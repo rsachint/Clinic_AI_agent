@@ -43,7 +43,9 @@ from sarvamai.types.realtime_transcript_partial import RealtimeTranscriptPartial
 from sarvamai.types.realtime_vad_speech_end import RealtimeVadSpeechEnd
 from sarvamai.types.realtime_vad_speech_start import RealtimeVadSpeechStart
 
-from clinic.pipeline import NavigateResult, ParsedResult, PipelineError, ReadResult, WriteResult
+from clinic import branches
+from clinic.pipeline import (ClosurePlanResult, NavigateResult, ParsedResult, PipelineError, ReadResult,
+                             SwitchBranchResult, WriteResult)
 from clinic.voice_context import AskResult, CardUpdate, Note, VoiceContext
 from clinic.voice_turns import handle_pick, handle_turn
 
@@ -402,6 +404,16 @@ class VoiceSession:
             self.context.touch()
         self._emit_context()
 
+    def set_branch(self, mine, view):
+        """The page's My branch / switcher changed (or was just loaded). Only a
+        branch that exists is taken: this is a hint for defaults, never trusted
+        for anything else."""
+        known = {b["id"] for b in branches.list_branches(self._get_conn(), include_inactive=True)}
+        mine = mine if isinstance(mine, int) and mine in known else None
+        view = view if view == "all" or (isinstance(view, int) and view in known) else None
+        with self._turn_lock:
+            self.context.set_client_branch(mine, view)
+
     def context_clear(self):
         """The person pressed the chip's clear button: forget everything."""
         with self._turn_lock:
@@ -463,6 +475,28 @@ class VoiceSession:
                 "transcript": text,
                 "language": self._language_hint,
                 "card_id": self.context.open_card["card_id"] if self.context.open_card else None,
+            })
+            return
+
+        if isinstance(result, ClosurePlanResult):
+            # "Close Branch A tomorrow": the batch review card. It is a plan only;
+            # the page's Apply button (a human tap) is what closes and moves anyone.
+            self._emit("closure_plan", {
+                "transcript": text,
+                "plan": result.plan,
+                "reason": result.reason,
+                "answer_text": result.answer_text,
+            })
+            return
+
+        if isinstance(result, SwitchBranchResult):
+            # "Switch to Branch C": the browser changes this computer's My
+            # branch. A setting on this screen only; no clinic data is touched.
+            self._emit("switch_branch", {
+                "transcript": text,
+                "branch_id": result.branch_id,
+                "branch_name": result.branch_name,
+                "answer_text": result.answer_text,
             })
             return
 
@@ -570,6 +604,12 @@ def register_realtime_voice(socketio, api_key, get_conn, clinical_adapter, ops_a
         session = sessions.get(request.sid)
         if session and isinstance(data, dict):
             session.card_closed(data.get("card_id"))
+
+    @socketio.on("set_branch")
+    def _on_set_branch(data=None):
+        session = sessions.get(request.sid)
+        if session and isinstance(data, dict):
+            session.set_branch(data.get("mine"), data.get("view"))
 
     @socketio.on("context_clear")
     def _on_context_clear(data=None):

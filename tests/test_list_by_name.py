@@ -20,7 +20,7 @@ from clinic.voice_context import VoiceContext
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = (ROOT / "clinic" / "schema.sql").read_text()
-LIST_KEYS = ["id", "appt_date", "start_time", "duration_minutes", "status", "notes", "patient_name", "patient_phone"]
+LIST_KEYS = ["id", "appt_date", "start_time", "duration_minutes", "status", "notes", "patient_name", "patient_phone", "branch_id", "doctor_id", "branch", "branch_code", "doctor"]   # the last five arrive with multi-branch
 
 
 def _iso(offset):
@@ -154,7 +154,7 @@ class AppointmentsNamedQueryTests(NamedDataTestCase):
         rows = queries.upcoming_appointments_named(self.conn, "Amit Dua")
         self.assertEqual(self.ids(rows), [self.dua_today])
         self.assertNotIn(past, self.ids(rows))
-        self.assertEqual(list(rows[0].keys()), ["id", "appt_date", "start_time", "duration_minutes", "who", "score"])
+        self.assertEqual(list(rows[0].keys()), ["id", "appt_date", "start_time", "duration_minutes", "who", "score", "branch_id", "branch", "branch_code"])
         self.assertEqual(rows[0]["who"], "Amit Dua")
         self.assertEqual(rows[0]["score"], 1.0)
         # A bare first name still keeps only the single best-sounding person there (no first-name rule).

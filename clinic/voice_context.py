@@ -7,6 +7,7 @@ only structured facts, not a transcript:
 
   - the last patient discussed and the last date discussed,
   - the appointment list currently on screen (so "cancel the second one" works),
+  - the branch the person last named (so "and what is free tomorrow?" stays at it),
   - the review card currently open (so "make it 6 pm" edits it),
   - a question the assistant has asked and is waiting for an answer to.
 
@@ -24,6 +25,7 @@ import time
 import unicodedata
 from collections import namedtuple
 
+from clinic import branches
 from clinic.nlu import datetime_extract, extract
 
 IDLE_SECONDS = 600  # 10 minutes
@@ -63,11 +65,15 @@ class VoiceContext:
     def __init__(self, clock=time.monotonic, idle_seconds=IDLE_SECONDS):
         self._clock = clock
         self.idle_seconds = idle_seconds
+        # What the browser tells us about itself (not conversation, so clear() keeps it).
+        self.my_branch = None      # this computer's My branch
+        self.view_branch = None    # the branch (or "all") the switcher shows
         self.clear()
 
     def clear(self):
         self.patient = None        # {"id", "name"}
         self.date = None           # 'YYYY-MM-DD'
+        self.branch = None         # a branch id the person named, kept until another is named
         self.last_intent = None
         self.list_rows = []        # appointments currently on screen, in order
         self.list_scope = None
@@ -93,7 +99,7 @@ class VoiceContext:
         return had
 
     def has_content(self):
-        return bool(self.patient or self.date or self.list_rows or self.open_card or self.pending)
+        return bool(self.patient or self.date or self.branch or self.list_rows or self.open_card or self.pending)
 
     # -- remembering ------------------------------------------------------
 
@@ -104,6 +110,22 @@ class VoiceContext:
     def remember_date(self, iso):
         if iso:
             self.date = iso
+
+    def remember_branch(self, branch_id):
+        """The person named a branch: later commands stay at it. None forgets it
+        (they said "my branch")."""
+        self.branch = int(branch_id) if branch_id else None
+
+    def set_client_branch(self, mine, view):
+        """The page's My branch / switcher, as it changes (valid ids only: the
+        caller checks)."""
+        self.my_branch = int(mine) if mine else None
+        self.view_branch = view if view == "all" else (int(view) if view else None)
+
+    def current_branch(self):
+        """The branch a command is about when none is named in it: the one
+        named earlier, else this computer's My branch."""
+        return self.branch or self.my_branch
 
     def remember_list(self, rows, scope, iso_date=None):
         self.list_rows = [dict(r) for r in rows]
@@ -130,6 +152,7 @@ class VoiceContext:
         return {
             "patient": self.patient["name"] if self.patient else None,
             "date": self.date,
+            "branch": self.branch,
             "awaiting": self.pending["kind"] if self.pending else None,
             "expires_in_s": self.seconds_left(),
         }
@@ -338,6 +361,7 @@ _QUESTIONS = {
     "choose_patient": ("Which one?", "Kaun sa wala?"),
     "date": ("Which day?", "Kis din?"),
     "time": ("What time?", "Kitne baje?"),
+    "branch": ("Which branch?", "Kaun si branch?"),
 }
 
 
@@ -468,7 +492,7 @@ _STATUS_WORDS = (
 _FIELD_LABELS = {
     "appt_date": "Date", "start_time": "Start time", "patient_phone": "Phone", "fee_rupees": "Fee",
     "days_from_now": "Days from now", "new_due_date": "New due date", "status": "Status",
-    "phone": "Phone", "age": "Age",
+    "phone": "Phone", "age": "Age", "branch_id": "Branch",
 }
 
 

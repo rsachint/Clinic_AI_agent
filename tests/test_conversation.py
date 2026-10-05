@@ -120,9 +120,12 @@ class ConvCase(unittest.TestCase):
             if r.rows:
                 self.assertLessEqual(len(r.rows), 10)
                 self.assertTrue(r.list_button and len(r.list_button) <= 20)
-                for _id, title in r.rows:
+                for row in r.rows:
+                    _id, title = row[0], row[1]
                     self.assertLessEqual(len(title), 24, title)
                     self.assertTrue(cv.parse_choice(_id), _id)
+                    if len(row) > 2 and row[2]:
+                        self.assertLessEqual(len(row[2]), 72, row[2])
 
     def assertReply(self, result, key, lang, index=0, **values):
         """The reply is exactly the fixed template `key` in `lang`."""

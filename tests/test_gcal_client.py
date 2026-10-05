@@ -222,7 +222,7 @@ class LazyConstructionTests(unittest.TestCase):
             key.write_text("{}")
             key.chmod(0)       # unreadable: building the client must not need to read it
             try:
-                with patch.dict(os.environ, {"GOOGLE_SERVICE_ACCOUNT_FILE": str(key), "GOOGLE_CALENDAR_ID": CAL}, clear=True):
+                with patch.dict(os.environ, {"GOOGLE_SERVICE_ACCOUNT_FILE": str(key), "GOOGLE_CALENDAR_ID": CAL, "GOOGLE_CALENDAR_SYNC": "1"}, clear=True):
                     first = gcal_client.get_client()
                     self.assertIsInstance(first, GoogleCalendarClient)
                     self.assertIs(gcal_client.get_client(), first)
