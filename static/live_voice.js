@@ -223,7 +223,7 @@ document.addEventListener("DOMContentLoaded", function () {
     orb.setAttribute("data-state", state);
     stage.setAttribute("data-active", state === "listening" ? "true" : "false");
     var labels = {
-      idle: connected ? "Hold Enter or F1 and speak" : "Connecting…",
+      idle: connected ? "Hold 'Enter' or 'F1' key to speak and release to end" : "Connecting…",
       listening: "Listening… release to send",
       thinking: "Thinking…",
       error: "Something went wrong",

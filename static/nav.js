@@ -3,13 +3,15 @@
 // not a structural change. Settings/Profile/Login are wired up the same
 // way as the real tabs specifically to prove that -- they just render a
 // placeholder because there's nothing behind them yet.
+// `hidden: true` keeps a tab out of the left menu while its panel and scripts stay in
+// the page untouched, so showing it again is just deleting the flag.
 var NAV_TABS = [
   { id: "assistant", label: "Assistant", icon: "🎙️" },
   { id: "queue", label: "Queue", icon: "🎟️" },
   { id: "appointments", label: "Appointments", icon: "📅" },
   { id: "automation", label: "Automation", icon: "🤖" },
   { id: "patients", label: "Patients", icon: "🧑‍🤝‍🧑" },
-  { id: "messages", label: "Patient messages", icon: "💬" },
+  { id: "messages", label: "Patient messages", icon: "💬", hidden: true },
   { id: "connectors", label: "Connectors", icon: "🔌" },
   { id: "audit", label: "Audit log", icon: "📜" },
   { id: "settings", label: "Settings", icon: "⚙️" },
@@ -39,6 +41,7 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   NAV_TABS.forEach(function (tab) {
+    if (tab.hidden) return;
     var li = document.createElement("li");
     var link = document.createElement("button");
     link.type = "button";

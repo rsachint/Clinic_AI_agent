@@ -61,7 +61,7 @@ class PttFrontEndWiringTests(unittest.TestCase):
             self.assertNotIn(gone, self.html)
         self.assertIn('id="call-orb"', self.html)
         self.assertIn('id="call-status"', self.html)
-        self.assertIn("Hold Enter or F1 and speak", self.js)
+        self.assertIn("Hold 'Enter' or 'F1' key to speak and release to end", self.js)
 
     def test_stat_cards_moved_to_the_queue_tab(self):
         queue = self.html.index('data-tab="queue"')
