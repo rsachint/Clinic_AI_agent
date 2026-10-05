@@ -339,6 +339,11 @@ tr:last-child td { border-bottom: none; }
   padding: 14px 16px;
 }
 .bubble-assistant .card { border: none; padding: 0; margin: 0; }
+/* A table answer uses the full row, keeps each value on one line, and scrolls sideways
+   on a narrow screen; only the free-text Notes column wraps. */
+.bubble-assistant.bubble-wide { align-self: stretch; max-width: 100%; overflow-x: auto; }
+.bubble-assistant table th, .bubble-assistant table td { white-space: nowrap; }
+.bubble-assistant table td.cell-notes { white-space: normal; min-width: 180px; }
 .bubble-assistant .flash:last-child { margin-bottom: 0; }
 
 details.card summary {
@@ -641,3 +646,104 @@ details.card table { margin-top: 12px; }
 
 /* What a read list covers, shown above its table ("Appointments for Amit, all dates"). */
 .list-caption { font-size: 13px; color: var(--muted); margin: 0 0 6px; }
+
+
+/* ---- branches ----------------------------------------------------------- */
+.branch-switcher {
+  margin: 0 12px 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px;
+  background: var(--card); display: flex; flex-direction: column; gap: 4px;
+}
+.branch-switcher[hidden] { display: none; }
+.branch-switcher label { font-size: 12px; color: var(--muted); }
+.branch-switcher select { width: 100%; font: inherit; padding: 6px; border-radius: 8px; border: 1px solid var(--border); background: white; }
+.branch-field[hidden] { display: none; }
+.queue-branch-name { color: var(--accent-dark); }
+.settings-table td, .settings-table th { text-align: left; vertical-align: top; padding: 8px 10px; }
+.settings-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.settings-edit-row td { background: #f7fbff; }
+.weekday-picks { display: flex; flex-wrap: wrap; gap: 14px; margin: 10px 0; }
+.weekday-pick { display: inline-flex; align-items: center; gap: 4px; }
+#settings-this-computer select { margin-top: 6px; font: inherit; padding: 6px; border-radius: 8px; border: 1px solid var(--border); }
+
+
+/* ---- in-app calendar (Appointments tab) --------------------------------- */
+.cv-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; justify-content: space-between; margin-bottom: 10px; }
+.cv-nav { display: flex; align-items: center; gap: 6px; }
+.cv-title { font-weight: 700; font-size: 17px; margin-left: 8px; }
+.cv-modes { display: flex; gap: 6px; }
+.cv-branch { display: flex; align-items: center; gap: 6px; font-size: 14px; }
+.cv-branch[hidden] { display: none; }
+.cv-branch select { font: inherit; padding: 6px; border-radius: 8px; border: 1px solid var(--border); background: white; }
+.cv-legend { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 8px; font-size: 13px; color: var(--muted); }
+.cv-legend-chip { display: inline-flex; align-items: center; gap: 5px; }
+.cv-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.cv-body { overflow-x: auto; }
+
+.cv-week { display: grid; grid-template-columns: 52px repeat(7, minmax(110px, 1fr)); min-width: 860px; border-top: 1px solid var(--border); }
+.cv-corner, .cv-dayhead { border-bottom: 1px solid var(--border); padding: 6px; font-weight: 600; font-size: 13px; text-align: center; background: #fafbfc; }
+.cv-dayhead.cv-today, .cv-agenda-date.cv-today { color: var(--accent-dark); background: #eaf2fd; }
+.cv-gutter { position: relative; border-right: 1px solid var(--border); }
+.cv-hour { position: absolute; right: 6px; transform: translateY(-7px); font-size: 11px; color: var(--muted); }
+.cv-daycol {
+  position: relative; border-left: 1px solid var(--border);
+  background-image: linear-gradient(to bottom, var(--border) 1px, transparent 1px); background-size: 100% 52px;
+}
+.cv-daycol.cv-today { background-color: #f6faff; }
+.cv-appt {
+  display: flex; gap: 6px; align-items: baseline; text-align: left; width: 100%; box-sizing: border-box; overflow: hidden;
+  background: #eef4fd; border: 1px solid #cfe0f7; border-left: 4px solid var(--accent); border-radius: 6px;
+  padding: 2px 6px; margin: 1px 0; font: inherit; font-size: 12px; cursor: pointer; color: inherit;
+}
+.cv-daycol .cv-appt { position: absolute; left: 2px; right: 2px; width: auto; }
+.cv-appt:hover { background: #dfeafb; }
+.cv-appt-time { font-weight: 700; flex: none; }
+.cv-appt-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cv-closure { position: absolute; inset: 0 0 auto 0; z-index: 0; background: repeating-linear-gradient(45deg, #fdecea, #fdecea 8px, #fff5f4 8px, #fff5f4 16px);
+  color: var(--danger-dark); font-size: 11px; padding: 2px 4px; height: 100%; pointer-events: none; }
+.cv-daycol .cv-appt { z-index: 1; }
+
+.cv-month { display: grid; grid-template-columns: repeat(7, minmax(110px, 1fr)); min-width: 780px; border-top: 1px solid var(--border); border-left: 1px solid var(--border); }
+.cv-month .cv-dayhead { border-right: 1px solid var(--border); }
+.cv-cell { min-height: 104px; border-right: 1px solid var(--border); border-bottom: 1px solid var(--border); padding: 4px; cursor: pointer; display: flex; flex-direction: column; gap: 2px; }
+.cv-cell:hover { background: #f7fbff; }
+.cv-cell.cv-today { background: #eaf2fd; }
+.cv-cell.cv-other { background: #fafbfc; color: var(--muted); }
+.cv-cell.cv-closed { background: repeating-linear-gradient(45deg, #fdecea, #fdecea 8px, #fff5f4 8px, #fff5f4 16px); }
+.cv-celldate { font-size: 12px; font-weight: 600; }
+.cv-more { font-size: 11px; color: var(--muted); }
+
+.cv-agenda-day { margin-bottom: 14px; }
+.cv-agenda-date { font-weight: 700; padding: 6px 8px; border-radius: 8px; background: #fafbfc; margin-bottom: 4px; }
+.cv-closure-row { position: static; height: auto; display: block; margin: 2px 0 4px; border-radius: 6px; padding: 4px 8px; }
+.cv-agenda-row {
+  display: flex; gap: 14px; align-items: baseline; width: 100%; text-align: left; box-sizing: border-box; background: white;
+  border: 1px solid var(--border); border-left: 4px solid var(--accent); border-radius: 8px; padding: 6px 10px; margin: 3px 0; font: inherit; cursor: pointer;
+}
+.cv-agenda-row:hover { background: #f7fbff; }
+.cv-agenda-time { font-weight: 700; min-width: 96px; }
+.cv-agenda-name { min-width: 160px; }
+.cv-status { margin-left: auto; font-size: 12px; color: var(--muted); text-transform: capitalize; }
+
+.cv-tip { position: fixed; z-index: 1000; min-width: 190px; max-width: 280px; padding: 10px 12px; border: 1px solid #c5dbf7; background: #f6faff; border-radius: 10px; box-shadow: 0 6px 18px rgba(20, 40, 70, .18); display: flex; flex-direction: column; gap: 3px; pointer-events: none; font-size: 13px; }
+.cv-tip[hidden] { display: none; }
+.cv-tip-hint { margin-top: 4px; font-size: 11px; color: var(--muted); }
+
+/* Closures: the batch review card and the history. */
+.closure-card { border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-top: 14px; background: #fff; }
+.closure-title { margin: 0 0 4px; font-size: 16px; }
+.closure-fields { display: flex; flex-wrap: wrap; gap: 12px; margin: 10px 0; }
+.closure-fields label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); flex: 1 1 260px; }
+.closure-fields input { font: inherit; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; }
+.closure-table-wrap { overflow-x: auto; }
+.closure-table td, .closure-table th { white-space: nowrap; vertical-align: top; }
+.closure-table select { font: inherit; padding: 4px 6px; max-width: 300px; }
+.closure-table tr.closure-leave { background: #fafbfc; color: var(--muted); }
+.closure-note { white-space: normal; max-width: 300px; font-size: 12px; }
+.closure-actions { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+.closure-status { margin-top: 12px; padding: 8px 10px; border-radius: 8px; font-size: 14px; }
+.closure-ok { background: #eaf7ee; border: 1px solid #b7e0c2; }
+.closure-bad { background: #fdecea; border: 1px solid #f3b9b3; }
+.closure-fail { color: #b3261e; margin-top: 4px; }
+.closure-history-head { margin: 18px 0 6px; font-size: 14px; }
+.closure-history-row { border-top: 1px solid var(--border); padding: 8px 0; }
+.closure-history-title { font-weight: 600; }
