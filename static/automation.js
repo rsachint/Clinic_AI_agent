@@ -80,7 +80,7 @@ document.addEventListener("DOMContentLoaded", function () {
       .then(function (r) {
         if (!r.ok) throw new Error(r.error || "failed");
         renderSettings(r.settings);
-        showFlash("Daily cap saved: " + r.settings.daily_cap + ".", true);
+        SaveTick.show(capSave);
       })
       .catch(function (err) { showFlash(err.message, false); });
   });

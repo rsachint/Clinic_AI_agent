@@ -35,6 +35,8 @@
         </div>
       </div>
 
+      <div id="unanswered-notices" class="unanswered-notices"></div>
+
       <div id="conversation-feed" class="conversation-feed">
       </div>
     </section>
@@ -71,11 +73,11 @@
             <label>Patient
               <select id="new-appt-patient">
                 <option value="">New / not registered...</option>
-                {% for p in all_patients %}<option value="{{ p.id }}">{{ p.name }} ({{ p.phone }})</option>{% endfor %}
+                {% for p in all_patients %}<option value="{{ p.id }}" data-phone="{{ p.phone }}">{{ p.name }} ({{ p.phone }})</option>{% endfor %}
               </select>
             </label>
             <label class="new-appt-unreg">Name <input type="text" id="new-appt-name" maxlength="60" placeholder="Patient name"></label>
-            <label class="new-appt-unreg">Phone <input type="tel" id="new-appt-phone" maxlength="15" placeholder="10-digit mobile"></label>
+            <label class="new-appt-phone" id="new-appt-phone-label">Phone <span class="muted">(required)</span> <input type="tel" id="new-appt-phone" maxlength="15" placeholder="10-digit mobile"></label>
             <label class="branch-field" hidden>Branch <select id="new-appt-branch"></select></label>
             <label>Date <input type="date" id="new-appt-date" value="{{ queue_today }}" min="{{ queue_today }}"></label>
             <label>Time
@@ -214,14 +216,26 @@
     </section>
 
     <section class="tab-panel" data-tab="patients" hidden>
+      {# Sub-tabs inside the Patients tab (static/patients_subtabs.js). Every card keeps its id. #}
+      <div class="subtabs" id="patients-subtabs" role="tablist" aria-label="Patients sections">
+        <button type="button" class="subtab" role="tab" data-subtab-link="patients" aria-selected="true">Patients</button>
+        <button type="button" class="subtab" role="tab" data-subtab-link="missed" aria-selected="false">Missed follow-ups</button>
+        <button type="button" class="subtab" role="tab" data-subtab-link="attendance" aria-selected="false">Attendance today</button>
+        <button type="button" class="subtab" role="tab" data-subtab-link="followups" aria-selected="false">Follow-ups</button>
+      </div>
+
+      <div class="subtab-panel" data-subtab="patients" role="tabpanel">
       <div class="card" id="patients-table-card">
-        <h2>Patients <span class="count">(most recent {{ patients|length }})</span></h2>
+        <h2>Patients <span class="count" id="patients-count" data-total="{{ patients_total }}">(showing {{ patients|length }} of {{ patients_total }})</span></h2>
         {% if patients %}
-        <table>
+        <table id="patients-table">
           <tr><th>Name</th><th>Phone</th><th>Age</th><th>Registered</th></tr>
           {% for pt in patients %}
           <tr class="patient-row" data-patient-id="{{ pt.id }}" tabindex="0" title="Show appointment activity"><td>{{ pt.name }}</td><td>{{ pt.phone }}</td><td>{{ pt.age or "-" }}</td><td>{{ pt.registered_at|ist }}</td></tr>
           {% endfor %}
+          {% if patients_total > patients|length %}
+          <tr class="patients-more-row"><td colspan="4"><button type="button" class="patients-more" id="patients-more" aria-label="Show the next 10 patients" title="Show the next 10 patients"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 6l4.5 4.5L12.5 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Next 10</span></button></td></tr>
+          {% endif %}
         </table>
         <div class="muted" style="font-size:12px;margin-top:8px;">Click a patient to see their appointment activity.</div>
         {% else %}<p class="muted">No patients yet.</p>{% endif %}
@@ -234,7 +248,9 @@
         <div id="patient-activity-list"></div>
       </div>
       {% endif %}
+      </div>
 
+      <div class="subtab-panel" data-subtab="missed" role="tabpanel" hidden>
       <div class="card" id="missed-followups-card">
         <h2>Missed follow-ups <span class="count">({{ missed|length }})</span></h2>
         <div class="muted" style="font-size:12px;margin:-6px 0 10px;">Source: {{ clinical_citation.source }}, {{ clinical_citation.as_of }}</div>
@@ -247,7 +263,9 @@
         </table>
         {% else %}<p class="muted">None due.</p>{% endif %}
       </div>
+      </div>
 
+      <div class="subtab-panel" data-subtab="attendance" role="tabpanel" hidden>
       <div class="card" id="attendance-card">
         <h2>Attendance today</h2>
         {% if attendance %}
@@ -258,6 +276,38 @@
           {% endfor %}
         </table>
         {% else %}<p class="muted">No attendance logged yet today.</p>{% endif %}
+      </div>
+      </div>
+
+      <div class="subtab-panel" data-subtab="followups" role="tabpanel" hidden>
+        <div id="followups-flash" class="flash" hidden></div>
+
+        <div class="card" id="followup-batch-card">
+          <h2>Schedule follow-ups <span class="count">(each one books a calendar slot and sends the patient two WhatsApp reminders)</span></h2>
+          <p class="muted auto-help">The doctor has seen the patient and advised a return visit. Add a row for each, check them, then book: the slot goes straight into the calendar (so nobody has to book it again) and the patient gets a reminder 2 days before and another 4 hours before. The diagnosis note is for your records only and is <strong>never</strong> sent to the patient. The whole batch can be undone.</p>
+          <datalist id="fu-patient-list">
+            {% for p in all_patients %}<option value="{{ p.name }} &middot; {{ p.phone }}" data-id="{{ p.id }}"></option>{% endfor %}
+          </datalist>
+          <div id="fu-rows"></div>
+          <div class="appt-form-actions">
+            <button type="button" class="btn-queue" id="fu-add-row">+ Add row</button>
+            <button type="button" class="btn-confirm" id="fu-review-btn">Review</button>
+          </div>
+          <div id="fu-error" class="field-note" hidden></div>
+          <div id="fu-review"></div>
+        </div>
+
+        <div class="card" id="followup-list-card">
+          <h2>Follow-ups <span class="count" id="fu-list-count"></span></h2>
+          <p class="muted auto-help">For the branch chosen in the sidebar. The two reminder lines show what happened to each WhatsApp reminder. Edit the internal diagnosis note right in the row.</p>
+          <div id="fu-list"><p class="muted">Loading...</p></div>
+        </div>
+
+        <div class="card" id="followup-manual-card">
+          <h2>Send manually <span class="count" id="fu-manual-count"></span></h2>
+          <p class="muted auto-help">Reminders WhatsApp would not let the app send (the patient has not written to the clinic in the last 24 hours and the message template is not approved yet), or that failed. Copy the text, send it yourself, then mark it as sent so it is not counted as missing.</p>
+          <div id="fu-manual"><p class="muted">Nothing to send by hand.</p></div>
+        </div>
       </div>
     </section>
 
@@ -333,6 +383,7 @@
         </table>
         {% else %}<p class="muted">Nothing logged yet.</p>{% endif %}
       </div>
+      <div id="unanswered-card"></div>
     </section>
 
     <!-- Settings/Profile/Login: placeholders only, wired through the exact
@@ -346,6 +397,8 @@
         <label>My branch <select id="my-branch"></select></label>
       </div>
       <div id="settings-branches"></div>
+      <div id="settings-followups"></div>
+      <div id="settings-sarvam"></div>
     </section>
     <section class="tab-panel" data-tab="profile" hidden>
       <div class="card"><p class="muted">Coming soon.</p></div>
@@ -365,16 +418,27 @@
 <script src="{{ url_for('static', filename='vendor/socket.io.min.js') }}"></script>
 <script src="{{ url_for('static', filename='time.js') }}"></script>
 <script src="{{ url_for('static', filename='branches.js') }}"></script>
+<script src="{{ url_for('static', filename='booking_phone.js') }}"></script>
+<script src="{{ url_for('static', filename='appt_details.js') }}"></script>
 <script src="{{ url_for('static', filename='review_card.js') }}"></script>
 <script src="{{ url_for('static', filename='wa_inbox.js') }}"></script>
 <script src="{{ url_for('static', filename='wa_threads.js') }}"></script>
 <script src="{{ url_for('static', filename='dashboard_refresh.js') }}"></script>
 <script src="{{ url_for('static', filename='queue.js') }}"></script>
 <script src="{{ url_for('static', filename='queue_edit.js') }}"></script>
+<script src="{{ url_for('static', filename='save_tick.js') }}"></script>
+<script src="{{ url_for('static', filename='patients_list.js') }}"></script>
 <script src="{{ url_for('static', filename='automation.js') }}"></script>
 <script src="{{ url_for('static', filename='closures.js') }}"></script>
+<script src="{{ url_for('static', filename='patients_subtabs.js') }}"></script>
+<script src="{{ url_for('static', filename='followups.js') }}"></script>
 <script src="{{ url_for('static', filename='calendar_view.js') }}"></script>
 <script src="{{ url_for('static', filename='settings_branches.js') }}"></script>
+<script src="{{ url_for('static', filename='settings_followups.js') }}"></script>
+<script src="{{ url_for('static', filename='settings_sarvam.js') }}"></script>
+<script src="{{ url_for('static', filename='unanswered.js') }}"></script>
+<script src="{{ url_for('static', filename='unanswered_notice.js') }}"></script>
+<script src="{{ url_for('static', filename='read_format.js') }}"></script>
 <script src="{{ url_for('static', filename='live_voice.js') }}"></script>
 <script src="{{ url_for('static', filename='nav.js') }}"></script>
 </body>

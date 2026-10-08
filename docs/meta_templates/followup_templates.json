@@ -1,0 +1,280 @@
+{
+  "templates": [
+    {
+      "name": "followup_reminder_2d_en",
+      "category": "UTILITY",
+      "language": "en",
+      "written_in": "English",
+      "reminder": "2 days before the follow-up date",
+      "components": {
+        "body": {
+          "text": "Hello {{1}}, this is a reminder from the clinic about your follow-up visit with {{2}} at {{3}} on {{4}} at {{5}}. If your plans have changed, please tap a button below.",
+          "variables": [
+            "{{1}} = patient name",
+            "{{2}} = doctor name",
+            "{{3}} = branch",
+            "{{4}} = follow-up date",
+            "{{5}} = follow-up time"
+          ],
+          "example": [
+            "Sunita Devi",
+            "Dr. Mehta",
+            "Branch A",
+            "Monday, 12 Oct 2026",
+            "10:30 AM"
+          ]
+        },
+        "footer": {
+          "text": "Reply STOP to stop these reminders"
+        },
+        "buttons": [
+          {
+            "type": "QUICK_REPLY",
+            "text": "Reschedule",
+            "payload_sent_with_each_message": "followup:reschedule:<follow-up id>"
+          },
+          {
+            "type": "QUICK_REPLY",
+            "text": "Already visited",
+            "payload_sent_with_each_message": "followup:visited:<follow-up id>"
+          },
+          {
+            "type": "QUICK_REPLY",
+            "text": "Cancel",
+            "payload_sent_with_each_message": "followup:cancel:<follow-up id>"
+          }
+        ]
+      }
+    },
+    {
+      "name": "followup_reminder_2d_hi",
+      "category": "UTILITY",
+      "language": "hi",
+      "written_in": "Hindi (Devanagari script)",
+      "reminder": "2 days before the follow-up date",
+      "components": {
+        "body": {
+          "text": "नमस्ते {{1}}, क्लिनिक की ओर से याद दिलाया जा रहा है कि {{2}} के साथ {{3}} में आपका फ़ॉलो-अप विज़िट {{4}} को {{5}} पर है। यदि आपकी योजना बदल गई है, तो कृपया नीचे दिए बटन दबाएँ।",
+          "variables": [
+            "{{1}} = patient name",
+            "{{2}} = doctor name",
+            "{{3}} = branch",
+            "{{4}} = follow-up date",
+            "{{5}} = follow-up time"
+          ],
+          "example": [
+            "सुनीता देवी",
+            "डॉ. मेहता",
+            "ब्रांच ए",
+            "12 अक्टूबर 2026, सोमवार",
+            "सुबह 10:30"
+          ]
+        },
+        "footer": {
+          "text": "ये रिमाइंडर रोकने के लिए STOP लिखें"
+        },
+        "buttons": [
+          {
+            "type": "QUICK_REPLY",
+            "text": "समय बदलें",
+            "payload_sent_with_each_message": "followup:reschedule:<follow-up id>"
+          },
+          {
+            "type": "QUICK_REPLY",
+            "text": "विज़िट हो चुकी",
+            "payload_sent_with_each_message": "followup:visited:<follow-up id>"
+          },
+          {
+            "type": "QUICK_REPLY",
+            "text": "रद्द करें",
+            "payload_sent_with_each_message": "followup:cancel:<follow-up id>"
+          }
+        ]
+      }
+    },
+    {
+      "name": "followup_reminder_2d_hinglish",
+      "category": "UTILITY",
+      "language": "en",
+      "written_in": "Hindi in Roman script (Hinglish)",
+      "reminder": "2 days before the follow-up date",
+      "components": {
+        "body": {
+          "text": "Namaste {{1}}, clinic ki taraf se yaad dilana: {{2}} ke saath {{3}} mein aapka follow-up visit {{4}} ko {{5}} par hai. Agar aapka plan badal gaya hai, to kripya neeche diye button dabayein.",
+          "variables": [
+            "{{1}} = patient name",
+            "{{2}} = doctor name",
+            "{{3}} = branch",
+            "{{4}} = follow-up date",
+            "{{5}} = follow-up time"
+          ],
+          "example": [
+            "Sunita Devi",
+            "Dr. Mehta",
+            "Branch A",
+            "Monday, 12 Oct 2026",
+            "10:30 AM"
+          ]
+        },
+        "footer": {
+          "text": "Reminders rokne ke liye STOP likhein"
+        },
+        "buttons": [
+          {
+            "type": "QUICK_REPLY",
+            "text": "Reschedule",
+            "payload_sent_with_each_message": "followup:reschedule:<follow-up id>"
+          },
+          {
+            "type": "QUICK_REPLY",
+            "text": "Already visited",
+            "payload_sent_with_each_message": "followup:visited:<follow-up id>"
+          },
+          {
+            "type": "QUICK_REPLY",
+            "text": "Cancel",
+            "payload_sent_with_each_message": "followup:cancel:<follow-up id>"
+          }
+        ]
+      }
+    },
+    {
+      "name": "followup_reminder_4h_en",
+      "category": "UTILITY",
+      "language": "en",
+      "written_in": "English",
+      "reminder": "4 hours before the visit",
+      "components": {
+        "body": {
+          "text": "Hello {{1}}, a reminder that your follow-up visit with {{2}} at {{3}} is today, {{4}}, at {{5}}. If you cannot make it, please tap a button below.",
+          "variables": [
+            "{{1}} = patient name",
+            "{{2}} = doctor name",
+            "{{3}} = branch",
+            "{{4}} = follow-up date",
+            "{{5}} = follow-up time"
+          ],
+          "example": [
+            "Sunita Devi",
+            "Dr. Mehta",
+            "Branch A",
+            "Monday, 12 Oct 2026",
+            "10:30 AM"
+          ]
+        },
+        "footer": {
+          "text": "Reply STOP to stop these reminders"
+        },
+        "buttons": [
+          {
+            "type": "QUICK_REPLY",
+            "text": "Reschedule",
+            "payload_sent_with_each_message": "followup:reschedule:<follow-up id>"
+          },
+          {
+            "type": "QUICK_REPLY",
+            "text": "Already visited",
+            "payload_sent_with_each_message": "followup:visited:<follow-up id>"
+          },
+          {
+            "type": "QUICK_REPLY",
+            "text": "Cancel",
+            "payload_sent_with_each_message": "followup:cancel:<follow-up id>"
+          }
+        ]
+      }
+    },
+    {
+      "name": "followup_reminder_4h_hi",
+      "category": "UTILITY",
+      "language": "hi",
+      "written_in": "Hindi (Devanagari script)",
+      "reminder": "4 hours before the visit",
+      "components": {
+        "body": {
+          "text": "नमस्ते {{1}}, याद दिलाना: {{2}} के साथ {{3}} में आपका फ़ॉलो-अप विज़िट आज, {{4}} को {{5}} पर है। यदि आप नहीं आ सकते, तो कृपया नीचे दिए बटन दबाएँ।",
+          "variables": [
+            "{{1}} = patient name",
+            "{{2}} = doctor name",
+            "{{3}} = branch",
+            "{{4}} = follow-up date",
+            "{{5}} = follow-up time"
+          ],
+          "example": [
+            "सुनीता देवी",
+            "डॉ. मेहता",
+            "ब्रांच ए",
+            "12 अक्टूबर 2026, सोमवार",
+            "सुबह 10:30"
+          ]
+        },
+        "footer": {
+          "text": "ये रिमाइंडर रोकने के लिए STOP लिखें"
+        },
+        "buttons": [
+          {
+            "type": "QUICK_REPLY",
+            "text": "समय बदलें",
+            "payload_sent_with_each_message": "followup:reschedule:<follow-up id>"
+          },
+          {
+            "type": "QUICK_REPLY",
+            "text": "विज़िट हो चुकी",
+            "payload_sent_with_each_message": "followup:visited:<follow-up id>"
+          },
+          {
+            "type": "QUICK_REPLY",
+            "text": "रद्द करें",
+            "payload_sent_with_each_message": "followup:cancel:<follow-up id>"
+          }
+        ]
+      }
+    },
+    {
+      "name": "followup_reminder_4h_hinglish",
+      "category": "UTILITY",
+      "language": "en",
+      "written_in": "Hindi in Roman script (Hinglish)",
+      "reminder": "4 hours before the visit",
+      "components": {
+        "body": {
+          "text": "Namaste {{1}}, yaad dilana: {{2}} ke saath {{3}} mein aapka follow-up visit aaj, {{4}} ko {{5}} par hai. Agar aap nahi aa sakte, to kripya neeche diye button dabayein.",
+          "variables": [
+            "{{1}} = patient name",
+            "{{2}} = doctor name",
+            "{{3}} = branch",
+            "{{4}} = follow-up date",
+            "{{5}} = follow-up time"
+          ],
+          "example": [
+            "Sunita Devi",
+            "Dr. Mehta",
+            "Branch A",
+            "Monday, 12 Oct 2026",
+            "10:30 AM"
+          ]
+        },
+        "footer": {
+          "text": "Reminders rokne ke liye STOP likhein"
+        },
+        "buttons": [
+          {
+            "type": "QUICK_REPLY",
+            "text": "Reschedule",
+            "payload_sent_with_each_message": "followup:reschedule:<follow-up id>"
+          },
+          {
+            "type": "QUICK_REPLY",
+            "text": "Already visited",
+            "payload_sent_with_each_message": "followup:visited:<follow-up id>"
+          },
+          {
+            "type": "QUICK_REPLY",
+            "text": "Cancel",
+            "payload_sent_with_each_message": "followup:cancel:<follow-up id>"
+          }
+        ]
+      }
+    }
+  ]
+}

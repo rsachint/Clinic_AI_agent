@@ -8,13 +8,15 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
 from flask_socketio import SocketIO
 
-from clinic import (auto_actions, booking_blocks, branches, closures, conv_runtime, conversation, core, gcal_client, gcal_config,
-                    gcal_sync, notify, patient_activity, scheduler, scheduling, settings, token_queue, whatsapp as wa)
+from clinic import (auto_actions, booking_blocks, booking_phone, branches, closures, conv_runtime, conversation, core, followup_notify, followups,
+                    gcal_client, gcal_config, gcal_sync, notify, patient_activity, planner_log, scheduler, scheduling, settings,
+                    token_queue, unanswered, whatsapp as wa)
 from clinic.adapters.registry import build_write_handlers, get_adapters
 from clinic.asr import transcribe
 from clinic.timefmt import utc_to_ist
 from clinic.db import connect
 from clinic.entity_resolution import last10_digits
+from clinic.nlu import planner as planner_module, sarvam
 from clinic.realtime_voice import register_realtime_voice
 from clinic import wa_threads
 from clinic.whatsapp_pipeline import classify_text_message, sender_appointments
@@ -26,6 +28,8 @@ _logger = logging.getLogger(__name__)
 # CLINIC_DB_PATH lets a scratch instance (screenshots, experiments) run on its
 # own database; unset, the app uses clinic.db exactly as before.
 DB_PATH = os.environ.get("CLINIC_DB_PATH", "clinic.db")
+PATIENTS_PAGE = 10          # rows the Patients table shows at first, and per "next" click
+PATIENTS_PAGE_MAX = 200     # most one request may return (restoring the table after a refresh)
 
 # Test seam: a callable sender(wa_id, text) that replaces the real WhatsApp
 # send for patient notifications. None means "use WHATSAPP_NOTIFY_MODE"
@@ -262,13 +266,33 @@ def _gcal_kick():
     (GCAL_BACKGROUND or _run_in_background)(_gcal_drain_job)
 
 
+def _followup_now():
+    """Both clocks for the follow-up reminders: the real ones, or (tests, via CLOCK)
+    the injected local clock with UTC derived from it (IST = UTC + 5:30)."""
+    if CLOCK is not None:
+        local = CLOCK()
+        return notify.Now(local, local - timedelta(hours=5, minutes=30))
+    return notify.Now.real()
+
+
+def followup_after_write(conn, intent, slots, entity_id):
+    """Post-commit: an appointment write may have moved, cancelled or completed a
+    follow-up's slot (clinic/followups.py). Cannot raise."""
+    try:
+        followups.after_write(conn, intent, slots, entity_id, now=_followup_now())
+    except Exception:  # after_write already swallows; this is belt and braces
+        _logger.exception("follow-up sync hook raised after a committed %s write", intent)
+
+
 def post_write_hooks(conn, intent, slots, entity_id, wa_id=None, language=None):
     """Everything that follows a committed write, in one place: patient
-    notification (+ token-change fan-out for other patients) and the Google
-    Calendar resync enqueue. Used by the staff approval routes, the Queue-tab
-    buttons, the staff direct-edit endpoints, Undo and the automatic WhatsApp
-    path, so there is exactly one copy of this logic. Cannot raise."""
+    notification (+ token-change fan-out for other patients), keeping a
+    follow-up in step with its appointment, and the Google Calendar resync
+    enqueue. Used by the staff approval routes, the Queue-tab buttons, the
+    staff direct-edit endpoints, Undo and the automatic WhatsApp path, so there
+    is exactly one copy of this logic. Cannot raise."""
     notify_after_write(conn, intent, slots, entity_id, wa_id=wa_id, language=language)
+    followup_after_write(conn, intent, slots, entity_id)
     calendar_after_write(conn, intent, slots, entity_id)
 
 
@@ -278,6 +302,12 @@ def _auto_runner(conn, **kwargs):
     check passes, commit through propose/confirm and the shared hooks."""
     return auto_actions.handle_request(
         conn, handlers=HANDLERS, after_commit=post_write_hooks, **kwargs)
+
+
+def _followup_runner(conn, **kwargs):
+    """The conversation agent's hook for a follow-up reminder's "Already visited" /
+    confirmed "Cancel" button (see clinic/conversation.py)."""
+    return followups.patient_action(conn, handlers=HANDLERS, after_commit=post_write_hooks, **kwargs)
 
 
 def calendar_after_write(conn, intent, slots, entity_id):
@@ -379,8 +409,9 @@ def queue_panel_context(conn, day=None, branch=None):
 def dashboard():
     conn = get_conn()
     patients = conn.execute(
-        "SELECT id, name, phone, age, registered_at FROM patients ORDER BY id DESC LIMIT 10"
+        "SELECT id, name, phone, age, registered_at FROM patients ORDER BY id DESC LIMIT ?", (PATIENTS_PAGE,)
     ).fetchall()
+    patients_total = conn.execute("SELECT COUNT(*) FROM patients").fetchone()[0]
     staff = conn.execute("SELECT id, name FROM staff ORDER BY name").fetchall()
     audit_log = conn.execute(
         "SELECT logged_at, intent, entity_type, entity_id, payload_json FROM audit_log ORDER BY id DESC LIMIT 10"
@@ -403,6 +434,9 @@ def dashboard():
                     (row["patient_id"],),
                 ).fetchall()
             ]
+        # A booking request that has no usable phone yet: the card says so before anyone presses Approve.
+        item["phone_problem"] = booking_phone.problem(conn, dict(item["slots"], patient_id=item["slots"].get("patient_id") or row["patient_id"])) \
+            if row["intent"] == "book_appointment" and row["status"] == "classified" else None
         item["appointments"] = []
         if row["intent"] in ("cancel_appointment", "reschedule_appointment"):
             # The sender's own upcoming appointments (by patient or by phone,
@@ -422,6 +456,7 @@ def dashboard():
         clinical_citation=CLINICAL_ADAPTER.citation(),
         ops_citation=OPS_ADAPTER.citation(),
         patients=patients,
+        patients_total=patients_total,
         staff=staff,
         audit_log=audit_log,
         wa_inbox=wa_inbox_rows,
@@ -594,7 +629,8 @@ def _process_text(msg_id, wa_id, text, choice_id=None, stale=False):
     conn = get_conn()
     try:
         conv_runtime.process_inbound(
-            conn, msg_id, wa_id, text, choice_id, now=_clinic_now(), picker=AGENT_PICKER, auto=_auto_runner)
+            conn, msg_id, wa_id, text, choice_id, now=_clinic_now(), picker=AGENT_PICKER, auto=_auto_runner,
+            followup=_followup_runner)
     except Exception:
         _logger.exception("conversation agent failed for wa_message %s; handing it to staff", msg_id)
         try:
@@ -899,13 +935,20 @@ def appointment_new():
             return jsonify(ok=False, error="That patient was not found.")
         patient_id, name, phone = patient["id"], patient["name"], patient["phone"]
         slots_name = slots_phone = None
+        if not booking_phone.valid_phone(phone):
+            # The patient has no usable number on file: the phone typed on this form is the one the
+            # booking is made under (the patient record itself is not changed).
+            phone = booking_phone.valid_phone(payload.get("patient_phone"))
+            if not phone:
+                return jsonify(ok=False, error=booking_phone.PATIENT_NO_PHONE)
+            slots_phone = phone
     else:
         name = (payload.get("patient_name") or "").strip()
-        phone = last10_digits(payload.get("patient_phone") or "")
+        phone = booking_phone.valid_phone(payload.get("patient_phone"))
         if not name or len(name) > 60:
             return jsonify(ok=False, error="Enter the patient's name (or pick an existing patient).")
-        if len(phone) != 10:
-            return jsonify(ok=False, error="Enter a 10-digit phone number so the patient can be notified.")
+        if not phone:
+            return jsonify(ok=False, error=booking_phone.REQUIRED)
         slots_name, slots_phone = name, phone
     slots = {
         "patient_id": patient_id, "patient_name": slots_name, "patient_phone": slots_phone,
@@ -1175,6 +1218,180 @@ def closures_data():
 
 
 # ---------------------------------------------------------------------------
+# Follow-ups (Patients tab -> Follow-ups): a visit the doctor advised, booked
+# into the calendar straight away, with two WhatsApp reminders. The batch card
+# plans and applies a set of rows (clinic/followups.py); Settings holds the
+# reminder timing and which Meta templates are approved.
+# ---------------------------------------------------------------------------
+
+def _followup_branch(conn, raw):
+    """The branch a follow-up list is filtered to: 'all', or a branch id (the
+    default branch when none / a bad one is named)."""
+    if str(raw or "").lower() == "all":
+        return "all"
+    try:
+        return _branch_id_from(conn, raw)
+    except ValueError:
+        return branches.default_branch_id(conn)
+
+
+def _followup_flush(conn, now):
+    """Queue what is due right now (a follow-up made inside the 2-day window gets
+    its first reminder at once) and deliver it. Best effort, never raises."""
+    try:
+        followups.process_due(conn, now)
+        sender, dry_run = notify.resolve_sender(NOTIFY_SENDER)
+        notify.flush(conn, sender, now=now, dry_run=dry_run)
+    except Exception:
+        _logger.exception("could not send the follow-up reminders right away; the scheduler will retry")
+
+
+@app.route("/followups/data")
+def followups_data():
+    conn = get_conn()
+    branch = _followup_branch(conn, request.args.get("branch"))
+    now = _followup_now()
+    return jsonify(ok=True, today=now.local.date().isoformat(), branch=branch,
+                   followups=followups.list_followups(conn, branch, now), manual=followups.manual_list(conn, branch))
+
+
+@app.route("/followups/slots")
+def followups_slots():
+    """Free times for the batch form's Time dropdown: one day, one branch, optionally one doctor."""
+    conn = get_conn()
+    day = _valid_day(request.args.get("date"))
+    if day is None:
+        return jsonify(ok=False, error="Pick a valid date."), 400
+    try:
+        branch_id = _branch_id_from(conn, request.args.get("branch"))
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    doctor_id = request.args.get("doctor") or None
+    if doctor_id is not None and (not doctor_id.isdigit() or branches.get_doctor(conn, int(doctor_id)) is None):
+        return jsonify(ok=False, error="That doctor does not exist."), 400
+    return jsonify(ok=True, date=day, branch_id=branch_id,
+                   **followups.free_slots(conn, day, branch_id, int(doctor_id) if doctor_id else None, _followup_now()))
+
+
+@app.route("/followups/plan", methods=["POST"])
+def followups_plan():
+    try:
+        result = followups.plan(get_conn(), _json_body().get("rows"), _followup_now())
+    except followups.FollowupError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    return jsonify(ok=True, plan=result)
+
+
+@app.route("/followups/apply", methods=["POST"])
+def followups_apply():
+    conn = get_conn()
+    now = _followup_now()
+    try:
+        result = followups.apply(conn, _json_body().get("rows"), handlers=HANDLERS, after_commit=post_write_hooks, now=now)
+    except followups.FollowupError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    _followup_flush(conn, now)
+    c = result["counts"]
+    result["message"] = "{} follow-up{} booked{}.".format(
+        c["created"], "" if c["created"] == 1 else "s", ", {} could not be booked".format(c["failed"]) if c["failed"] else "")
+    return jsonify(result)
+
+
+@app.route("/followups/batches/<int:batch_id>/undo", methods=["POST"])
+def followups_undo(batch_id):
+    conn = get_conn()
+    result = followups.undo_batch(conn, batch_id, handlers=HANDLERS, after_commit=post_write_hooks, now=_followup_now())
+    if not result.get("ok"):
+        return jsonify(result), 400
+    sender, dry_run = notify.resolve_sender(NOTIFY_SENDER)
+    try:
+        notify.flush(conn, sender, dry_run=dry_run)
+    except Exception:
+        _logger.exception("could not send the undo notices right away; the scheduler will retry")
+    skipped = result["skipped"]
+    result["message"] = "Batch undone: {} follow-up{} cancelled{}.".format(
+        result["cancelled"], "" if result["cancelled"] == 1 else "s",
+        "; left as they are: {}".format("; ".join("{} ({})".format(x["name"], x["why"]) for x in skipped)) if skipped else "")
+    return jsonify(result)
+
+
+@app.route("/followups/<int:followup_id>/diagnosis", methods=["POST"])
+def followups_diagnosis(followup_id):
+    """Staff edit the internal diagnosis note. It is never part of any patient message."""
+    try:
+        text = followups.edit_diagnosis(get_conn(), followup_id, _json_body().get("diagnosis"), _followup_now())
+    except followups.FollowupError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    return jsonify(ok=True, diagnosis=text or "")
+
+
+@app.route("/followups/reminders/<int:reminder_id>/retry", methods=["POST"])
+def followups_reminder_retry(reminder_id):
+    conn = get_conn()
+    if not followups.retry_reminder(conn, reminder_id):
+        return jsonify(ok=False, error="Only a blocked or failed reminder can be retried."), 400
+    sender, dry_run = notify.resolve_sender(NOTIFY_SENDER)
+    try:
+        notify.flush(conn, sender, now=_followup_now(), dry_run=dry_run)
+    except Exception:
+        _logger.exception("flush after a follow-up reminder retry failed")
+    row = conn.execute("SELECT n.status FROM followup_reminders r JOIN notifications n ON n.id = r.notification_id "
+                       "WHERE r.id = ?", (reminder_id,)).fetchone()
+    return jsonify(ok=True, status=row["status"] if row else None)
+
+
+@app.route("/followups/reminders/<int:reminder_id>/manual-sent", methods=["POST"])
+def followups_reminder_manual(reminder_id):
+    if not followups.mark_sent_manually(get_conn(), reminder_id, _followup_now()):
+        return jsonify(ok=False, error="Only a blocked or failed reminder can be marked as sent by hand."), 400
+    return jsonify(ok=True)
+
+
+def _followup_settings_view(conn):
+    return {"timing": settings.followup_reminder_settings(conn), "templates": followups.template_settings(conn)}
+
+
+@app.route("/settings/followups/data")
+def settings_followups_data():
+    return jsonify(ok=True, data=_followup_settings_view(get_conn()))
+
+
+@app.route("/settings/followups", methods=["POST"])
+def settings_followups_save():
+    p, conn = _json_body(), get_conn()
+    try:
+        settings.set_followup_reminder_settings(
+            conn, p.get("days_before"), p.get("send_time"), p.get("hours_before"), p.get("earliest_send"))
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    followups.refresh_scheduled(conn)
+    return jsonify(ok=True, data=_followup_settings_view(conn))
+
+
+@app.route("/settings/followup-templates", methods=["POST"])
+def settings_followup_templates():
+    """Staff tick the Meta templates that Meta has approved. Until a template is
+    ticked, an out-of-window reminder just waits (and is listed to send by hand)."""
+    conn = get_conn()
+    try:
+        settings.set_approved_templates(conn, _json_body().get("approved"), followup_notify.all_template_names())
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    return jsonify(ok=True, data=_followup_settings_view(conn))
+
+
+@app.route("/settings/sarvam-usage")
+def settings_sarvam_usage():
+    """This month's Sarvam planner spend (an estimate from token counts at Sarvam's published prices),
+    for the one line in Settings. Read-only."""
+    conn = get_conn()
+    data = planner_log.sarvam_usage(conn, _clinic_now())
+    data["active"] = planner_module.backend_name() == "sarvam" and bool(sarvam.api_key())
+    data["log_enabled"] = settings.planner_log_enabled(conn)
+    return jsonify(ok=True, data=data)
+
+
+# ---------------------------------------------------------------------------
 # Settings -> Branches / Doctors / Schedules. Every route returns the full
 # branch context so the page can redraw from one response.
 # ---------------------------------------------------------------------------
@@ -1266,6 +1483,26 @@ def settings_schedule_remove(schedule_id):
 def automation_undo(activity_id):
     result = auto_actions.undo(get_conn(), activity_id, HANDLERS, post_write_hooks, _clinic_now())
     return jsonify(result)
+
+
+@app.route("/patients/page")
+def patients_page():
+    """The next page of the Patients table, newest first. Keyset paging
+    (`before_id` = the id of the last row the table shows) so a patient
+    registered while the table is open can't shift the pages and repeat a
+    row. `limit` is capped; has_more says whether older patients remain."""
+    try:
+        before_id = int(request.args.get("before_id", ""))
+        limit = int(request.args.get("limit", PATIENTS_PAGE))
+    except ValueError:
+        return jsonify(ok=False, error="before_id and limit must be numbers."), 400
+    limit = max(1, min(limit, PATIENTS_PAGE_MAX))
+    rows = get_conn().execute(
+        "SELECT id, name, phone, age, registered_at FROM patients WHERE id < ? ORDER BY id DESC LIMIT ?",
+        (before_id, limit + 1),
+    ).fetchall()
+    patients = [dict(r, registered_at=utc_to_ist(r["registered_at"])) for r in rows[:limit]]
+    return jsonify(ok=True, patients=patients, has_more=len(rows) > limit)
 
 
 @app.route("/patients/<int:patient_id>/activity")
@@ -1397,6 +1634,36 @@ def notification_retry(notification_id):
         _logger.exception("flush after retry failed")
     status = conn.execute("SELECT status FROM notifications WHERE id = ?", (notification_id,)).fetchone()["status"]
     return jsonify(ok=True, status=status)
+
+
+# -- questions the assistant could not answer (clinic/unanswered.py) --------------------------
+# The Audit log tab lists them for staff; marking one resolved (with a one-line note) is what
+# makes the Assistant tell the user, once, that it works now. Nothing here changes clinic data
+# and none of it ever becomes SQL: a developer adds the whitelist entry (clinic/query_tool.py).
+
+@app.route("/unanswered/data")
+def unanswered_data():
+    return jsonify(ok=True, **unanswered.list_items(get_conn()))
+
+
+@app.route("/unanswered/<int:item_id>/status", methods=["POST"])
+def unanswered_status(item_id):
+    p = _json_body()
+    try:
+        item = unanswered.set_status(get_conn(), item_id, p.get("status"), p.get("note"), _clinic_now())
+    except unanswered.UnansweredError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    return jsonify(ok=True, item=item)
+
+
+@app.route("/unanswered/notices")
+def unanswered_notices():
+    return jsonify(ok=True, notices=unanswered.pending_notices(get_conn()))
+
+
+@app.route("/unanswered/<int:item_id>/notified", methods=["POST"])
+def unanswered_notified(item_id):
+    return jsonify(ok=True, changed=unanswered.mark_notified(get_conn(), item_id, _clinic_now()))
 
 
 if __name__ == "__main__":

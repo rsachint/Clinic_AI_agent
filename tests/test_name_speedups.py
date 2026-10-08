@@ -122,7 +122,7 @@ class OptionsTests(unittest.TestCase):
 
 
 class PipelineKnownNamesTests(unittest.TestCase):
-    def test_registered_names_filters_single_word_patients_but_keeps_staff(self):
+    def test_registered_names_lists_every_patient_and_staff_member_including_one_word_names(self):
         import sqlite3
         from clinic.queries import registered_names
         conn = sqlite3.connect(":memory:")
@@ -130,7 +130,8 @@ class PipelineKnownNamesTests(unittest.TestCase):
         conn.execute("INSERT INTO patients (name, phone, age) VALUES ('Rakesh Verma', '9000000001', 40)")
         conn.execute("INSERT INTO patients (name, phone, age) VALUES ('Anil', '9000000002', 30)")
         conn.execute("INSERT INTO staff (name, role) VALUES ('Seema', 'nurse')")
-        self.assertEqual(sorted(registered_names(conn)), ["Rakesh Verma", "Seema"])
+        # A one-word name is listed too: the matcher (llm_slots.match_known_name) is what keeps it safe.
+        self.assertEqual(sorted(registered_names(conn)), ["Anil", "Rakesh Verma", "Seema"])
 
 
 if __name__ == "__main__":

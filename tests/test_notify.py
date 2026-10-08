@@ -63,6 +63,16 @@ def book(conn, name, appt_date, start_time, phone="9876543210", now=NOW, hook=Tr
     return appt_id
 
 
+def book_legacy_without_phone(conn, name, appt_date, start_time):
+    """An appointment from before a phone was mandatory (the booking handler now refuses one): written straight
+    to the table, as older rows are, then announced through the notification hook like any booking."""
+    cur = conn.execute("INSERT INTO appointments (patient_name, appt_date, start_time, duration_minutes) VALUES (?, ?, ?, 15)",
+                       (name, appt_date, start_time))
+    conn.commit()
+    notify.after_write(conn, "book_appointment", {"appt_date": appt_date}, cur.lastrowid, now=NOW)
+    return cur.lastrowid
+
+
 def rows(conn, event=None):
     q = "SELECT * FROM notifications"
     params = ()
@@ -166,7 +176,7 @@ class EnqueueTests(unittest.TestCase):
         self.assertEqual(rows(self.conn)[0]["status"], "skipped_no_phone")
 
     def test_appointment_with_no_phone_records_a_skip_but_no_token_marker(self):
-        a = book(self.conn, "NoPhone", TODAY, "09:00", phone=None)
+        a = book_legacy_without_phone(self.conn, "NoPhone", TODAY, "09:00")
         self.assertEqual([r["status"] for r in rows(self.conn)], ["skipped_no_phone"])
         self.assertIsNone(self.conn.execute("SELECT last_notified_token FROM appointments WHERE id=?", (a,)).fetchone()[0])
 
@@ -651,7 +661,7 @@ class ReminderTests(unittest.TestCase):
         self.assertEqual(rows(self.conn, "reminder_day_before"), [])
 
     def test_no_phone_creates_no_reminder_noise(self):
-        book(self.conn, "NoPhone", TODAY, "12:00", phone=None)
+        book_legacy_without_phone(self.conn, "NoPhone", TODAY, "12:00")
         self.conn.execute("DELETE FROM notifications")
         self.conn.commit()
         notify.generate_reminders(self.conn, self.at(5, 9))

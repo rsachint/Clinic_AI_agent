@@ -25,8 +25,11 @@ Hard rules this module enforces
   last inbound message. Outside that window `flush` does NOT attempt a send;
   the row becomes `blocked_no_window` (visible in the UI, retryable with
   `retry()`). META_TEMPLATES below holds the template bodies to submit to
-  Meta for approval later; template *sending* is deliberately not
-  implemented.
+  Meta for approval later. Template *sending* exists only for rows that carry
+  a template spec (the follow-up reminders, clinic/followup_notify.py): such a
+  row outside the window is sent as that template, but only when staff have
+  marked the template approved (clinic/settings.py); otherwise it waits as
+  `blocked_no_window` like every other message.
 """
 
 import inspect
@@ -39,7 +42,7 @@ import time
 from collections import namedtuple
 from datetime import date, datetime, timedelta, timezone
 
-from clinic import branches, token_queue, whatsapp
+from clinic import branches, settings, token_queue, whatsapp
 from clinic.entity_resolution import last10_digits
 
 _logger = logging.getLogger(__name__)
@@ -66,6 +69,8 @@ EVENTS = (
     "appointment_cancelled_by_clinic", "appointment_reinstated",
     # A branch closure moved or cancelled the appointment (clinic/closure_notify.py):
     "closure_moved", "closure_cancelled",
+    # A follow-up visit's two reminders (clinic/followups.py):
+    "followup_reminder_2d", "followup_reminder_4h",
 )
 
 # Events whose text states the patient's token. Sending one updates
@@ -415,20 +420,23 @@ def _appointment_context(conn, appointment_id):
 # ---------------------------------------------------------------------------
 
 def enqueue(conn, *, event, dedup_key, body, wa_id, appointment_id=None, language=None, now=None,
-            interactive=None):
+            interactive=None, template=None):
     """Insert one outbox row, idempotently. Returns the new row id, or None
     if a row with this dedup_key already exists (nothing is changed then).
     A missing wa_id is recorded as `skipped_no_phone` rather than dropped, so
     staff can see the patient could not be reached. `interactive` is the
-    JSON-able button/list spec (see whatsapp.build_interactive_body)."""
+    JSON-able button/list spec (see whatsapp.build_interactive_body); `template`
+    the spec of the template to send instead outside the 24-hour window (see
+    whatsapp.build_template_body)."""
     now = now or Now.real()
     status = "pending" if wa_id else "skipped_no_phone"
     cur = conn.execute(
         "INSERT OR IGNORE INTO notifications "
-        "(appointment_id, wa_id, event, dedup_key, language, body, status, created_at, interactive_json) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "(appointment_id, wa_id, event, dedup_key, language, body, status, created_at, interactive_json, template_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (appointment_id, wa_id or None, event, dedup_key, language, body, status, _ts(now.utc),
-         json.dumps(interactive, ensure_ascii=False) if interactive else None),
+         json.dumps(interactive, ensure_ascii=False) if interactive else None,
+         json.dumps(template, ensure_ascii=False) if template else None),
     )
     conn.commit()
     return cur.lastrowid if cur.rowcount else None
@@ -713,8 +721,10 @@ def notify_mode():
     return "live" if os.environ.get("WHATSAPP_ACCESS_TOKEN") else "dry_run"
 
 
-def live_sender(wa_id, text, interactive=None):
+def live_sender(wa_id, text, interactive=None, template=None):
     # Looked up at call time (not imported by name) so a test can patch it.
+    if template:
+        return whatsapp.send_template(wa_id, template)
     if interactive:
         return whatsapp.send_interactive(wa_id, text, interactive)
     return whatsapp.send_message(wa_id, text)
@@ -729,12 +739,16 @@ def interactive_fallback_text(body, interactive):
     return "{}\n\n{}".format(body, "\n".join("- {}".format(o["title"]) for o in options))
 
 
-def _sender_takes_interactive(sender):
+def _sender_takes(sender, keyword):
     try:
         params = inspect.signature(sender).parameters
     except (TypeError, ValueError):
         return False
-    return "interactive" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    return keyword in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _sender_takes_interactive(sender):
+    return _sender_takes(sender, "interactive")
 
 
 def resolve_sender(override=None):
@@ -805,17 +819,21 @@ def _deliver(conn, row, sender, now, dry_run):
         if not row["wa_id"]:
             _set_status(conn, nid, "skipped_no_phone")
             return "skipped_no_phone"
+        template = None
         if not in_window(conn, row["wa_id"], now.utc):
-            _set_status(
-                conn, nid, "blocked_no_window",
-                error="No message from this number in the last {}h; WhatsApp needs an approved template.".format(WINDOW_HOURS),
-            )
-            return "blocked_no_window"
+            template, why = _usable_template(conn, row, sender, dry_run)
+            if template is None:
+                _set_status(
+                    conn, nid, "blocked_no_window",
+                    error="No message from this number in the last {}h; WhatsApp needs an approved template{}.".format(
+                        WINDOW_HOURS, " ({})".format(why) if why else ""),
+                )
+                return "blocked_no_window"
         if dry_run:
             _set_status(conn, nid, "dry_run")
             return "dry_run"
         try:
-            _send_row(sender, row)
+            _send_row(sender, row, template)
         except Exception as exc:
             _logger.warning("notification %s failed: %s", nid, exc)
             _set_status(conn, nid, "failed", error=str(exc)[:500], attempts_delta=1)
@@ -831,7 +849,25 @@ def _deliver(conn, row, sender, now, dry_run):
         return "error"
 
 
-def _send_row(sender, row):
+def _usable_template(conn, row, sender, dry_run):
+    """(spec, None) when this out-of-window row may go out as an approved
+    template, else (None, why-not or '')."""
+    if "template_json" not in row.keys() or not row["template_json"]:
+        return None, ""
+    try:
+        spec = json.loads(row["template_json"])
+    except ValueError:
+        return None, ""
+    if not settings.template_approved(conn, spec.get("name")):
+        return None, "template {} is not marked approved".format(spec.get("name"))
+    if not dry_run and not _sender_takes(sender, "template"):
+        return None, "this sender cannot send templates"
+    return spec, None
+
+
+def _send_row(sender, row, template=None):
+    if template is not None:
+        return sender(row["wa_id"], row["body"], template=template)
     interactive = None
     if "interactive_json" in row.keys() and row["interactive_json"]:
         interactive = json.loads(row["interactive_json"])

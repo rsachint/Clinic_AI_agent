@@ -11,8 +11,8 @@ import re
 import unicodedata
 from datetime import date, timedelta
 
-from clinic import branches
-from clinic.nlu import datetime_extract
+from clinic import branches, voice_branch
+from clinic.nlu import date_guard, datetime_extract
 
 _EDGE_L = r"(?<![\wऀ-ॿ])"
 _EDGE_R = r"(?![\wऀ-ॿ])"
@@ -25,8 +25,9 @@ _LEAVE_WORD = re.compile(
     r"|छुट्टी|बीमार|नहीं\s+आएंगे|नहीं\s+आयेंगे", re.IGNORECASE)
 # Questions about hours or the state of things are reads, not a request to close.
 _NOT_A_CLOSURE = re.compile(
-    _EDGE_L + r"(?:show|list|how\s+many|what|when|which|kitne|kitni|kab|kya|status|timing|timings|hours|closing\s+time"
-    r"|opens?|open\s+hours|दिखा\w*|कितने|कितनी|कब|क्या|समय)" + _EDGE_R, re.IGNORECASE)
+    _EDGE_L + r"(?:show|list|how\s+many|what|when|which|why|who|whom|kitne|kitni|kab|kya|kyun|kyon|kaun|status|timing|timings|hours"
+    r"|closing\s+time|opens?|open\s+hours|दिखा\w*|कितने|कितनी|कब|क्या|क्यों|कौन|समय"
+    r"|^\s*(?:is|are|was|were|has|have|does|did))" + _EDGE_R, re.IGNORECASE)
 
 _REASON = re.compile(
     r"(?:because(?:\s+of)?|since|due\s+to|reason(?:\s+is)?|kyunki|kyuki|क्योंकि|कारण)\s*[:,]?\s*(.+)$", re.IGNORECASE | re.DOTALL)
@@ -112,6 +113,44 @@ def parse(conn, text, cleaned_text, mention, today=None):
         slots["reason"] = re.sub(r"\s+", " ", m.group(1)).strip(" .,।!?")[:200]
     elif doctor and _LEAVE_WORD.search(_norm(text)):
         slots["reason"] = "{} is on leave".format(doctor["name"])
+    return slots
+
+
+_MOVE_CUE = re.compile(
+    _EDGE_L + r"(?:move|moved|shift|shifted|send|sent|transfer|transferred|redirect|reassign|भेज\w*|शिफ्ट|ट्रांसफर)" + _EDGE_R,
+    re.IGNORECASE)
+
+
+def needs_reading(conn, text, slots):
+    """True when the phrase rules above probably missed something in a closing
+    command: no first day, a length ("for the next one week", "agle 3 din") with no
+    last day, or a second branch named (where everyone should go). Only then is
+    the planner worth asking (clinic/pipeline.py); a plain "close Branch A
+    tomorrow" never is."""
+    if "appt_date" not in slots:
+        return True
+    if "end_date" not in slots and date_guard.duration_days(text):
+        return True
+    return len(voice_branch.named_branches(conn, text)) >= 2
+
+
+def apply_reading_rules(conn, text, slots, today=None):
+    """What the plain rules can still do for such a command when the planner could
+    not help (deterministic, no model): the first branch named is the one closing
+    and, after a "move / send", the last named is where everyone goes; a length
+    counts from the first day said, or from today. Returns new slots."""
+    today = today or date.today()
+    slots = dict(slots)
+    named = voice_branch.named_branches(conn, text)
+    if len(named) >= 2 and _MOVE_CUE.search(text):
+        slots["branch_id"] = named[0]["id"]
+        slots["destination_branch_id"] = named[-1]["id"]
+    days = date_guard.duration_days(text)
+    if days and days > 1 and "end_date" not in slots:
+        start = slots.get("appt_date") or today.isoformat()
+        slots["appt_date"] = start
+        slots["end_date"] = (date.fromisoformat(start) + timedelta(days=days - 1)).isoformat()
+        slots.pop("date_unreadable", None)
     return slots
 
 

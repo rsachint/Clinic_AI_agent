@@ -4,7 +4,10 @@ thread that, about once a minute,
   (a) delivers pending notifications, retrying recently failed ones a
       bounded number of times (see notify.RETRY_MAX_ATTEMPTS), and
   (b) generates the day-before and morning reminders
-      (notify.generate_reminders; hour constants live in clinic/notify.py), and
+      (notify.generate_reminders; hour constants live in clinic/notify.py), plus
+      the two follow-up reminders (followups.tick: any whose time has passed
+      while the visit is still ahead is sent now, so a tick after downtime
+      catches up), and
   (c) when Google Calendar sync is configured, drains the calendar sync queue
       (bounded retries) and queues a full reconcile of today..+30 days about
       every 10 minutes (clinic/gcal_sync.py). This step runs LAST and is
@@ -25,7 +28,7 @@ Design points:
 import logging
 import threading
 
-from clinic import gcal_client, gcal_sync, notify
+from clinic import followups, gcal_client, gcal_sync, notify
 
 _logger = logging.getLogger(__name__)
 
@@ -39,7 +42,7 @@ def tick(conn, sender=None, dry_run=False, now=None, calendar_client=None):
     configured and that step is skipped. Returns a small summary dict; never
     raises."""
     now = now or notify.Now.real()
-    summary = {"reminders_created": 0, "flushed": {}, "errors": 0, "calendar": None}
+    summary = {"reminders_created": 0, "followup_reminders": 0, "flushed": {}, "errors": 0, "calendar": None}
 
     def step(name, fn):
         try:
@@ -58,8 +61,10 @@ def tick(conn, sender=None, dry_run=False, now=None, calendar_client=None):
     flushed = step("flush", lambda: notify.flush(conn, sender, now=now, dry_run=dry_run))
     created = step("reminders", lambda: notify.generate_reminders(conn, now))
     summary["reminders_created"] = created or 0
+    followup_created = step("followup-reminders", lambda: followups.tick(conn, now))
+    summary["followup_reminders"] = followup_created or 0
     # ...then send the reminders just created without waiting a full minute.
-    if created:
+    if created or followup_created:
         again = step("flush-reminders", lambda: notify.flush(conn, sender, now=now, dry_run=dry_run))
         for status, count in (again or {}).items():
             flushed = flushed or {}

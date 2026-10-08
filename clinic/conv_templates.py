@@ -72,6 +72,43 @@ MSG = {
         "hi": "क्षमा करें, वह बदलाव नहीं मिला। शायद वह पहले ही अपडेट हो चुका है। आप क्या करना चाहेंगे?",
         "hinglish": "Maaf kijiye, woh badlaav nahi mila. Shayad woh pehle hi update ho chuka hai. Aap kya karna chahenge?",
     },
+    # --- a follow-up reminder's buttons (clinic/followup_notify.py); the visit is never described clinically ---
+    "followup_cancel_ask": {
+        "en": "Cancel your follow-up visit on {date} at {time}?",
+        "hi": "{date} को {time} की अपनी फ़ॉलो-अप विज़िट रद्द करें?",
+        "hinglish": "{date} ko {time} ki apni follow-up visit cancel karein?",
+    },
+    "followup_cancelled": {
+        "en": "Your follow-up visit on {date} at {time} has been cancelled. Message us any time if you would like to book again.",
+        "hi": "{date} को {time} की आपकी फ़ॉलो-अप विज़िट रद्द कर दी गई है। दोबारा बुक करना चाहें तो कभी भी हमें संदेश भेजें।",
+        "hinglish": "{date} ko {time} ki aapki follow-up visit cancel kar di gayi hai. Dobara book karna chahein to kabhi bhi hamein message bhejein.",
+    },
+    "followup_kept": {
+        "en": "Okay, your follow-up visit on {date} at {time} stays as booked. See you then.",
+        "hi": "ठीक है, {date} को {time} की आपकी फ़ॉलो-अप विज़िट जैसी बुक है वैसी ही रहेगी। तब मिलते हैं।",
+        "hinglish": "Theek hai, {date} ko {time} ki aapki follow-up visit jaisi book hai waisi hi rahegi. Tab milte hain.",
+    },
+    "followup_visited": {
+        "en": "Thank you for letting us know. We have updated our records and will not send more reminders for this follow-up.",
+        "hi": "बताने के लिए धन्यवाद। हमने अपना रिकॉर्ड अपडेट कर दिया है और इस फ़ॉलो-अप के लिए अब कोई रिमाइंडर नहीं भेजेंगे।",
+        "hinglish": "Bataane ke liye dhanyavaad. Humne apna record update kar diya hai aur is follow-up ke liye ab koi reminder nahi bhejenge.",
+    },
+    "followup_gone": {
+        "en": "This follow-up is no longer active. What would you like to do?",
+        "hi": "यह फ़ॉलो-अप अब सक्रिय नहीं है। आप क्या करना चाहेंगे?",
+        "hinglish": "Yeh follow-up ab active nahi hai. Aap kya karna chahenge?",
+    },
+    # --- STOP / START for the follow-up reminders ---
+    "optout_done": {
+        "en": "You will no longer receive follow-up reminders from us. Send START any time to receive them again.",
+        "hi": "अब आपको हमसे फ़ॉलो-अप रिमाइंडर नहीं मिलेंगे। दोबारा पाने के लिए कभी भी START लिखें।",
+        "hinglish": "Ab aapko humse follow-up reminders nahi milenge. Dobara paane ke liye kabhi bhi START likhein.",
+    },
+    "optin_done": {
+        "en": "Follow-up reminders are back on.",
+        "hi": "फ़ॉलो-अप रिमाइंडर फिर से चालू हैं।",
+        "hinglish": "Follow-up reminders phir se chalu hain.",
+    },
     "where_branch": {"en": "Branch: {branch}", "hi": "ब्रांच: {branch}", "hinglish": "Branch: {branch}"},
     "where_doctor": {"en": "Doctor: {doctor}", "hi": "डॉक्टर: {doctor}", "hinglish": "Doctor: {doctor}"},
     # --- booking questions -----------------------------------------------
@@ -296,6 +333,8 @@ BTN = {
     "choose_time": {"en": "Choose time", "hi": "समय चुनें", "hinglish": "Time chunein"},
     "choose": {"en": "Choose", "hi": "चुनें", "hinglish": "Chunein"},
     "choose_branch": {"en": "Choose branch", "hi": "ब्रांच चुनें", "hinglish": "Branch chunein"},
+    "followup_cancel_yes": {"en": "Yes, cancel", "hi": "हाँ, रद्द करें", "hinglish": "Haan, cancel karein"},
+    "followup_cancel_no": {"en": "No, keep it", "hi": "नहीं, रखें", "hinglish": "Nahi, rakhein"},
 }
 
 # Short notes shown under a branch in the "Which branch?" list (<= 72 chars with the address).

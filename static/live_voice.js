@@ -197,6 +197,18 @@ window.buildTranscriptReview = function (data, handlers) {
   return { element: wrap, textarea: textarea };
 };
 
+// The planner (a local model) can take several seconds. While it works the page
+// shows this line in the assistant's bubble, so the wait never looks like a hang.
+// `data` is the server's "thinking" event ({transcript, stage}). Pure: no DOM.
+window.thinkingNote = function (data) {
+  if (!data || typeof data !== "object") return "";
+  return data.stage === "planner" ? "Working out what you meant\u2026" : "Thinking\u2026";
+};
+
+// How long the page waits on "Thinking..." before giving up on a silent server. It has to
+// outlast the planner's own time limit (12 s) plus the one-word fallback behind it.
+window.THINKING_SAFETY_MS = 45000;
+
 window.readAnswerSentence = function (data) {
   var rows = Array.isArray(data.data) ? data.data : (data.data ? [data.data] : []);
   var hasTable = rows.length > 0 && typeof rows[0] === "object";
@@ -237,7 +249,7 @@ document.addEventListener("DOMContentLoaded", function () {
         cancelAllListens();
         setState("idle");
         flashCaption("No response from the assistant. Try again.");
-      }, 25000);
+      }, window.THINKING_SAFETY_MS);
     }
   }
 
@@ -281,18 +293,39 @@ document.addEventListener("DOMContentLoaded", function () {
   var waitingBubbles = [];
   function takeBubble(transcript) {
     for (var i = 0; i < waitingBubbles.length; i++) {
-      if (waitingBubbles[i].text === transcript) return waitingBubbles.splice(i, 1)[0].bubble;
+      if (waitingBubbles[i].text === transcript) {
+        var bubble = waitingBubbles.splice(i, 1)[0].bubble;
+        clearThinking(bubble);
+        return bubble;
+      }
     }
     return appendTurn(transcript);
+  }
+
+  // The "working out what you meant" line shown while the planner runs.
+  function showThinking(transcript, note) {
+    for (var i = 0; i < waitingBubbles.length; i++) {
+      var bubble = waitingBubbles[i].bubble;
+      if (waitingBubbles[i].text === transcript && !bubble.querySelector(".assistant-thinking")) {
+        bubble.appendChild(el("div", { class: "assistant-thinking", text: note }));
+        feed.scrollTop = feed.scrollHeight;
+        return;
+      }
+    }
+  }
+
+  function clearThinking(bubble) {
+    var line = bubble.querySelector(".assistant-thinking");
+    if (line) line.remove();
   }
 
   // Cards still waiting for a decision, by id, so a voice edit can find its card.
   var openCards = {};
 
-  function cardClosed(cardId) {
+  function cardClosed(cardId, outcome) {
     if (!cardId) return;
     delete openCards[cardId];
-    socket.emit("card_closed", { card_id: cardId });
+    socket.emit("card_closed", { card_id: cardId, outcome: outcome || null });
   }
 
   function showReviewTurn(bubble, data) {
@@ -325,12 +358,12 @@ document.addEventListener("DOMContentLoaded", function () {
             return;
           }
           ReviewCard.showOutcome(card, "✅ " + result.message, true);
-          cardClosed(cardId);
+          cardClosed(cardId, "approved");
           if (window.DashboardRefresh) DashboardRefresh.refresh();
         },
         onRejected: function () {
           ReviewCard.showOutcome(card, "Rejected -- nothing was saved.", false);
-          cardClosed(cardId);
+          cardClosed(cardId, "rejected");
         },
       }
     );
@@ -383,12 +416,17 @@ document.addEventListener("DOMContentLoaded", function () {
         bubble.classList.add("bubble-wide");      // a table gets the whole row, not 92% of it
         var headerRow = el("tr");
         var columns = window.orderColumns(Object.keys(rows[0]), !!(window.Branches && Branches.multi()));
-        columns.forEach(function (k) { headerRow.appendChild(el("th", { text: k })); });
+        var fmt = window.ReadFormat;                // money as Rs, numbers on the right (static/read_format.js)
+        columns.forEach(function (k) {
+          headerRow.appendChild(el("th", fmt && fmt.isNumericColumn(k, rows) ? { text: k, class: "cell-num" } : { text: k }));
+        });
         table.appendChild(headerRow);
         rows.forEach(function (row) {
           var tr = el("tr");
           columns.forEach(function (k) {
-            var cell = el("td", { text: row[k] === null || row[k] === undefined ? "-" : row[k] });
+            var shown = fmt ? fmt.cell(k, row[k]) : { text: row[k] === null || row[k] === undefined ? "-" : row[k], numeric: false };
+            var cell = el("td", { text: shown.text });
+            if (shown.numeric) cell.className = "cell-num";
             if (String(k).toLowerCase() === "notes") cell.className = "cell-notes";   // the one column allowed to wrap
             tr.appendChild(cell);
           });
@@ -728,6 +766,13 @@ document.addEventListener("DOMContentLoaded", function () {
     if (!machine.isHeld()) setState("idle");
   });
 
+  // The planner is working on this command: say so, and keep the safety timer from
+  // firing while it does (a slow model is not a silent server).
+  socket.on("thinking", function (data) {
+    showThinking(data.transcript, window.thinkingNote(data));
+    if (!machine.isHeld()) setState("thinking");
+  });
+
   socket.on("review_card", function (data) {
     var bubble = takeBubble(data.transcript);
     showReviewTurn(bubble, data);
@@ -823,6 +868,7 @@ if (typeof module !== "undefined" && module.exports) {
     pttElementInfo: window.pttElementInfo,
     createHoldMachine: window.createHoldMachine,
     readAnswerSentence: window.readAnswerSentence,
+    thinkingNote: window.thinkingNote,
     orderColumns: window.orderColumns,
     buildTranscriptReview: window.buildTranscriptReview,
   };

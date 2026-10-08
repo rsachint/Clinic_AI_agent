@@ -43,9 +43,11 @@ class TransliterationTests(unittest.TestCase):
         self.assertFalse(has_devanagari("Amit"))
         self.assertEqual(to_latin("अमित"), "amit")  # the final "a" is dropped, as in Hindi
 
-    def test_a_cross_script_match_is_never_an_exact_match(self):
-        self.assertLess(entity_resolution.similarity("अमित दुआ", "Amit Dua"), 0.999)
+    def test_a_cross_script_match_is_exact_or_nothing(self):
+        self.assertEqual(entity_resolution.similarity("अमित दुआ", "Amit Dua"), 1.0)     # the same name, in the other script
         self.assertEqual(entity_resolution.similarity("Amit Dua", "Amit Dua"), 1.0)
+        self.assertEqual(entity_resolution.similarity("अमित दुआ", "Amit Duaa Rao"), 0.0)  # not "nearly"
+        self.assertEqual(entity_resolution.similarity("अमित", "Amita"), 0.0)
 
 
 class WalkInTestCase(unittest.TestCase):
@@ -127,10 +129,8 @@ class CancelCardTests(WalkInTestCase):
         self.assertIn("No upcoming appointment found", card.resolved["note"])
         self.assertNotIn("appointment_id", card.slots)
 
-    def test_two_people_who_sound_alike_get_no_preselected_choice(self):
-        self.add_appt(None, "Amit Duaa", 5, "09:00")  # a different walk-in, nearly the same name
-        self.conn.commit()
-        card = self.ask("Amit Dua cancel", "Amit Dua")
+    def test_two_people_with_the_same_first_name_get_no_preselected_choice(self):
+        card = self.ask("Amit cancel", "Amit")      # Amit Dua and Amit Anand both fit exactly
         self.assertGreaterEqual(len(card.resolved["appointments"]), 2)
         self.assertNotIn("appointment_id", card.slots)
 

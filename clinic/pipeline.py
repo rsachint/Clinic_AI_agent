@@ -1,11 +1,15 @@
 from collections import namedtuple
 from datetime import date, datetime, timedelta
 
-from clinic import branches, closures, core, entity_resolution, scheduling, voice_branch, voice_closure
+from clinic import booking_phone, branches, closures, core, entity_resolution, query_tool, scheduling, unanswered, voice_branch, voice_closure
+from clinic.nlu import planner as planner_module
 from clinic.nlu.answer import compose_answer, compose_navigation
 from clinic.nlu.parser import QUEUE_WRITE_INTENTS, UnrecognizedCommand, parse
 from clinic.queries import registered_names
-from clinic.voice_context import APPOINTMENT_INTENTS, _display_name, apply_context, next_question
+from clinic.voice_context import APPOINTMENT_INTENTS, AskResult, Note, _display_name, apply_context, next_question
+
+
+NOT_CLASSIFIED = "Could not classify this into a known command."
 
 
 class PipelineError(Exception):
@@ -48,12 +52,23 @@ def _short_day(day, weekday=True):
     return "{} {}".format(day.strftime("%a"), label) if weekday else label
 
 
-def _resolve_patient_or_raise(clinical_adapter, conn, name):
-    if not name:
+def _patients_for(clinical_adapter, conn, name, slots):
+    """The registered patients exactly meant: a patient already chosen (slots["patient_id"]), else the phone
+    number in the command (exact match first), else the name. Each has score 1.0."""
+    slots = slots or {}
+    return clinical_adapter.resolve_patient(conn, name or "", 4, phone=slots.get("patient_phone"),
+                                            patient_id=slots.get("patient_id"))
+
+
+def _resolve_patient_or_raise(clinical_adapter, conn, name, slots=None):
+    if not name and not (slots or {}).get("patient_phone") and not (slots or {}).get("patient_id"):
         raise PipelineError("Could not hear a patient name.")
-    candidates = clinical_adapter.resolve_patient(conn, name)
-    if not candidates or candidates[0].score < 0.6:
-        raise PipelineError("No confident patient match for '{}'.".format(name))
+    candidates = _patients_for(clinical_adapter, conn, name, slots)
+    if not candidates:
+        raise PipelineError("No patient found exactly matching '{}'.".format(name or (slots or {}).get("patient_phone")))
+    if len(candidates) > 1:
+        raise PipelineError("More than one patient matches '{}': {}. Say the phone number to pick one.".format(
+            name, "; ".join(c.label for c in candidates)))
     return candidates[0]
 
 
@@ -61,27 +76,27 @@ def _resolve_staff_or_raise(ops_adapter, conn, name):
     if not name:
         raise PipelineError("Could not hear a staff name.")
     candidates = ops_adapter.resolve_staff(conn, name)
-    if not candidates or candidates[0].score < 0.6:
-        raise PipelineError("No confident staff match for '{}'.".format(name))
+    if not candidates:
+        raise PipelineError("No staff member found exactly matching '{}'.".format(name))
+    if len(candidates) > 1:
+        raise PipelineError("More than one staff member matches '{}': {}. Say the full name.".format(
+            name, "; ".join(c.label for c in candidates)))
     return candidates[0]
 
 
-def _best_effort_patient(clinical_adapter, conn, name):
-    if not name:
+def _best_effort_patient(clinical_adapter, conn, name, slots=None):
+    """The one patient exactly meant, or None (nobody, or several: the caller never picks one of several)."""
+    if not name and not (slots or {}).get("patient_phone") and not (slots or {}).get("patient_id"):
         return None
-    candidates = clinical_adapter.resolve_patient(conn, name)
-    if candidates and candidates[0].score >= 0.6:
-        return candidates[0]
-    return None
+    candidates = _patients_for(clinical_adapter, conn, name, slots)
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _best_effort_staff(ops_adapter, conn, name):
     if not name:
         return None
     candidates = ops_adapter.resolve_staff(conn, name)
-    if candidates and candidates[0].score >= 0.6:
-        return candidates[0]
-    return None
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _resolve_queue_command(conn, intent, slots, clinical_adapter):
@@ -108,21 +123,27 @@ def _resolve_queue_command(conn, intent, slots, clinical_adapter):
             appointment_id = entry["id"]
         else:
             note = "Token {} is not waiting in today's queue.".format(token)
-    elif name:
-        patient = _best_effort_patient(clinical_adapter, conn, name)
-        mine = [e for e in entries if e["id"] in outstanding_ids and patient and e["patient_id"] == patient.id]
-        if not mine:
-            # Walk-ins booked under a raw name have no patient row: fall back
-            # to a close name match among today's queue.
-            scored = sorted(
-                ((entity_resolution.similarity(name, e["name"] or ""), e) for e in entries if e["id"] in outstanding_ids),
-                key=lambda pair: pair[0], reverse=True,
-            )
-            mine = [scored[0][1]] if scored and scored[0][0] >= 0.75 else []
-        if mine:
+    elif name or slots.get("patient_id"):
+        waiting = [e for e in entries if e["id"] in outstanding_ids]
+        if slots.get("patient_id") is not None:
+            # The person was already chosen: their id decides, the name is only for display.
+            mine = [e for e in waiting if str(e["patient_id"]) == str(slots["patient_id"])]
+        else:
+            ids = {c.id for c in _patients_for(clinical_adapter, conn, name, slots)}
+            # Walk-ins booked under a raw name have no patient row: their written name is compared exactly.
+            mine = [e for e in waiting if e["patient_id"] in ids
+                    or (e["patient_id"] is None and name and entity_resolution.name_match(name, e["name"] or "") == 1.0)]
+        people = {("patient", e["patient_id"]) if e["patient_id"] is not None
+                  else ("walk-in", (e["name"] or "").strip().casefold(), entity_resolution.last10_digits(e.get("phone") or ""))
+                  for e in mine}
+        if len(people) > 1:
+            # Never pick one of several people: the dropdown of everyone waiting is for a human to choose from.
+            note = "More than one person named '{}' is waiting in today's queue. Choose the right one from the list.".format(
+                name or "that name")
+        elif mine:
             appointment_id = mine[0]["id"]
         else:
-            note = "No one named '{}' is waiting in today's queue.".format(name)
+            note = "No one named '{}' is waiting in today's queue.".format(name or "that name")
     elif intent == "queue_call_next":
         nxt = clinical_adapter.next_to_call(conn, today, branch_id)
         if nxt:
@@ -137,7 +158,7 @@ def _resolve_queue_command(conn, intent, slots, clinical_adapter):
 
 
 def transcript_to_response(conn, text, clinical_adapter, ops_adapter, language_code="hi-IN",
-                           defer_intents=frozenset(), context=None):
+                           defer_intents=frozenset(), context=None, source="voice"):
     """Parse a transcript and either propose a write, answer a query, or (for
     intents named in `defer_intents`) hand back the raw parsed slots with no
     validation or database write at all. Raises PipelineError with a
@@ -146,24 +167,59 @@ def transcript_to_response(conn, text, clinical_adapter, ops_adapter, language_c
 
     `context` (a clinic.voice_context.VoiceContext, voice flow only) lets a
     follow-up lean on what was just discussed, and lets the assistant ask for
-    a missing patient / day / time instead of opening a half-empty card."""
+    a missing patient / day / time instead of opening a half-empty card.
+
+    With the tool-calling planner on (clinic/nlu/planner.py), the command goes to
+    it wherever the one-word label picker used to be asked; the precise rules
+    (a branch switch, closing a branch, a move, a patient count, a follow-up on
+    what is on screen) still come first and the planner is only consulted for a
+    closing command the rules read too little of. `source` is recorded in the
+    planner log."""
     mention = voice_branch.find(conn, text)
     if mention.branch is None and voice_branch.is_switch_command(text):
         mention = voice_branch.find(conn, text, tail=True)        # "change my branch to b"
-    if voice_branch.is_switch_command(text):
-        intent, slots = "set_my_branch", {"branch_id": mention.branch["id"] if mention.branch else None}
-    elif voice_closure.is_close_command(conn, text, mention):
-        intent, slots = "close_branch", voice_closure.parse(conn, text, mention.text, mention, today=date.today())
-    else:
-        try:
-            intent, slots = parse(mention.text, known_names=registered_names(conn), context=context)
-        except UnrecognizedCommand:
-            raise PipelineError("Could not classify this into a known command.")
-        if mention.branch:
-            slots["branch_id"] = mention.branch["id"]
-        elif mention.every:
-            slots["all_branches"] = True
-    if context is not None and intent not in ("set_my_branch", "close_branch"):
+    run = planner_module.start_run(conn, text, context, source)
+    final_intent = "unclear"
+    final_slots = None
+    try:
+        if voice_branch.is_switch_command(text):
+            intent, slots = "set_my_branch", {"branch_id": mention.branch["id"] if mention.branch else None}
+            if run is not None:
+                run.note_rule("branch")
+        elif voice_closure.is_close_command(conn, text, mention):
+            intent, slots = "close_branch", voice_closure.parse(conn, text, mention.text, mention, today=date.today())
+            if run is not None:
+                run.note_rule("closure")
+            if run is not None and voice_closure.needs_reading(conn, text, slots):
+                slots = _read_closing_command(conn, text, slots, run)
+        else:
+            try:
+                intent, slots = parse(mention.text, known_names=registered_names(conn), context=context, planner=run)
+            except UnrecognizedCommand:
+                saved = _unanswered_read(conn, text, run, language_code, source)
+                if saved is not None:
+                    return saved          # a question the app cannot answer yet: saved for a person, the user is told
+                raise PipelineError(NOT_CLASSIFIED)
+            if run is not None and run.rejected_query and (intent in defer_intents or intent in QUEUE_WRITE_INTENTS):
+                # The planner understood a READ it cannot run; the keyword rules then guessed a write card.
+                # A card nobody asked for is worse than "not yet": save the question instead.
+                saved = _unanswered_read(conn, text, run, language_code, source)
+                if saved is not None:
+                    return saved
+            if intent in ("close_branch", "set_my_branch", "clarify"):
+                pass          # the planner named the branch itself; a branch in the words is not a second answer
+            elif mention.branch:
+                slots["branch_id"] = mention.branch["id"]
+            elif mention.every:
+                slots["all_branches"] = True
+        final_intent, final_slots = intent, slots
+    finally:
+        if run is not None:
+            run.finish(final_intent, final_slots)
+            if context is not None:
+                context.turn_call = run.call_summary()
+                context.planner_log_id = run.log_id
+    if context is not None and intent not in ("set_my_branch", "close_branch", "clarify"):
         if mention.branch:
             context.remember_branch(mention.branch["id"])     # later commands stay at it
         elif mention.mine:
@@ -172,26 +228,153 @@ def transcript_to_response(conn, text, clinical_adapter, ops_adapter, language_c
                              defer_intents, context=context)
 
 
-def _appointment_options(clinical_adapter, conn, appointment_id, name=None):
-    """The cancel / reschedule card's dropdown: upcoming appointments whose
-    written or registered name sounds like the heard `name` (this covers
-    walk-ins with no patient record and names in the other script, and keeps
-    only the best-fitting person), plus the one picked from the on-screen list.
-    Returns (options, suggested_id); the id is only suggested when it is
+def _unanswered_hint(text, run):
+    """{'wanted': ..., 'spec': ...} when a command the parser could not place was plainly a request
+    for information the app cannot read yet, else None. Three ways in: (a) the planner called
+    `unsupported` and said what the user wanted; (b) it called `query` with something outside the
+    whitelist; (c) the command ended as "please rephrase" and reads like a question. Small talk and
+    commands that change something are never counted."""
+    if run is not None and run.tool == "unsupported" and run.wanted and not unanswered.opens_with_write_verb(text):
+        return {"wanted": run.wanted}
+    if run is not None and run.rejected_query:
+        return {"spec": run.rejected_query["spec"]}
+    if (run is None or run.route == "rephrase") and unanswered.looks_like_information_request(text):
+        return {}
+    return None
+
+
+def _unanswered_read(conn, text, run, language_code, source):
+    """Save an unanswerable read (clinic/unanswered.py) and return the fixed reply, or None when
+    the command is not one."""
+    hint = _unanswered_hint(text, run)
+    if hint is None:
+        return None
+    message = unanswered.reply(conn, text, "voice" if source == "voice" else "typed", language_code,
+                               wanted=hint.get("wanted"), rejected_spec=hint.get("spec"))
+    return Note(message)
+
+
+def _read_closing_command(conn, text, slots, run):
+    """A closing command the plain phrase rules read too little of (no first day, a
+    length such as "for the next one week", a second branch named as the place
+    to move everyone). The planner reads it; if it cannot, the deterministic
+    reading rules (clinic/voice_closure.py) do what they can. Either way the
+    result is only a plan on a review card."""
+    planned = run.ask()
+    if planned is not None and planned.intent == "close_branch":
+        merged = dict(planned.slots)
+        if slots.get("reason") and not merged.get("reason"):
+            merged["reason"] = slots["reason"]
+        return merged
+    run.note_route("rules")
+    return voice_closure.apply_reading_rules(conn, text, slots, today=date.today())
+
+
+def _generic_query(conn, slots, clinical_adapter, context, language_code):
+    """The planner's generic read (clinic/query_tool.py): a whitelisted entity,
+    filters, columns, sort and sums, never model-written SQL. Branch-aware for the
+    entities that belong to a branch (a named branch limits them; appointments also
+    default to My branch)."""
+    spec = {k: v for k, v in slots.items() if k not in ("branch_id", "all_branches")}
+    scoped = spec.get("entity") in query_tool.BRANCH_ENTITIES
+    branch_id, every, branch_name = _branch_scope(conn, slots) if scoped else (None, False, None)
+    now = _local_now()
+    try:
+        result = query_tool.run(conn, spec, branch_id=branch_id, today=now.date().isoformat(), now=now.strftime("%H:%M"))
+    except query_tool.QueryError:
+        raise PipelineError("I could not run that lookup. Please say it another way.")
+    spec = query_tool.validate_spec(spec)
+    citation = clinical_adapter.citation()
+    sentence = query_tool.describe(spec, result, None if spec["entity"] == "branches" else branch_name, today=now.date().isoformat())
+    caption = branch_name if spec["entity"] != "branches" else None
+    if result.truncated and (spec["aggregate"] == "list" or spec.get("group_by")):
+        caption = "{}Showing the first {} of {}".format("{} \u00b7 ".format(caption) if caption else "",
+                                                       len(result.rows), result.total) if not spec.get("group_by") \
+            else "{}Showing the first {} groups".format("{} \u00b7 ".format(caption) if caption else "", len(result.rows))
+    if context is not None and spec.get("date") and not spec.get("date_to"):
+        context.remember_date(spec["date"])
+    scalar = not spec.get("group_by") and spec["aggregate"] != "list"
+    data = None if scalar else result.rows
+    return ReadResult("query", data, citation, "{} Source: {}, {}.".format(sentence, citation.source, citation.as_of), caption)
+
+
+def _person_key(row):
+    """Who an appointment row is for, by identity and not by the name written on it: the registered patient's
+    id, else (a walk-in) the name with the phone written on the appointment."""
+    if row.get("patient_id") is not None:
+        return ("patient", row["patient_id"])
+    return ("walk-in", (row.get("who") or "").strip().casefold(), entity_resolution.last10_digits(row.get("patient_phone") or ""))
+
+
+def _phone_tail(phone):
+    digits = entity_resolution.last10_digits(phone or "")
+    return "\u2026{}".format(digits[-4:]) if digits else ""
+
+
+def _appointment_details(row):
+    """One appointment as a review-card option: id, date, time and length (the keys other callers rely on)
+    plus what the cancel / reschedule card shows as text, the same as the calendar's hover: who, end time, phone,
+    status, branch and doctor names. The notes and diagnosis are never carried."""
+    row = dict(row)
+    start, length = row["start_time"], row.get("duration_minutes") or scheduling.SLOT_MINUTES
+    return {
+        "id": row["id"], "appt_date": row["appt_date"], "start_time": start,
+        "duration_minutes": row.get("duration_minutes"),
+        "end_time": scheduling._from_minutes(scheduling._to_minutes(start) + length),
+        "patient_name": row.get("who") or row.get("patient_name"),
+        "patient_phone": row.get("patient_phone"), "status": row.get("status"),
+        "branch": row.get("branch"), "doctor": row.get("doctor"), "branch_id": row.get("branch_id"),
+    }
+
+
+def _add_tokens(clinical_adapter, conn, options):
+    """Give each option its queue token (A-T04), as the calendar's hover shows it. Best effort: a token that
+    cannot be worked out is simply not shown."""
+    tokens = {}
+    for key in {(o["appt_date"], o.get("branch_id")) for o in options}:
+        try:
+            for entry in clinical_adapter.queue_for_date(conn, key[0], key[1]):
+                tokens[entry["id"]] = entry["token_label"]
+        except Exception:
+            continue
+    for o in options:
+        if tokens.get(o["id"]):
+            o["token"] = tokens[o["id"]]
+
+
+def _appointment_options(clinical_adapter, conn, appointment_id, name=None, patient_id=None):
+    """The cancel / reschedule card's dropdown, plus the one picked from the on-screen list.
+    Returns (options, suggested_id).
+
+    Once the person is settled (`patient_id`: chosen, matched by their phone number, or the owner of the
+    appointment picked from the list) only THAT patient's upcoming appointments are listed, found by id,
+    never by name. Without an id the heard `name` is searched among the written / registered names (this
+    covers walk-ins with no patient record and names in the other script). When that search finds more
+    than one person (told apart by patient id or phone, not by the name text), every label carries the
+    last four digits of the phone and nothing is suggested. An appointment is only suggested when it is
     unambiguous (one person's nearest appointment)."""
-    options, people = [], set()
-    for row in clinical_adapter.upcoming_appointments_named(conn, name) if name else []:
-        options.append({"id": row["id"], "appt_date": row["appt_date"], "start_time": row["start_time"],
-                        "duration_minutes": row["duration_minutes"],
-                        "label": "{} {} - {}".format(row["appt_date"], row["start_time"], row["who"])})
-        people.add(row["who"].strip().casefold())
+    rows = []
+    if patient_id is not None:
+        rows = list(clinical_adapter.upcoming_appointments_by_patient_id(conn, patient_id))
+    elif name:
+        rows = list(clinical_adapter.upcoming_appointments_named(conn, name))
+    people = {_person_key(r) for r in rows}
+    several = len(people) > 1
+    options = []
+    for row in rows:
+        label = "{} {} - {}".format(row["appt_date"], row["start_time"], row["who"])
+        tail = _phone_tail(row.get("patient_phone")) if several else ""
+        if tail:
+            label += " ({})".format(tail)
+        options.append(dict(_appointment_details(row), label=label))
     if appointment_id and not any(str(o["id"]) == str(appointment_id) for o in options):
         row = clinical_adapter.appointment_option(conn, appointment_id)
         if row:
-            options.insert(0, dict(row))
+            options.insert(0, _appointment_details(row))
     options.sort(key=lambda o: (o["appt_date"], o["start_time"]))
+    _add_tokens(clinical_adapter, conn, options)
     suggested = appointment_id
-    if not suggested and options and len(people) <= 1:
+    if not suggested and options and not several:
         suggested = options[0]["id"]
     return options, suggested
 
@@ -250,18 +433,24 @@ def _close_branch(conn, slots, context, language_code):
         return AskResult("close_branch", slots, "branch", question_text("branch", language_code), options)
     try:
         plan = closures.plan(conn, branch_id, start, slots.get("end_date") or start, doctor_id=slots.get("doctor_id"),
-                             now=_local_now())
+                             now=_local_now(), preferred_branch_id=slots.get("destination_branch_id"))
     except closures.ClosureError as exc:
         raise PipelineError(str(exc))
     if context is not None:
         context.remember_date(start)
     counts = plan["counts"]
+    preferred = plan["scope"].get("preferred_branch")
     if language_code == "hi-IN":
         text = "{} mein {} mareez booked hain. Neeche dekhkar Apply dabayein; tab tak kuch nahi badlega.".format(
             plan["scope"]["branch"], counts["total"])
+        if preferred:
+            text += " Pehle {} mein jagah dekhi gayi hai.".format(preferred)
     else:
         text = "{} patient{} booked at {} in that window. Review the batch below; nothing changes until you press Apply.".format(
             counts["total"], "" if counts["total"] == 1 else "s", plan["scope"]["branch"])
+        if preferred:
+            text += " {} was tried first for everyone{}.".format(
+                preferred, "; " + plan["scope"]["preferred_note"].lower() if plan["scope"].get("preferred_note") else "")
     return ClosurePlanResult("close_branch", plan, slots.get("reason") or "", text)
 
 
@@ -313,6 +502,17 @@ def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, 
     """Everything after the transcript has become an (intent, slots) pair.
     `fresh` is False when `text` is only the answer to a question the assistant
     asked, so it is not re-read as a new command."""
+    if context is not None:
+        context.turn_command = (intent, dict(slots))          # for the next turn's "previous turn" line
+
+    if intent == "clarify":
+        # The planner needs one detail it was not given. The question is shown as the
+        # assistant's own; the next utterance is planned with it as the previous turn.
+        question = slots.get("question") or "Could you say that again?"
+        if context is None:
+            raise PipelineError(question)
+        return AskResult("clarify", {"question": question, "text": text}, "clarify", question, [])
+
     if intent == "open_calendar":
         mode = slots.get("mode")
         return NavigateResult(intent, "appointments", mode, compose_navigation(intent, mode, language_code))
@@ -330,7 +530,7 @@ def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, 
             slots = apply_context(intent, slots, text, context, fresh=fresh)
         except ValueError as exc:
             raise PipelineError(str(exc))
-        question = next_question(conn, intent, slots, clinical_adapter, context, language_code, skipped)
+        question = next_question(conn, intent, slots, clinical_adapter, context, language_code, skipped, heard=text)
         if question is not None:
             return question
 
@@ -343,10 +543,20 @@ def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, 
             "record_visit", "set_followup", "cancel_followup", "reschedule_followup",
             "book_appointment", "cancel_appointment", "reschedule_appointment",
         ):
-            patient = _best_effort_patient(clinical_adapter, conn, slots.get("patient_name"))
+            patient = _best_effort_patient(clinical_adapter, conn, slots.get("patient_name"), slots)
             if intent in APPOINTMENT_INTENTS:
+                # The person is "settled" when an id was carried, a phone number matched them, or the
+                # appointment picked from the list on screen says whose it is; the list then holds only
+                # their appointments. A name alone is searched among everyone it fits (walk-ins too).
+                anchor_id = slots.get("patient_id")
+                if anchor_id is None and patient and entity_resolution.full_number(slots.get("patient_phone")):
+                    anchor_id = patient.id
+                if anchor_id is None and patient is None and slots.get("appointment_id"):
+                    anchor_id = clinical_adapter.appointment_patient_id(conn, slots["appointment_id"])
+                    if anchor_id is not None:
+                        patient = _best_effort_patient(clinical_adapter, conn, None, dict(slots, patient_id=anchor_id))
                 options, suggested = _appointment_options(
-                    clinical_adapter, conn, slots.get("appointment_id"), slots.get("patient_name"))
+                    clinical_adapter, conn, slots.get("appointment_id"), slots.get("patient_name"), patient_id=anchor_id)
                 if patient:
                     resolved = {"patient_id": patient.id, "patient_label": patient.label}
                 resolved["appointments"] = options
@@ -368,10 +578,21 @@ def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, 
             staff = _best_effort_staff(ops_adapter, conn, slots.get("staff_name"))
             if staff:
                 resolved = {"staff_id": staff.id, "staff_label": staff.label}
+        if intent == "book_appointment":
+            # No usable phone yet (a patient who is not registered, none spoken, or a number on file that is
+            # not 10 digits): flagged on the card from the start, not only when Approve is refused.
+            phone_problem = booking_phone.problem(conn, dict(slots, patient_id=resolved.get("patient_id")))
+            if phone_problem:
+                resolved = dict(resolved, phone_problem=phone_problem)
+        if intent == "book_appointment" and patient and entity_resolution.full_number(slots.get("patient_phone")) \
+                and slots.get("patient_name") and not entity_resolution.name_match(slots["patient_name"], patient.label.rsplit(" (", 1)[0]):
+            # The phone number was matched first and exactly; say so when the name heard is someone else's.
+            resolved = dict(resolved, notes=["This phone number belongs to {}; you said {}.".format(
+                patient.label, slots["patient_name"])])
         if intent in ("book_appointment", "reschedule_appointment") and branches.multi_branch(conn):
             notes = _slot_notes(conn, intent, slots)
             if notes:
-                resolved = dict(resolved, notes=notes)
+                resolved = dict(resolved, notes=list(resolved.get("notes", [])) + list(notes))
         return ParsedResult(intent, slots, resolved)
 
     if intent == "register_patient":
@@ -388,7 +609,7 @@ def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, 
 
     if intent in ("record_visit", "set_followup"):
         name = slots.pop("patient_name", None)
-        patient = _resolve_patient_or_raise(clinical_adapter, conn, name)
+        patient = _resolve_patient_or_raise(clinical_adapter, conn, name, slots)
         if intent == "record_visit" and not slots.get("fee_rupees"):
             raise PipelineError("Could not hear a fee amount.")
         if intent == "set_followup" and not slots.get("days_from_now"):
@@ -403,7 +624,7 @@ def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, 
 
     if intent in ("cancel_followup", "reschedule_followup"):
         name = slots.pop("patient_name", None)
-        patient = _resolve_patient_or_raise(clinical_adapter, conn, name)
+        patient = _resolve_patient_or_raise(clinical_adapter, conn, name, slots)
         followup_id = clinical_adapter.nearest_pending_followup(conn, patient.id)
         if followup_id is None:
             raise PipelineError("No pending follow-up found for {}.".format(patient.label))
@@ -419,7 +640,7 @@ def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, 
 
     if intent == "book_appointment":
         name = slots.pop("patient_name", None)
-        patient = _best_effort_patient(clinical_adapter, conn, name)
+        patient = _best_effort_patient(clinical_adapter, conn, name, slots)
         if patient:
             slots["patient_id"] = patient.id
             patient_label = patient.label
@@ -427,13 +648,16 @@ def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, 
             patient_label = name or slots.get("patient_phone") or "unregistered caller"
         if not slots.get("appt_date") or not slots.get("start_time"):
             raise PipelineError("Could not hear a date and time for the appointment.")
+        phone_problem = booking_phone.problem(conn, slots)
+        if phone_problem:
+            raise PipelineError(phone_problem)
         pid = core.propose(conn, intent, slots, source_text=text)
         description = "appointment for {} on {} at {}".format(patient_label, slots["appt_date"], slots["start_time"])
         return WriteResult(pid, intent, description)
 
     if intent in ("cancel_appointment", "reschedule_appointment"):
         name = slots.pop("patient_name", None)
-        patient = _resolve_patient_or_raise(clinical_adapter, conn, name)
+        patient = _resolve_patient_or_raise(clinical_adapter, conn, name, slots)
         appointment = clinical_adapter.next_appointment_for_patient(conn, patient.id)
         if appointment is None:
             raise PipelineError("No upcoming appointment found for {}.".format(patient.label))
@@ -451,7 +675,7 @@ def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, 
 
     if intent == "patient_lookup":
         name = slots.pop("patient_name", None)
-        patient = _resolve_patient_or_raise(clinical_adapter, conn, name)
+        patient = _resolve_patient_or_raise(clinical_adapter, conn, name, slots)
         data = clinical_adapter.patient_lookup(conn, patient.id)
         if context is not None:
             context.remember_patient(patient.id, patient.label)
@@ -505,6 +729,9 @@ def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, 
         raise PipelineError(
             "I couldn't read the date. Please say it again, for example '7 October', 'kal' or 'Monday'."
         )
+
+    if intent == "query":
+        return _generic_query(conn, slots, clinical_adapter, context, language_code)
 
     if intent == "check_availability":
         appt_date = slots.get("appt_date") or date.today().isoformat()
@@ -573,7 +800,7 @@ def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, 
 
     if intent == "next_appointment":
         name = slots.pop("patient_name", None)
-        patient = _resolve_patient_or_raise(clinical_adapter, conn, name)
+        patient = _resolve_patient_or_raise(clinical_adapter, conn, name, slots)
         row = clinical_adapter.next_appointment_for_patient(conn, patient.id)
         data = dict(row) if row else None
         if data:

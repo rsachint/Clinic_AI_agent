@@ -272,8 +272,11 @@ class ConversationThroughTheWebhookTests(AgentRouteCase):
 
     def test_reschedule_and_cancel_hand_offs_are_proposals_too(self):
         pid = self.conn.execute("INSERT INTO patients (name, phone) VALUES ('Sunita Devi', '9876543210')").lastrowid
+        # The inbox card lists appointments from the REAL date on, while the conversation follows the test
+        # clock: use a day that is still ahead of both, so this does not expire when the real date passes TOMORROW.
+        ahead = max(TOMORROW, (datetime.now() + timedelta(days=1)).date().isoformat())
         aid = self.conn.execute("INSERT INTO appointments (patient_id, appt_date, start_time) VALUES (?, ?, '09:00')",
-                                (pid, TOMORROW)).lastrowid
+                                (pid, ahead)).lastrowid
         self.conn.commit()
         self.say("cancel my appointment")
         self.tap("confirm:yes", "Yes")

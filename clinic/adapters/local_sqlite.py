@@ -79,6 +79,12 @@ class LocalSQLiteAdapter:
     def upcoming_appointments_named(self, conn, name, branch_id=None):
         return queries.upcoming_appointments_named(conn, name, branch_id=branch_id)
 
+    def upcoming_appointments_by_patient_id(self, conn, patient_id, branch_id=None):
+        return queries.upcoming_appointments_by_patient_id(conn, patient_id, branch_id=branch_id)
+
+    def appointment_patient_id(self, conn, appointment_id):
+        return queries.appointment_patient_id(conn, appointment_id)
+
     def appointments_named(self, conn, name, start_date=None, end_date=None, branch_id=None):
         return queries.appointments_named(conn, name, start_date, end_date, branch_id=branch_id)
 
@@ -94,8 +100,8 @@ class LocalSQLiteAdapter:
     def scheduled_appointments(self, conn, start_date, end_date=None, branch_id=None):
         return queries.scheduled_appointments(conn, start_date, end_date, branch_id)
 
-    def resolve_patient(self, conn, query, top_n=3):
-        return entity_resolution.resolve_patient(conn, query, top_n)
+    def resolve_patient(self, conn, query, top_n=3, phone=None, patient_id=None):
+        return entity_resolution.resolve_patient(conn, query, top_n, phone=phone, patient_id=patient_id)
 
     def resolve_patient_by_phone(self, conn, wa_id):
         return entity_resolution.resolve_patient_by_phone(conn, wa_id)

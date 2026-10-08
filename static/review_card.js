@@ -82,11 +82,12 @@ var ReviewCard = (function () {
       { key: "start_time", label: "Start time (HH:MM)", type: "text" },
       { key: "notes", label: "Notes", type: "text" },
     ],
+    // `detail`: the settled appointment is shown as text (the calendar hover's details), not a dropdown.
     cancel_appointment: [
-      { key: "appointment_id", label: "Appointment", type: "appointment" },
+      { key: "appointment_id", label: "Appointment", type: "appointment", detail: true },
     ],
     reschedule_appointment: [
-      { key: "appointment_id", label: "Appointment", type: "appointment" },
+      { key: "appointment_id", label: "Appointment", type: "appointment", detail: true },
       { key: "branch_id", label: "Move to branch", type: "branch", keep: true },
       { key: "appt_date", label: "New date (YYYY-MM-DD)", type: "text" },
       { key: "start_time", label: "New start time (HH:MM)", type: "text" },
@@ -116,6 +117,51 @@ var ReviewCard = (function () {
     });
     (children || []).forEach(function (c) { node.appendChild(c); });
     return node;
+  }
+
+  // The Cancel / Reschedule card's appointment: read-only text with the same details as the calendar's hover
+  // (static/appt_details.js), not a dropdown. A hidden input carries the id (data-key), so gatherFields and a
+  // voice edit work as for any field. A selector appears only when a choice is really open: nothing is picked yet
+  // (several people or dates fit, or none was found), or the nearest of several was picked and another may be meant.
+  // Choosing one fills in its details below.
+  function buildAppointmentDetail(spec, slots, context, wrap) {
+    var appointments = (context && context.appointments) || [];
+    function find(id) {
+      var found = null;
+      appointments.forEach(function (a) { if (id !== "" && id != null && String(a.id) === String(id)) found = a; });
+      return found;
+    }
+    var picked = find(slots[spec.key]);
+    var carrier = el("input", { type: "hidden", "data-key": spec.key, value: picked ? picked.id : "" });
+    var box = el("div", { class: "appt-details" });
+
+    function render() {
+      while (box.firstChild) box.removeChild(box.firstChild);
+      var a = find(carrier.value);
+      box.hidden = !a;
+      if (!a) return;
+      window.ApptDetails.lines(a).forEach(function (line) {
+        box.appendChild(el("div", { class: "appt-line appt-" + line.kind, text: line.text }));
+      });
+    }
+
+    wrap.appendChild(carrier);
+    wrap.appendChild(box);
+    if (!picked || appointments.length > 1) {
+      var select = el("select", { class: "appt-choose", "aria-label": spec.label });
+      if (!picked) select.appendChild(el("option", { value: "", selected: "selected" }, [document.createTextNode("Select...")]));
+      appointments.forEach(function (a) {
+        var opt = el("option", { value: a.id }, [document.createTextNode(window.ApptDetails.optionLabel(a))]);
+        if (picked && String(picked.id) === String(a.id)) opt.setAttribute("selected", "selected");
+        select.appendChild(opt);
+      });
+      select.addEventListener("change", function () { carrier.value = select.value; render(); });
+      wrap.appendChild(select);
+      carrier._sync = function () { select.value = carrier.value; };
+    }
+    // A voice edit that sets the carrier's value redraws the text (and moves the selector if there is one).
+    carrier._refresh = function () { if (carrier._sync) carrier._sync(); render(); };
+    render();
   }
 
   function buildFieldInput(spec, slots, resolved, context) {
@@ -165,6 +211,8 @@ var ReviewCard = (function () {
         fuSelect.appendChild(opt);
       });
       wrap.appendChild(fuSelect);
+    } else if (spec.type === "appointment" && spec.detail && window.ApptDetails) {
+      buildAppointmentDetail(spec, slots, context, wrap);
     } else if (spec.type === "appointment") {
       // Mirrors the "followup" branch above: options come from this
       // specific patient's own upcoming appointments (context.appointments),
@@ -222,6 +270,38 @@ var ReviewCard = (function () {
     return slots;
   }
 
+  // A booking card: the phone field is "Phone (required)" while the booking has no registered patient with a
+  // valid number, and a message beside it (not only the banner after Approve) says what is wrong. The rule is
+  // static/booking_phone.js; `card._checkPhone(attempted)` re-reads the fields and returns the problem or null.
+  function wirePhone(card, fieldsWrap, data) {
+    var BP = window.BookingPhone;
+    var phoneInput = fieldsWrap.querySelector('[data-key="patient_phone"]');
+    var patientSel = fieldsWrap.querySelector('[data-key="patient_id"]');
+    if (!BP || !phoneInput) return;
+    var row = phoneInput.parentNode;
+    var label = row.querySelector("label");
+    var message = el("div", { class: "field-note", role: "alert", hidden: "hidden" });
+    row.appendChild(message);
+    var serverFlag = (data.resolved && data.resolved.phone_problem) || null;
+
+    function check(attempted) {
+      var slots = gatherFields(fieldsWrap, "book_appointment");
+      var problem = BP.problem(slots, PATIENTS);
+      var known = !slots.patient_id || PATIENTS.some(function (p) { return String(p.id) === String(slots.patient_id); });
+      if (!problem && !known && serverFlag) problem = serverFlag;     // the page does not know this patient: the server's word
+      if (label) label.textContent = (BP.required(slots, PATIENTS) || (!known && serverFlag)) ? "Phone (required)" : "Patient phone (if not registered)";
+      phoneInput.setAttribute("aria-invalid", problem && attempted ? "true" : "false");
+      message.textContent = problem || "";
+      message.hidden = !problem;
+      if (attempted) message.classList.add("field-error");
+      return problem;
+    }
+    phoneInput.addEventListener("input", function () { check(false); });
+    if (patientSel) patientSel.addEventListener("change", function () { check(false); });
+    card._checkPhone = check;
+    check(false);
+  }
+
   // opts: { approveUrl, transcript, language, context, notes (array of strings),
   // onApproved(result),
   // onRejected(), buildApprovePayload(slots) -> object to POST }
@@ -247,6 +327,7 @@ var ReviewCard = (function () {
       fieldsWrap.appendChild(buildFieldInput(spec, data.slots, data.resolved || {}, opts.context));
     });
     card.appendChild(fieldsWrap);
+    if (data.intent === "book_appointment") wirePhone(card, fieldsWrap, data);
 
     var actions = el("div", { class: "actions", style: "margin-top:14px;" });
     var approveBtn = el("button", { class: "btn-confirm", type: "button", text: "Approve" });
@@ -264,6 +345,12 @@ var ReviewCard = (function () {
     }
 
     approveBtn.addEventListener("click", function () {
+      // A new booking needs a phone number: say so beside the field and send nothing (the server checks too).
+      if (card._checkPhone && card._checkPhone(true)) {
+        var phoneField = card.querySelector('[data-key="patient_phone"]');
+        if (phoneField && phoneField.focus) phoneField.focus();
+        return;
+      }
       approveBtn.disabled = true;
       rejectBtn.disabled = true;
       var slots = gatherFields(card, data.intent);
@@ -322,6 +409,7 @@ var ReviewCard = (function () {
       var field = card.querySelector('[data-key="' + key + '"]');
       if (!field) return;
       field.value = changes[key] === null || changes[key] === undefined ? "" : changes[key];
+      if (field._refresh) field._refresh();
       var row = field.closest ? field.closest(".field-row") : null;
       if (row) {
         row.classList.remove("field-updated");
@@ -330,6 +418,7 @@ var ReviewCard = (function () {
       }
       applied.push(key);
     });
+    if (card._checkPhone) card._checkPhone(false);     // a spoken phone number fills the booking's required field
     return applied;
   }
 

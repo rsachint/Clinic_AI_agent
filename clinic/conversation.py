@@ -47,7 +47,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
-from clinic import branches, closures
+from clinic import branches, closures, followups
 from clinic import conv_templates as ct
 from clinic import notify, scheduling, whatsapp
 from clinic.entity_resolution import last10_digits, resolve_patient_by_phone
@@ -155,6 +155,8 @@ class Result:
 #   day:YYYY-MM-DD            slot:YYYY-MM-DDTHH:MM
 #   appt:<appointment id>     confirm:yes | confirm:no | confirm:change
 #   branch:<branch id>        closure:accept:<move id> | closure:change:<move id>
+#   followup:reschedule|visited|cancel|cancel_confirm|cancel_keep:<follow-up id>
+#                             (the buttons of a follow-up reminder, clinic/followup_notify.py)
 # ---------------------------------------------------------------------------
 
 _CHOICE = re.compile(
@@ -164,7 +166,8 @@ _CHOICE = re.compile(
     r"|(appt):(\d{1,9})"
     r"|(confirm):(yes|no|change)"
     r"|(branch):(\d{1,9})"
-    r"|(closure):((?:accept|change):\d{1,9}))$"
+    r"|(closure):((?:accept|change):\d{1,9})"
+    r"|(followup):((?:reschedule|visited|cancel|cancel_confirm|cancel_keep):\d{1,9}))$"
 )
 
 
@@ -190,6 +193,10 @@ def confirm_choice(answer):
 
 def branch_choice(branch_id):
     return "branch:{}".format(branch_id)
+
+
+def followup_choice(action, followup_id):
+    return "followup:{}:{}".format(action, followup_id)
 
 
 def parse_choice(choice_id):
@@ -303,6 +310,26 @@ _BOOK = _compile([
     "dikhana", "दिखाना", "checkup", "check-up", "check up", "consult*", "see the doctor", "see doctor",
     "visit",
 ])
+
+# "STOP" / "START" for the follow-up reminders (clinic/followups.py): whole-message
+# matches only, so a sentence that merely contains the word is never an opt-out.
+_STOP_PHRASES = frozenset((
+    "stop", "stop reminders", "stop reminder", "stop messages", "stop all", "stop all messages", "unsubscribe",
+    "opt out", "optout", "no reminders", "reminder band karo", "reminders band karo", "रिमाइंडर बंद करें",
+    "रिमाइंडर बंद करो",
+))
+_START_PHRASES = frozenset(("start", "start reminders", "resume reminders", "reminders start karo"))
+
+
+def reminder_keyword(text):
+    """'stop' / 'start' when the whole message is an opt-out / opt-in phrase, else None."""
+    phrase = " ".join(_tokens(normalize(text)))
+    if phrase in _STOP_PHRASES:
+        return "stop"
+    if phrase in _START_PHRASES:
+        return "start"
+    return None
+
 
 _GREETING_CORE = frozenset((
     "hi", "hii", "hiii", "hello", "hellow", "helo", "hey", "heyy", "hlo", "namaste", "namaskar", "namaskaar",
@@ -722,9 +749,10 @@ def free_times(conn, appt_date, now, for_wa_id=None, branch_id=None):
 # ---------------------------------------------------------------------------
 
 class _Turn:
-    def __init__(self, conn, wa_id, text, choice, now, msg_id, picker, auto=None):
+    def __init__(self, conn, wa_id, text, choice, now, msg_id, picker, auto=None, followup=None):
         self.conn = conn
         self.auto = auto
+        self.followup = followup
         self.wa_id = wa_id
         self.text = text or ""
         self.norm = normalize(self.text)
@@ -867,6 +895,19 @@ class _Turn:
             self.result.emergency = True
             self.say("emergency")
             return self.finish()
+
+        word = reminder_keyword(self.text) if typed else None
+        if word == "stop" and s["step"] != "confirm":
+            # At a yes/no question "stop" still means no; anywhere else it is the opt-out.
+            followups.set_opted_out(self.conn, self.wa_id, True)
+            if s["mode"] == "agent":
+                self.say("optout_done")
+                return self.finish()
+        elif word == "start" and followups.is_opted_out(self.conn, self.wa_id):
+            followups.set_opted_out(self.conn, self.wa_id, False)
+            if s["mode"] == "agent":
+                self.say("optin_done")
+                return self.finish()
 
         if s["mode"] == "human":
             self.result.silent = True
@@ -1051,6 +1092,8 @@ class _Turn:
         kind, value = self.choice
         if kind == "closure":
             return self.on_closure_choice(value)
+        if kind == "followup":
+            return self.on_followup_choice(value)
         if kind == "menu":
             if value == "status":
                 return self.answer_status()
@@ -1113,6 +1156,61 @@ class _Turn:
         self.note_activity("closure_changed", "Chose to pick another slot", code="closure_changed", appointment_id=appt["id"])
         self.say("closure_choose_another", date=date_text, time=time_text)
         self.advance()
+
+    # -- a follow-up reminder: Reschedule / Already visited / Cancel ---------------------
+    def on_followup_choice(self, value):
+        """The three buttons of a follow-up reminder. They carry the follow-up's own
+        id, so they work however long after the reminder they are tapped (no chat
+        session needed); one that is not this sender's, or whose follow-up is done /
+        cancelled / past, gets the polite "no longer active" reply."""
+        action, raw_id = value.split(":")
+        followup_id = int(raw_id)
+        fu = followups.patient_view(self.conn, followup_id, self.wa_id, self.now)
+        if fu is None:
+            self.reset_flow()
+            return self.say("followup_gone", buttons=self.menu_buttons())
+        date_text, time_text = self.fdate(fu["due_date"]), self.ftime(fu["due_time"])
+        appt = self.find_own(fu["appointment_id"])
+        branch_id = branches.resolve(self.conn, fu["branch_id"])
+        if action == "reschedule":
+            if appt is None:
+                self.reset_flow()
+                return self.say("followup_gone", buttons=self.menu_buttons())
+            self.reset_flow()
+            self.s["goal"] = "reschedule"
+            return self.select_appointment(appt)      # the normal slot-picking chat, at the same branch
+        if action == "cancel":
+            # Ask once more. The session is set up as an ordinary cancel confirmation, so a
+            # typed "yes" / "no" instead of a tap goes through the normal cancel flow.
+            self.reset_flow()
+            self.s.update(goal="cancel", step="confirm")
+            self.slots.update(appointment_id=fu["appointment_id"], old_date=fu["due_date"], old_time=fu["due_time"],
+                              old_branch_id=branch_id, followup_id=followup_id)
+            return self.say(
+                "followup_cancel_ask", date=date_text, time=time_text,
+                tail=self.where_text(branch_id, fu["due_date"], fu["due_time"]),
+                buttons=[(followup_choice("cancel_confirm", followup_id), self.btn("followup_cancel_yes")),
+                         (followup_choice("cancel_keep", followup_id), self.btn("followup_cancel_no"))])
+        if action == "cancel_keep":
+            self.reset_flow(step="done")
+            return self.say("followup_kept", date=date_text, time=time_text)
+        # "visited" and "cancel_confirm": close the follow-up and free its slot
+        runner = self.followup or followups.patient_action
+        outcome = runner(self.conn, action="visited" if action == "visited" else "cancel", followup_id=followup_id,
+                         wa_id=self.wa_id, now=self.now, msg_id=self.msg_id)
+        if not outcome.get("ok"):
+            self.reset_flow()
+            return self.say("followup_gone", buttons=self.menu_buttons())
+        self.slots["appointment_id"] = fu["appointment_id"]      # so the staff-visible activity row is linked to it
+        if action == "visited":
+            self.note_activity("followup_visited", "Said they had already visited the follow-up on {} {}".format(
+                fu["due_date"], fu["due_time"]), code="followup_visited", followup_id=followup_id)
+            self.reset_flow(step="done")
+            return self.say("followup_visited")
+        self.note_activity("followup_cancelled", "Cancelled the follow-up on {} {}".format(fu["due_date"], fu["due_time"]),
+                           code="followup_cancelled", followup_id=followup_id)
+        self.reset_flow(step="done")
+        self.say("followup_cancelled", date=date_text, time=time_text)
 
     # -- goals: entering ---------------------------------------------------------
     def start_goal(self, goal, trigger_text):
@@ -1709,7 +1807,8 @@ class _Turn:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def handle_inbound(conn, wa_id, text, choice_id=None, now=None, msg_id=None, intent_picker=None, auto=None):
+def handle_inbound(conn, wa_id, text, choice_id=None, now=None, msg_id=None, intent_picker=None, auto=None,
+                   followup=None):
     """Process one inbound patient message and return a Result.
 
     `now` is the clinic's local wall clock (naive datetime, injectable).
@@ -1719,8 +1818,12 @@ def handle_inbound(conn, wa_id, text, choice_id=None, now=None, msg_id=None, int
     inject a fake in tests. `auto(conn, *, intent, slots, wa_id, patient_id,
     patient_name, msg_id, now, language) -> AutoOutcome` is the automatic-commit hook
     (clinic/auto_actions.py via app.py); None means every finished request
-    goes to staff. Writes only wa_sessions and slot_holds itself."""
+    goes to staff. `followup(conn, *, action, followup_id, wa_id, now, msg_id) -> {ok}`
+    runs a follow-up reminder's "Already visited" / confirmed "Cancel" button
+    (clinic/followups.py via app.py; None = followups.patient_action with the
+    default handlers). Writes only wa_sessions and slot_holds itself, besides what
+    those two callables do and the STOP / START opt-out."""
     now = (now or datetime.now()).replace(microsecond=0)
     choice = parse_choice(choice_id)
-    turn = _Turn(conn, wa_id, text, choice, now, msg_id, intent_picker, auto)
+    turn = _Turn(conn, wa_id, text, choice, now, msg_id, intent_picker, auto, followup)
     return turn.run()

@@ -29,7 +29,7 @@ import os
 
 import httpx
 
-from clinic.nlu.llm_slots import KEEP_ALIVE, MODEL, OLLAMA_URL, ollama_options
+from clinic.nlu.llm_slots import KEEP_ALIVE, MODEL, OLLAMA_URL, local_model_allowed, ollama_options
 
 _logger = logging.getLogger(__name__)
 
@@ -131,7 +131,7 @@ def pick_intent(text, model=MODEL, timeout=15, hint=None):
     never a crash. Every decision (including failures) is logged at INFO
     level so this stage is inspectable/auditable, consistent with this
     codebase's audit-trail instincts elsewhere (proposals/audit_log)."""
-    if not llm_enabled():
+    if not llm_enabled() or not local_model_allowed():
         return None
     try:
         response = httpx.post(
@@ -143,6 +143,7 @@ def pick_intent(text, model=MODEL, timeout=15, hint=None):
                     {"role": "user", "content": "{}\nCommand: {}".format(hint, text) if hint else text},
                 ],
                 "stream": False,
+                "think": False,
                 "options": ollama_options(num_predict=16),
                 "keep_alive": KEEP_ALIVE,
             },
@@ -220,6 +221,7 @@ def pick_patient_intent(text, model=MODEL, timeout=15):
                     "required": ["intent"],
                 },
                 "stream": False,
+                "think": False,
                 "options": ollama_options(num_predict=24),
                 "keep_alive": KEEP_ALIVE,
             },

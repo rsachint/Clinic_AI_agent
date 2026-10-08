@@ -175,6 +175,23 @@ def parse_webhook_payload(payload):
             "timestamp": timestamp,
             "choice_id": str(reply["id"]),
         }
+    if msg_type == "button":
+        # A tap on a quick-reply button of a TEMPLATE message (the free-form
+        # reply buttons arrive as "interactive" above). The payload is the
+        # choice id we put on the button when we sent the template.
+        button = message.get("button") or {}
+        payload = button.get("payload")
+        if not payload:
+            return None
+        return {
+            "wa_message_id": wa_message_id,
+            "wa_id": wa_id,
+            "message_type": "text",
+            "text": button.get("text") or "",
+            "media_id": None,
+            "timestamp": timestamp,
+            "choice_id": str(payload),
+        }
     return None  # other message types (image, location, sticker, ...) not handled yet
 
 
@@ -313,6 +330,51 @@ def build_interactive_body(to, text, spec):
     raise ValueError("unknown interactive type: {!r}".format(kind))
 
 
+# --- Template messages (the only thing allowed outside the 24-hour window) ----
+# Cloud API: {"type": "template", "template": {name, language, components}}.
+# `spec` is the JSON stored in notifications.template_json:
+#   {"name": "followup_reminder_2d_en", "language": "en",
+#    "params": ["Sunita", "Dr. Mehta", ...],            # body {{1}}..{{n}}, in order
+#    "buttons": ["followup:reschedule:12", ...]}        # quick-reply payloads, in order
+# Like the builders above this is a PURE function (unit-tested for shape); only
+# send_template() touches the network.
+TEMPLATE_PARAM_MAX = 1024
+BUTTON_PAYLOAD_MAX = 128
+_PARAM_SPACES = re.compile(r"\s+")
+
+
+def clean_template_param(value):
+    """A body variable as Meta accepts it: one line, no tabs, no runs of spaces."""
+    text = _PARAM_SPACES.sub(" ", str(value if value is not None else "")).strip()
+    if not text:
+        raise ValueError("template parameters cannot be empty")
+    if len(text) > TEMPLATE_PARAM_MAX:
+        raise ValueError("template parameter is {} chars (max {})".format(len(text), TEMPLATE_PARAM_MAX))
+    return text
+
+
+def build_template_body(to, spec):
+    name, language = (spec or {}).get("name"), (spec or {}).get("language")
+    if not name or not language:
+        raise ValueError("a template needs a name and a language code")
+    components = []
+    params = [clean_template_param(p) for p in (spec.get("params") or [])]
+    if params:
+        components.append({"type": "body", "parameters": [{"type": "text", "text": p} for p in params]})
+    for index, payload in enumerate(spec.get("buttons") or []):
+        if not payload or len(str(payload)) > BUTTON_PAYLOAD_MAX:
+            raise ValueError("button payload must be 1-{} chars".format(BUTTON_PAYLOAD_MAX))
+        components.append({"type": "button", "sub_type": "quick_reply", "index": str(index),
+                           "parameters": [{"type": "payload", "payload": str(payload)}]})
+    return {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to,
+        "type": "template",
+        "template": {"name": name, "language": {"code": language}, "components": components},
+    }
+
+
 def _post_message(body):
     token = os.environ["WHATSAPP_ACCESS_TOKEN"]
     phone_number_id = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
@@ -334,3 +396,9 @@ def send_interactive(to, text, spec):
     """Reply buttons / a list message. The body is validated (and so can raise
     ValueError) BEFORE any credential is read or any request is made."""
     return _post_message(build_interactive_body(to, text, spec))
+
+
+def send_template(to, spec):
+    """A Meta-approved template message. The body is validated (and so can
+    raise ValueError) BEFORE any credential is read or any request is made."""
+    return _post_message(build_template_body(to, spec))

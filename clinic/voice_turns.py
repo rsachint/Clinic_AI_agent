@@ -13,12 +13,17 @@ results are only read answers, review cards for a human to approve, questions,
 and edits to a card that is still waiting for that approval.
 """
 
+import re
 import uuid
+from datetime import date
 
 from clinic import branches, voice_branch
+from clinic.nlu import tools
 from clinic.nlu.classify import classify
-from clinic.nlu.llm_slots import extract_name
-from clinic.pipeline import ParsedResult, PipelineError, respond_to_intent, transcript_to_response
+from clinic.nlu.llm_slots import extract_name, staff_command
+from clinic.pipeline import (ClosurePlanResult, NOT_CLASSIFIED, NavigateResult, ParsedResult, PipelineError, ReadResult,
+                             SwitchBranchResult, respond_to_intent, transcript_to_response)
+from clinic.unanswered import reply_language
 from clinic.voice_context import (
     AskResult, CardUpdate, Note, PATIENT_INTENTS, answer_time, ambiguous_patients, describe_edits,
     extract_card_edits, is_never_mind, is_skip, looks_like_edit, pick_option, question_text,
@@ -30,14 +35,66 @@ _MAX_TRIES = 2  # re-asks of one question before the assistant lets it go
 _MAX_SHORT_ANSWER_WORDS = 4
 
 
+# What to say when a bare answer ("8th of October") arrives but the question it answers is gone. Fixed text, three
+# languages like the other voice replies. "timed out": we know a question was open and the 10-minute memory dropped it.
+# "no question": nothing is open and the words look like an answer, not a command.
+FORGOTTEN_REPLIES = {
+    "timed out": {
+        "en": "I stopped waiting for your answer after 10 minutes. Please say the whole command again.",
+        "hi": "मैं 10 मिनट तक आपके जवाब का इंतज़ार करके रुक गया था। कृपया पूरा कमांड फिर से बोलिए।",
+        "hinglish": "Main 10 minute tak aapke jawab ka intezaar karke ruk gaya tha. Kripya poora command phir se bolein.",
+    },
+    "no question": {
+        "en": "I don't have an earlier question to match that to. Please say the whole command again, for example \"Book Amit tomorrow at 4 PM\".",
+        "hi": "इस जवाब के लिए मेरे पास कोई पिछला सवाल नहीं है। कृपया पूरा कमांड फिर से बोलिए, जैसे \"अमित को कल शाम 4 बजे बुक करो\"।",
+        "hinglish": "Is jawab ke liye mere paas koi pichla sawaal nahi hai. Kripya poora command phir se bolein, jaise \"Amit ko kal 4 baje book karo\".",
+    },
+}
+
+
+_FILLER_WORDS = frozenset(("on", "at", "of", "the", "for", "in", "a", "m", "am", "pm", "p", "o", "clock", "please", "to", "by"))
+_MAX_FRAGMENT_WORDS = 3
+
+
+def _is_bare_day_or_time(text):
+    """A short fragment that is only a day or a time ("8th of October", "at 4 pm", "next Monday at 5"), not a
+    sentence that happens to contain a day word ("the weather is nice today")."""
+    if not (datetime_extract.extract_appt_date(text, date.today()) or voice_context.spoken_time(text)):
+        return False
+    words = [w for w in re.findall(r"[\w\u0900-\u097F]+", text.lower()) if w not in _FILLER_WORDS]
+    return len(words) <= _MAX_FRAGMENT_WORDS
+
+
+def _forgotten_reply(ctx, text, language):
+    """The clearer message for an unclassifiable utterance that is really the answer to a question the
+    assistant no longer has, or None when it is just an unknown command (the usual message then stands)."""
+    if ctx.lost_question:
+        kind = "timed out"
+    elif _is_bare_day_or_time(text):
+        kind = "no question"          # only a day or a time was said: that answers something, it is not a command
+    else:
+        return None
+    return FORGOTTEN_REPLIES[kind][reply_language(text, language)]
+
+
 def handle_turn(ctx, conn, text, clinical_adapter, ops_adapter, language="hi-IN", defer_intents=frozenset()):
     """Returns a pipeline result (ReadResult, ParsedResult, NavigateResult ...)
     or one of voice_context.AskResult / CardUpdate / Note. Raises PipelineError
     with a human-readable reason when it cannot proceed."""
     ctx.expire_if_idle()
     ctx.touch()
-    result = _route(ctx, conn, text, clinical_adapter, ops_adapter, language, defer_intents)
+    ctx.turn_call = ctx.turn_command = ctx.planner_log_id = None
+    try:
+        result = _route(ctx, conn, text, clinical_adapter, ops_adapter, language, defer_intents)
+    except PipelineError as exc:
+        reply = _forgotten_reply(ctx, text, language) if str(exc) == NOT_CLASSIFIED else None
+        if reply is not None:
+            raise PipelineError(reply) from exc
+        raise
+    finally:
+        ctx.lost_question = False         # only the first turn after a timeout may say so
     _remember(ctx, result)
+    _remember_turn(ctx, text, result)
     return result
 
 
@@ -49,6 +106,7 @@ def handle_pick(ctx, conn, index, clinical_adapter, ops_adapter, language="hi-IN
     if not pending or not 0 <= index < len(pending["options"]):
         return None
     ctx.touch()
+    ctx.turn_call = ctx.turn_command = ctx.planner_log_id = None
     option = pending["options"][index]
     ctx.pending = None
     slots = dict(pending["slots"])
@@ -56,9 +114,12 @@ def handle_pick(ctx, conn, index, clinical_adapter, ops_adapter, language="hi-IN
         slots["branch_id"] = option["branch_id"]
     else:
         slots["patient_name"] = option["patient_name"]
+        if option.get("patient_id") is not None:
+            slots["patient_id"] = option["patient_id"]     # which of two same-named patients was tapped
     result = _continue(ctx, conn, pending["intent"], slots, option["label"], clinical_adapter, ops_adapter,
                        language, defer_intents, pending["skipped"])
     _remember(ctx, result)
+    _remember_turn(ctx, option["label"], result)
     return option["label"], result
 
 
@@ -86,8 +147,11 @@ def _answer_pending(ctx, conn, text, clinical_adapter, ops_adapter, language, de
     pending = ctx.pending
     intent, kind = pending["intent"], pending["kind"]
     # A sentence that clearly is a different command (the keyword rules
-    # recognise it) is never swallowed as an "answer".
-    if classify(text) is not None:
+    # recognise it) is never swallowed as an "answer". The one exception: a
+    # phone number said as "my phone number is ..." reads like a lookup to the
+    # keyword rules, but with a whole number in it, it is the answer.
+    rules = classify(text)
+    if rules is not None and not (kind == "phone" and rules == "patient_lookup" and voice_context.spoken_phone(text)):
         return None
 
     slots = dict(pending["slots"])
@@ -103,6 +167,7 @@ def _answer_pending(ctx, conn, text, clinical_adapter, ops_adapter, language, de
         name = _heard_name(text)
         if not name:
             return _ask_again(ctx, pending, language)
+        slots.pop("patient_id", None)          # a new name answers "which patient?": an older id must not outvote it
         if intent in voice_context.APPOINTMENT_INTENTS and clinical_adapter.upcoming_appointments_named(conn, name):
             # Cancel / reschedule are about an existing booking: the name as
             # heard goes to the appointment search (it finds registered patients
@@ -112,19 +177,25 @@ def _answer_pending(ctx, conn, text, clinical_adapter, ops_adapter, language, de
             ctx.pending = None
             return _continue(ctx, conn, intent, slots, text, clinical_adapter, ops_adapter, language,
                              defer_intents, skipped)
-        candidates = clinical_adapter.resolve_patient(conn, name, 4)
+        candidates = clinical_adapter.resolve_patient(conn, name, 4, phone=slots.get("patient_phone"))
         close = ambiguous_patients(candidates)
         if close:
             options = [{"label": c.label, "patient_name": voice_context._display_name(c.label), "patient_id": c.id}
                        for c in close]
             ctx.ask(intent, slots, "choose_patient", options, skipped)
             return AskResult(intent, slots, "choose_patient", question_text("choose_patient", language), options)
-        if candidates and candidates[0].score >= 0.6:
+        if len(candidates) == 1:
             slots["patient_name"] = voice_context._display_name(candidates[0].label)
+            slots["patient_id"] = candidates[0].id          # resolved once: carried from here on
         elif intent == "book_appointment":
             slots["patient_name"] = name  # a new, unregistered patient
         else:
             return _ask_again(ctx, pending, language, "I couldn't find {}. ".format(name))
+    elif kind == "phone":
+        number = voice_context.spoken_phone(text)
+        if not number:
+            return _ask_again(ctx, pending, language, heard=text)
+        slots["patient_phone"] = number
     elif kind == "branch":
         named = voice_branch.find(conn, text, bare=True).branch
         if named is None:
@@ -134,7 +205,11 @@ def _answer_pending(ctx, conn, text, clinical_adapter, ops_adapter, language, de
         index = pick_option(text, pending["options"])
         if index is None:
             return _ask_again(ctx, pending, language)
-        slots["patient_name"] = pending["options"][index]["patient_name"]
+        chosen = pending["options"][index]
+        slots["patient_name"] = chosen["patient_name"]
+        if chosen.get("patient_id") is not None:
+            # Two patients can have the same name: remember WHICH one was chosen, not just the name.
+            slots["patient_id"] = chosen["patient_id"]
     elif kind == "date":
         found = datetime_extract.extract_appt_date(text)
         if not found:
@@ -167,14 +242,14 @@ def _continue(ctx, conn, intent, slots, text, clinical_adapter, ops_adapter, lan
     return result
 
 
-def _ask_again(ctx, pending, language, prefix=""):
+def _ask_again(ctx, pending, language, prefix="", heard=None):
     tries = pending["tries"] + 1
     if tries >= _MAX_TRIES:
         ctx.pending = None
         raise PipelineError("{}I couldn't get that, so I stopped asking. Say the whole command again.".format(prefix))
     ctx.ask(pending["intent"], pending["slots"], pending["kind"], pending["options"], pending["skipped"], tries)
     return AskResult(pending["intent"], pending["slots"], pending["kind"],
-                     prefix + question_text(pending["kind"], language), pending["options"])
+                     prefix + question_text(pending["kind"], language, heard), pending["options"])
 
 
 def _heard_name(text):
@@ -185,7 +260,8 @@ def _heard_name(text):
     if cleaned and len(cleaned.split()) <= _MAX_SHORT_ANSWER_WORDS and not any(ch.isdigit() for ch in cleaned):
         return cleaned
     try:
-        return extract_name(text)
+        with staff_command():            # with the hosted planner selected, no local model for this either
+            return extract_name(text)
     except Exception:
         return None
 
@@ -206,12 +282,48 @@ def _try_card_edit(ctx, conn, text):
         changes["branch_id"] = branch["id"]
     if not changes:
         return None
+    dropped = voice_context.drop_stale_identity(conn, card["slots"], changes)
+    if dropped is not None and ctx.patient and str(ctx.patient["id"]) == str(dropped):
+        ctx.patient = None          # "him" must not mean the person the card was about before the edit
     card["slots"].update(changes)
     shown = dict(changes, **({"branch_id": branch["name"]} if branch else {}))
     return CardUpdate(card["card_id"], card["intent"], changes, describe_edits(shown))
 
 
 # -- keeping the context current ------------------------------------------
+
+_SOURCE_TAIL = re.compile(r"\s*Source:.*$")
+
+
+def _result_summary(result):
+    """What came back, in a few words, for the previous-turn line the planner reads."""
+    if isinstance(result, ReadResult):
+        return _SOURCE_TAIL.sub("", result.answer_text or "").strip() or "an answer was shown"
+    if isinstance(result, AskResult):
+        return "asked the user: {}".format(result.question)
+    if isinstance(result, ParsedResult):
+        return "showed a review card for {} (nothing saved until approved)".format(result.intent)
+    if isinstance(result, (ClosurePlanResult, NavigateResult, SwitchBranchResult)):
+        return _SOURCE_TAIL.sub("", result.answer_text or "").strip()
+    if isinstance(result, CardUpdate):
+        return "updated the open card: {}".format(result.summary)
+    return None
+
+
+def _remember_turn(ctx, text, result):
+    """Keep this turn as one line -- what was said, the command it became, what
+    came back -- so a short follow-up can be read in its light. The call is the
+    planner's own when it made one; otherwise it is derived from the intent the
+    rules chose, in the same notation."""
+    summary = _result_summary(result)
+    if summary is None:
+        return
+    call = ctx.turn_call
+    if not call and ctx.turn_command:
+        intent, slots = ctx.turn_command
+        call = tools.describe_intent(intent, slots, date.today().isoformat())
+    if call:
+        ctx.remember_turn(text, call, summary)
 
 
 def _remember(ctx, result):

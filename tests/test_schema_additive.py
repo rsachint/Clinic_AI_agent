@@ -109,6 +109,47 @@ class AdditiveSchemaTests(unittest.TestCase):
             "rate_window_start", "updated_at", "expires_at"})
         self.assertTrue({"wa_id", "appt_date", "start_time", "expires_at"} <= columns(conn, "slot_holds"))
 
+    def test_planner_log_gains_the_sarvam_usage_columns_in_place(self):
+        # planner_log exactly as it was before the hosted planner recorded its backend, tokens and cost.
+        old_log = """
+        CREATE TABLE planner_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL DEFAULT (datetime('now')),
+            source TEXT NOT NULL DEFAULT 'voice' CHECK (source IN ('voice', 'wa_staff')),
+            transcript TEXT NOT NULL,
+            previous_turn TEXT,
+            planner_tool TEXT,
+            planner_args_json TEXT,
+            route_taken TEXT NOT NULL CHECK (route_taken IN ('rules', 'planner', 'label_fallback', 'rephrase')),
+            final_intent TEXT,
+            latency_ms INTEGER,
+            override_notes TEXT,
+            outcome TEXT CHECK (outcome IS NULL OR outcome IN ('approved', 'rejected', 'edited'))
+        );"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "old.db")
+            old = sqlite3.connect(path)
+            old.executescript(old_log)
+            old.execute("INSERT INTO planner_log (transcript, route_taken, final_intent, latency_ms) VALUES ('book Amit', 'planner', 'book_appointment', 900)")
+            old.commit()
+            old.close()
+            conn = db.connect(path)
+            conn2 = db.connect(path)    # idempotent
+            self.assertTrue({"backend", "tokens_in", "tokens_out", "cost_paise", "route_detail"} <= columns(conn, "planner_log"))
+            row = conn.execute("SELECT * FROM planner_log").fetchone()
+            self.assertEqual((row["transcript"], row["route_taken"], row["latency_ms"]), ("book Amit", "planner", 900))
+            self.assertEqual((row["backend"], row["tokens_in"], row["tokens_out"], row["cost_paise"]), (None, None, None, None))
+            self.assertIsNone(row["route_detail"])
+            sql = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'planner_log'").fetchone()[0]
+            self.assertIn("'rules', 'planner', 'label_fallback', 'rephrase'", sql)        # the route CHECK is untouched
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("INSERT INTO planner_log (transcript, route_taken) VALUES ('x', 'sarvam')")
+            conn.execute("INSERT INTO planner_log (transcript, route_taken, backend, tokens_in, tokens_out, cost_paise) "
+                         "VALUES ('y', 'rules', 'sarvam', 3700, 40, 11)")
+            conn.execute("INSERT INTO planner_log (transcript, route_taken, route_detail) VALUES ('z', 'rules', 'rule:move')")
+            conn.close()
+            conn2.close()
+
     def test_session_table_constraints(self):
         conn = db.connect(":memory:")
         with self.assertRaises(sqlite3.IntegrityError):

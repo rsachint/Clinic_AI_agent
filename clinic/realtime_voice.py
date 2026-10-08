@@ -43,7 +43,8 @@ from sarvamai.types.realtime_transcript_partial import RealtimeTranscriptPartial
 from sarvamai.types.realtime_vad_speech_end import RealtimeVadSpeechEnd
 from sarvamai.types.realtime_vad_speech_start import RealtimeVadSpeechStart
 
-from clinic import branches
+from clinic import branches, planner_log
+from clinic.nlu import planner
 from clinic.pipeline import (ClosurePlanResult, NavigateResult, ParsedResult, PipelineError, ReadResult,
                              SwitchBranchResult, WriteResult)
 from clinic.voice_context import AskResult, CardUpdate, Note, VoiceContext
@@ -160,6 +161,7 @@ class VoiceSession:
         # (corrected or not) goes through the pipeline.
         self._review = review_transcripts
         self._held = {}  # review id -> transcript text, in the order heard
+        self._card_logs = {}  # review card id -> planner_log row, to record how the card ended
 
     # -- listen lifecycle (called from the Socket.IO handlers) -----------
 
@@ -379,10 +381,12 @@ class VoiceSession:
         conn = self._get_conn()
         with self._turn_lock:
             try:
-                result = handle_turn(
-                    self.context, conn, text, self._clinical_adapter, self._ops_adapter,
-                    self._language_hint, defer_intents=self._deferred_intents,
-                )
+                # The planner can take several seconds: tell the page it is thinking.
+                with planner.on_thinking(lambda: self._emit("thinking", {"transcript": text, "stage": "planner"})):
+                    result = handle_turn(
+                        self.context, conn, text, self._clinical_adapter, self._ops_adapter,
+                        self._language_hint, defer_intents=self._deferred_intents,
+                    )
             except PipelineError as e:
                 self._emit("pipeline_error", {"transcript": text, "error": str(e)})
                 self._emit_context()
@@ -397,11 +401,16 @@ class VoiceSession:
 
     # -- page -> server: things the person did with the mouse -------------
 
-    def card_closed(self, card_id):
-        """A review card was approved or rejected: it can no longer be edited by voice."""
+    def card_closed(self, card_id, outcome=None):
+        """A review card was approved or rejected: it can no longer be edited by voice.
+        `outcome` ("approved" / "rejected") is added to the planner log row of the
+        command that produced the card, when there is one."""
         with self._turn_lock:
             self.context.close_card(card_id)
             self.context.touch()
+            log_id = self._card_logs.pop(card_id, None)
+        if log_id and outcome in planner_log.OUTCOMES:
+            planner_log.set_outcome(self._get_conn(), log_id, outcome)
         self._emit_context()
 
     def set_branch(self, mine, view):
@@ -468,13 +477,18 @@ class VoiceSession:
             # ReviewCard.build() to render; a human must still tap Approve
             # via the existing /approve HTTP POST route before anything is
             # written, exactly as the old click-to-record flow worked.
+            card_id = self.context.open_card["card_id"] if self.context.open_card else None
+            if card_id and self.context.planner_log_id:
+                self._card_logs[card_id] = self.context.planner_log_id
+                while len(self._card_logs) > _MAX_HELD_TRANSCRIPTS:
+                    self._card_logs.pop(next(iter(self._card_logs)))
             self._emit("review_card", {
                 "intent": result.intent,
                 "slots": result.slots,
                 "resolved": result.resolved,
                 "transcript": text,
                 "language": self._language_hint,
-                "card_id": self.context.open_card["card_id"] if self.context.open_card else None,
+                "card_id": card_id,
             })
             return
 
@@ -562,6 +576,9 @@ def register_realtime_voice(socketio, api_key, get_conn, clinical_adapter, ops_a
         sessions[sid] = VoiceSession(sid, api_key, emit, get_conn, clinical_adapter, ops_adapter,
                                      deferred_intents, stt_factory=stt_factory,
                                      review_transcripts=review_transcripts)
+        # Opening the page is the moment to load the model's prompt, so the first spoken
+        # command does not wait for a cold start (a no-op when the planner is off).
+        planner.warm_up_async(get_conn)
 
     @socketio.on("disconnect")
     def _on_disconnect():
@@ -603,7 +620,7 @@ def register_realtime_voice(socketio, api_key, get_conn, clinical_adapter, ops_a
     def _on_card_closed(data=None):
         session = sessions.get(request.sid)
         if session and isinstance(data, dict):
-            session.card_closed(data.get("card_id"))
+            session.card_closed(data.get("card_id"), data.get("outcome") if isinstance(data.get("outcome"), str) else None)
 
     @socketio.on("set_branch")
     def _on_set_branch(data=None):

@@ -9,7 +9,10 @@ only structured facts, not a transcript:
   - the appointment list currently on screen (so "cancel the second one" works),
   - the branch the person last named (so "and what is free tomorrow?" stays at it),
   - the review card currently open (so "make it 6 pm" edits it),
-  - a question the assistant has asked and is waiting for an answer to.
+  - a question the assistant has asked and is waiting for an answer to,
+  - the last turn in one line (what was said, the command it became, what came
+    back), so a short follow-up ("give me the names as well", "and the day
+    after?") can be read by the tool-calling planner (clinic/nlu/planner.py).
 
 Everything here only PRE-FILLS a review card, answers a read, or edits an open
 card. Nothing in this module can write to the clinic's data: a human still
@@ -25,7 +28,7 @@ import time
 import unicodedata
 from collections import namedtuple
 
-from clinic import branches
+from clinic import booking_phone, branches, entity_resolution
 from clinic.nlu import datetime_extract, extract
 
 IDLE_SECONDS = 600  # 10 minutes
@@ -79,6 +82,12 @@ class VoiceContext:
         self.list_scope = None
         self.open_card = None      # {"card_id", "intent", "slots"}
         self.pending = None        # the question being asked, see ask()
+        self.last_turn = None      # {"text", "call", "result"}: the previous turn, see remember_turn()
+        # Set while one turn is being handled and read when it ends (voice_turns._remember):
+        self.turn_call = None      # the planner's tool call this turn, when it made one
+        self.turn_command = None   # (intent, slots) this turn ran as
+        self.planner_log_id = None # the planner_log row this turn wrote, to record the card's outcome
+        self.lost_question = False # a question was open when the memory timed out (read for one turn)
         self._touched = self._clock()
 
     # -- lifetime ---------------------------------------------------------
@@ -95,7 +104,9 @@ class VoiceContext:
         if self._clock() - self._touched <= self.idle_seconds:
             return False
         had = self.has_content()
+        was_asking = bool(self.pending)
         self.clear()
+        self.lost_question = was_asking     # so the next turn can say the question timed out
         return had
 
     def has_content(self):
@@ -139,6 +150,9 @@ class VoiceContext:
     def close_card(self, card_id=None):
         if self.open_card and (card_id is None or self.open_card["card_id"] == card_id):
             self.open_card = None
+
+    def remember_turn(self, text, call, result):
+        self.last_turn = {"text": text, "call": call, "result": result}
 
     def ask(self, intent, slots, kind, options=None, skipped=(), tries=0):
         self.pending = {
@@ -334,12 +348,17 @@ def apply_context(intent, slots, text, ctx, fresh=True):
             if row.get("patient_name"):
                 slots["patient_name"] = row["patient_name"]
 
-    if intent in PATIENT_INTENTS and not slots.get("patient_name") and not slots.get("appointment_id"):
+    if intent in PATIENT_INTENTS and not slots.get("appointment_id") and not slots.get("patient_id"):
         # Only an explicit "him / her / उसका / same patient" carries the last
         # patient over. A bare "book an appointment" asks instead, so a stale
-        # patient is never silently attached to the next card.
+        # patient is never silently attached to the next card. The remembered patient's ID
+        # is carried with the name, so two patients who share a name are never mixed up.
         if fresh and ctx.patient and has_patient_reference(text):
-            slots["patient_name"] = ctx.patient["name"]
+            spoken = (slots.get("patient_name") or "").strip()
+            if not spoken or entity_resolution.name_match(spoken, ctx.patient["name"]) == 1.0:
+                # (a model may fill in the remembered name for "him"; a different name spoken is a new person)
+                slots["patient_name"] = ctx.patient["name"]
+                slots["patient_id"] = ctx.patient["id"]
 
     if fresh and ctx.date and has_same_day_reference(text):
         if intent in ("book_appointment", "reschedule_appointment", "check_availability") and not slots.get("appt_date"):
@@ -358,44 +377,61 @@ def apply_context(intent, slots, text, ctx, fresh=True):
 
 _QUESTIONS = {
     "patient": ("Which patient?", "Kaun sa patient?"),
+    # Asked when the command named no patient we could read: says so instead of looking like a guess. English,
+    # Hinglish, and (third) Devanagari for a command spoken in Hindi script. The plain "patient" wording above
+    # is the re-ask after an answer that was not understood.
+    "patient_unheard": ("I couldn't tell who the patient is. Which patient?",
+                        "Mujhe samajh nahi aaya ki patient kaun hai. Kaun sa patient?",
+                        "मुझे समझ नहीं आया कि मरीज़ कौन है। कौन सा मरीज़?"),
     "choose_patient": ("Which one?", "Kaun sa wala?"),
     "date": ("Which day?", "Kis din?"),
     "time": ("What time?", "Kitne baje?"),
     "branch": ("Which branch?", "Kaun si branch?"),
+    # English, Hinglish, and (third) the Devanagari wording for an answer spoken in Hindi script.
+    "phone": ("What is the patient's phone number?", "Patient ka phone number kya hai?",
+              "मरीज़ का फ़ोन नंबर क्या है?"),
 }
 
+_DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 
-def question_text(kind, language):
-    english, hinglish = _QUESTIONS[kind]
-    return hinglish if language == "hi-IN" else english
+
+def question_text(kind, language, heard=None):
+    """The fixed question. A question that has a Devanagari wording uses it when the words just heard
+    were in Devanagari; otherwise Hinglish for a Hindi session and English for the rest."""
+    texts = _QUESTIONS[kind]
+    if len(texts) > 2 and _DEVANAGARI.search(heard or ""):
+        return texts[2]
+    return texts[1] if language == "hi-IN" else texts[0]
 
 
 def ambiguous_patients(candidates):
-    """The registered patients a heard name could equally be (e.g. two
-    Mohans), or []. Needs at least two candidates scoring >= 0.6 within 0.08 of
-    the best one, and the best one not an exact full-name match."""
-    if len(candidates) < 2:
-        return []
-    best = candidates[0].score
-    if best >= 0.999 or best < 0.6:
-        return []
-    close = [c for c in candidates if c.score >= 0.6 and best - c.score <= 0.08]
-    return close if len(close) >= 2 else []
+    """The registered patients a heard name or number could equally be (e.g. two Mohans, or two people on
+    one phone), or []. Matching is exact, so this is simply "two or more exact matches"."""
+    exact = [c for c in candidates if c.score >= 1.0]
+    return exact if len(exact) >= 2 else []
 
 
-def next_question(conn, intent, slots, adapter, ctx, language="hi-IN", skipped=()):
+def next_question(conn, intent, slots, adapter, ctx, language="hi-IN", skipped=(), heard=None):
     """The AskResult for whatever is still missing before a card is worth
-    showing, or None when the card can be built now."""
+    showing, or None when the card can be built now. `heard` (the words just
+    said) only picks the script of the fixed question."""
     skipped = set(skipped)
 
     if intent in PATIENT_INTENTS and not slots.get("appointment_id"):
         name = (slots.get("patient_name") or "").strip()
-        if not name:
+        # A phone number in the command is matched first (exactly); the name is then only needed to tell
+        # apart people who share that number.
+        by_phone = adapter.resolve_patient(conn, "", 4, phone=slots.get("patient_phone")) \
+            if entity_resolution.full_number(slots.get("patient_phone")) else []
+        if not name and len(by_phone) == 1:
+            slots["patient_name"] = name = _display_name(by_phone[0].label)
+        if not name and not by_phone:
             options = []
             if ctx is not None and ctx.patient:
                 options = [{"label": ctx.patient["name"], "patient_name": ctx.patient["name"]}]
-            return AskResult(intent, slots, "patient", question_text("patient", language), options)
-        candidates = adapter.resolve_patient(conn, name, 4)
+            return AskResult(intent, slots, "patient", question_text("patient_unheard", language, heard), options)
+        candidates = adapter.resolve_patient(conn, name, 4, phone=slots.get("patient_phone"),
+                                             patient_id=slots.get("patient_id"))
         close = ambiguous_patients(candidates)
         if close:
             options = [{"label": c.label, "patient_name": _display_name(c.label), "patient_id": c.id} for c in close]
@@ -406,7 +442,62 @@ def next_question(conn, intent, slots, adapter, ctx, language="hi-IN", skipped=(
             return AskResult(intent, slots, "date", question_text("date", language), [])
         if not slots.get("start_time") and "time" not in skipped:
             return AskResult(intent, slots, "time", question_text("time", language), [])
+    if intent == "book_appointment" and booking_phone_missing(conn, slots, adapter):
+        # A phone number is mandatory for a new booking and cannot be skipped: for a patient who is not
+        # registered (or whose number on file is unusable) it is asked for here, so the card is not
+        # one that can only fail at Approve.
+        return AskResult(intent, slots, "phone", question_text("phone", language, heard), [])
     return None
+
+
+def booking_phone_missing(conn, slots, adapter):
+    """True when this booking has no usable phone yet: the named patient is not registered (or has no
+    valid number on file) and no valid number was given. Deterministic: names are resolved in code."""
+    name = (slots.get("patient_name") or "").strip()
+    patient_id = slots.get("patient_id")
+    if not patient_id and (name or slots.get("patient_phone")):
+        candidates = adapter.resolve_patient(conn, name, 2, phone=slots.get("patient_phone"))
+        if len(candidates) == 1:
+            patient_id = candidates[0].id
+    return booking_phone.problem(conn, dict(slots, patient_id=patient_id)) is not None
+
+
+# Digits said one by one, the way phone numbers are read out (English, Hinglish, Devanagari).
+_DIGIT_WORDS = {
+    "zero": 0, "oh": 0, "shunya": 0, "sunya": 0, "शून्य": 0, "ज़ीरो": 0, "जीरो": 0,
+    "one": 1, "ek": 1, "एक": 1,
+    "two": 2, "do": 2, "दो": 2,
+    "three": 3, "teen": 3, "तीन": 3,
+    "four": 4, "char": 4, "chaar": 4, "चार": 4,
+    "five": 5, "paanch": 5, "panch": 5, "pach": 5, "पांच": 5, "पाँच": 5,
+    "six": 6, "chhe": 6, "chhah": 6, "che": 6, "cheh": 6, "छह": 6, "छः": 6, "छे": 6,
+    "seven": 7, "saat": 7, "sat": 7, "सात": 7,
+    "eight": 8, "aath": 8, "ath": 8, "आठ": 8,
+    "nine": 9, "nau": 9, "nao": 9, "नौ": 9,
+}
+_REPEATS = {"double": 2, "dubal": 2, "डबल": 2, "triple": 3, "ट्रिपल": 3}
+
+
+def spoken_phone(text):
+    """The 10-digit phone number in an answer like "98765 00301", "+91 9876500301", "९८७६५००३०१" or digits read
+    out one by one ("nine eight seven six ..."), or None when there is no such number. Fewer or more than
+    10 digits (after a +91 / 0 prefix) is not a phone number: speech recognition drops digits on long
+    sequences, so a short run is asked again rather than guessed at."""
+    digits, repeat = [], 1
+    for token in re.findall(r"[\w\u0900-\u097F+]+", unicodedata.normalize("NFC", text or "").lower()):
+        if token in _REPEATS:
+            repeat = _REPEATS[token]
+            continue
+        if token in _DIGIT_WORDS:
+            digits.extend([str(_DIGIT_WORDS[token])] * repeat)
+        else:
+            # a run of digits (any script's); anything else said around it is ignored
+            digits.extend(str(unicodedata.digit(ch)) for ch in token if unicodedata.category(ch) == "Nd")
+        repeat = 1
+    number = "".join(digits)
+    if not (len(number) == 10 or (len(number) == 11 and number[0] == "0") or (len(number) == 12 and number[:2] == "91")):
+        return None
+    return booking_phone.valid_phone(number) or None
 
 
 def clinic_hour(hour):
@@ -537,6 +628,35 @@ def extract_card_edits(card_intent, text):
         if age:
             edits["age"] = age
     return edits
+
+
+def drop_stale_identity(conn, slots, changes):
+    """A voice edit to an open card that changes WHO the card is about (the patient's name, or a phone number
+    other than the registered patient's own) makes the id the card carried stale: drop it, so an old id
+    never outvotes what the person just said. A phone given to a patient who has none on file is not a
+    change of person. Returns the id that was dropped, or None."""
+    old_id = slots.get("patient_id")
+    if old_id is None:
+        return None
+    stale = False
+    if changes.get("patient_name") and entity_resolution.name_match(changes["patient_name"], _registered_name(conn, old_id)) != 1.0:
+        stale = True
+        slots.pop("appointment_id", None)          # that appointment was the old person's
+    number = entity_resolution.full_number(changes.get("patient_phone"))
+    if number:
+        on_file = conn.execute("SELECT phone FROM patients WHERE id = ?", (old_id,)).fetchone()
+        own = entity_resolution.full_number(on_file["phone"]) if on_file else ""
+        stale = stale or (bool(own) and own != number)
+    if stale:
+        slots.pop("patient_id", None)
+        slots.pop("patient_label", None)
+        return old_id
+    return None
+
+
+def _registered_name(conn, patient_id):
+    row = conn.execute("SELECT name FROM patients WHERE id = ?", (patient_id,)).fetchone()
+    return row["name"] if row else ""
 
 
 def describe_edits(changes):

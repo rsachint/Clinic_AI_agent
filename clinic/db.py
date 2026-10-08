@@ -21,10 +21,16 @@ _APPOINTMENT_COLUMNS = (
 _ADDED_COLUMNS = {
     "appointments": _APPOINTMENT_COLUMNS,
     "wa_messages": (("agent_handled", "INTEGER DEFAULT 0"),),
-    "notifications": (("interactive_json", "TEXT"),),
+    "notifications": (("interactive_json", "TEXT"), ("template_json", "TEXT")),
+    "followups": (
+        ("due_time", "TEXT"), ("doctor_id", "INTEGER"), ("branch_id", "INTEGER"),
+        ("appointment_id", "INTEGER"), ("diagnosis", "TEXT"), ("batch_id", "INTEGER"),
+    ),
     "booking_blocks": (("branch_id", "INTEGER"), ("doctor_id", "INTEGER")),
     "staff": (("branch_id", "INTEGER"),),
     "slot_holds": (("branch_id", "INTEGER"),),
+    "planner_log": (("backend", "TEXT"), ("tokens_in", "INTEGER"), ("tokens_out", "INTEGER"), ("cost_paise", "INTEGER"),
+                    ("route_detail", "TEXT")),
 }
 
 

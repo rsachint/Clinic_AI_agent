@@ -24,6 +24,7 @@ EVENTS = (
     "requested", "auto_booked", "auto_cancelled", "auto_rescheduled", "escalated", "blocked", "conflict",
     "undone", "staff_booked", "staff_cancelled", "staff_rescheduled",
     "closure_moved", "closure_cancelled", "closure_undone", "closure_accepted", "closure_changed",
+    "followup_scheduled", "followup_undone", "followup_visited", "followup_cancelled",
 )
 SOURCES = ("whatsapp-agent", "staff")
 AUTO_EVENTS = ("auto_booked", "auto_cancelled", "auto_rescheduled")
@@ -48,6 +49,10 @@ LABELS = {
     "closure_undone": "Put back after a closure was undone",
     "closure_accepted": "Accepted the new slot after a closure",
     "closure_changed": "Chose another slot after a closure",
+    "followup_scheduled": "Follow-up visit booked",
+    "followup_undone": "Follow-up cancelled with its batch",
+    "followup_visited": "Said they had already visited (follow-up)",
+    "followup_cancelled": "Cancelled the follow-up visit",
 }
 
 

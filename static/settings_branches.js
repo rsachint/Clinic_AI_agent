@@ -10,6 +10,8 @@ document.addEventListener("DOMContentLoaded", function () {
 
   var DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
   var editing = null;   // id of the branch whose row is open for editing
+  var savedBranchId = null;   // a branch just saved: its row shows a check mark after the redraw
+  var savedDoctorId = null;   // same for a renamed doctor
 
   function h(tag, attrs, children) {
     var node = document.createElement(tag);
@@ -71,8 +73,10 @@ document.addEventListener("DOMContentLoaded", function () {
   function branchRow(b) {
     var isDefault = b.id === Branches.data().default_branch_id;
     if (editing === b.id) return branchEditRow(b);
+    var editButton = h("button", { type: "button", class: "btn-queue", text: "Edit", onclick: function () { editing = b.id; draw(); } });
+    if (savedBranchId === b.id) { savedBranchId = null; setTimeout(function () { SaveTick.show(editButton); }, 0); }
     var actions = h("td", { class: "settings-actions" }, [
-      h("button", { type: "button", class: "btn-queue", text: "Edit", onclick: function () { editing = b.id; draw(); } }),
+      editButton,
       b.status === "open"
         ? h("button", { type: "button", class: "btn-queue btn-queue-danger", text: "Close", onclick: function () {
             var reason = window.prompt("Why is " + b.name + " closing? (shown to staff)", "Renovation");
@@ -126,7 +130,7 @@ document.addEventListener("DOMContentLoaded", function () {
             post("/settings/branches/" + b.id, {
               code: value(p + "code"), name: value(p + "name"), address: value(p + "address"),
               pin_code: value(p + "pin"), phone: value(p + "phone"), maps_url: value(p + "maps"),
-            }, "Saved " + value(p + "name") + ".").then(function (r) { if (r) { editing = null; draw(); } });
+            }).then(function (r) { if (r) { editing = null; savedBranchId = b.id; draw(); } });
           } }),
           h("button", { type: "button", class: "btn-queue", text: "Cancel", onclick: function () { editing = null; draw(); } }),
         ]),
@@ -169,12 +173,16 @@ document.addEventListener("DOMContentLoaded", function () {
     var table = h("table", { class: "queue-table settings-table" }, [
       h("tr", {}, ["Name", "Title", "Specialty", ""].map(function (t) { return h("th", { text: t }); })),
     ].concat(doctors.map(function (d) {
+      var renameButton = h("button", { type: "button", class: "btn-queue", text: "Rename", onclick: function () {
+        var name = window.prompt("Doctor's name", d.name);
+        if (!name) return;
+        savedDoctorId = d.id;     // the table is redrawn by the save itself, so mark it first
+        post("/settings/doctors/" + d.id, { name: name }).then(function (r) { if (!r) { savedDoctorId = null; } });
+      } });
+      if (savedDoctorId === d.id) { savedDoctorId = null; setTimeout(function () { SaveTick.show(renameButton); }, 0); }
       return h("tr", {}, [
         h("td", { text: d.name }), h("td", { text: d.title || "-" }), h("td", { text: d.specialty || "-" }),
-        h("td", { class: "settings-actions" }, [h("button", { type: "button", class: "btn-queue", text: "Rename", onclick: function () {
-          var name = window.prompt("Doctor's name", d.name);
-          if (name) post("/settings/doctors/" + d.id, { name: name }, "Saved.");
-        } })]),
+        h("td", { class: "settings-actions" }, [renameButton]),
       ]);
     })));
     var add = h("form", { class: "appt-form", autocomplete: "off", onsubmit: function (event) {

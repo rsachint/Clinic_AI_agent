@@ -5,19 +5,32 @@ from clinic.nlu.classify import calendar_mode, classify, is_move_command, is_pat
 from clinic.nlu.datetime_extract import extract_appt_date, extract_appt_time, mentions_unreadable_date
 from clinic.nlu.intent_llm import llm_enabled, pick_intent
 from clinic.voice_context import contextual_intent, spoken_time
-from clinic.nlu.llm_slots import clear_prefetch, extract_name, prefetch_name, reset_known_names, set_known_names
+from clinic.nlu.llm_slots import (clear_prefetch, extract_name, local_model_allowed, prefetch_name, reset_known_names,
+                                  set_known_names, staff_command)
 
 
 _logger = logging.getLogger(__name__)
 
 
-def parse(text, known_names=None, context=None):
+def parse(text, known_names=None, context=None, planner=None):
     """parse(), with `known_names` (registered patient / staff names) made
     available to the name extractor so a name we already know is recognised by
-    plain string matching, with no model call (clinic/nlu/llm_slots.py)."""
+    plain string matching, with no model call (clinic/nlu/llm_slots.py).
+
+    `planner` (a clinic.nlu.planner.PlannerRun, passed by the pipeline when the
+    tool-calling planner is on) is asked where the one-word label picker used to
+    be asked; when it cannot help, the label picker runs exactly as before.
+
+    With PLANNER_BACKEND=sarvam the local model is not used here at all (no label
+    picker, no name lookup): whatever the planner could not place is left to the
+    keyword rules and the deterministic readers."""
     token = set_known_names(known_names)
     try:
-        return _parse(text, context)
+        with staff_command():
+            if planner is None:
+                return _parse(text, context)
+            intent, slots = _parse(text, context, planner)
+            return intent, _fill_missing_name(text, intent, slots, planner)
     finally:
         clear_prefetch()
         reset_known_names(token)
@@ -28,6 +41,12 @@ _NAMELESS_INTENTS = frozenset((
     "check_availability", "day_end_cashbook", "missed_followups",
     "queue_status", "open_calendar", "log_expense", "patient_count",
 ))
+
+
+def _note_rule(planner, rule):
+    """Tell the planner run (if any) which precise rule decided the intent, for the log and the name read."""
+    if planner is not None:
+        planner.note_rule(rule)
 
 
 def _spoken_name_or_none(text):
@@ -41,6 +60,32 @@ def _spoken_name_or_none(text):
         return None
 
 
+# A rule decided the intent and the deterministic readers found no name: the one place the hosted planner is asked
+# for just the name (clinic/nlu/planner.py fill_name). "move": an explicit move / shift of an appointment;
+# "keywords": the planner scope is 'unmatched' and the keyword rules placed the command. A follow-up on what is on
+# screen ("cancel the second one") never asks: its person comes from the screen or the conversation.
+_NAME_FILL_RULES = frozenset(("move", "keywords"))
+_NAME_SLOT = {intent: "patient_name" for intent in (
+    "book_appointment", "cancel_appointment", "reschedule_appointment", "record_visit", "set_followup",
+    "cancel_followup", "reschedule_followup", "patient_lookup", "next_appointment")}
+_NAME_SLOT["log_attendance"] = "staff_name"
+
+
+def _fill_missing_name(text, intent, slots, planner):
+    """When a precise rule picked the intent and no reader found who the command is about, ask the hosted planner
+    for the name words only (one small call) and put them in the name slot. The intent is never changed; the name
+    goes through the normal exact entity resolution like any other heard name. A failure leaves the slot empty,
+    exactly as before, and the person is asked."""
+    key = _NAME_SLOT.get(intent)
+    if (key is None or planner is None or planner.asked or planner.rule not in _NAME_FILL_RULES
+            or slots.get(key) or slots.get("patient_phone") or slots.get("appointment_id")):
+        return slots
+    name = planner.fill_name()
+    if not name:
+        return slots
+    return dict(slots, **{key: name})
+
+
 class UnrecognizedCommand(Exception):
     pass
 
@@ -48,7 +93,7 @@ class UnrecognizedCommand(Exception):
 QUEUE_WRITE_INTENTS = frozenset(("queue_check_in", "queue_call_next", "queue_mark_done", "queue_mark_no_show"))
 
 
-def _parse(text, context=None):
+def _parse(text, context=None, planner=None):
     """Turn a raw ASR transcript into (intent, raw_slots). raw_slots carries
     ASR-hint values only (a name string, a phone digit-string, etc) -- these
     are NOT resolved against the database yet. The caller must still run
@@ -69,14 +114,37 @@ def _parse(text, context=None):
         if rules_intent not in (None, contextual):
             _logger.info("Context rule: %s overrides rules=%s for transcript=%r", contextual, rules_intent, text)
         intent = contextual
+        _note_rule(planner, "context")
     elif is_move_command(text):
         intent = rules_intent      # an explicit "move / shift ... appointment": no need to ask the model
+        _note_rule(planner, "move")
     elif is_patient_count(text):
         intent = "patient_count"   # "how many patients are registered": a count, never a registration
+        _note_rule(planner, "count")
     else:
-        if llm_enabled() and rules_intent not in _NAMELESS_INTENTS:
-            prefetch_name(text)  # runs while the intent model below is thinking
-        intent = pick_intent(text, hint=context.model_hint() if context is not None else None)
+        planned = planner.ask() if planner is not None and planner.wants(rules_intent) else None
+        if planned is not None:
+            # The tool call was valid: its (intent, slots) is what the extractors
+            # below would have produced for this sentence, so it goes straight to
+            # entity resolution and the review card. "unsupported" is final.
+            if planned.intent == "unclear":
+                raise UnrecognizedCommand(text)
+            return planned.intent, dict(planned.slots)
+        if planner is not None and planner.skips_model(rules_intent):
+            intent = rules_intent      # planner scope "unmatched": the keyword rules stand
+            _note_rule(planner, "keywords")
+        elif not local_model_allowed():
+            # The hosted planner could not help (or is off) and the local model is not used for staff
+            # commands: straight to the keyword rules below, no label picker, no name model.
+            intent = None
+            if planner is not None and planner.asked:
+                planner.note_route("rules")
+        else:
+            if llm_enabled() and rules_intent not in _NAMELESS_INTENTS:
+                prefetch_name(text)  # runs while the intent model below is thinking
+            intent = pick_intent(text, hint=context.model_hint() if context is not None else None)
+            if planner is not None and planner.asked:
+                planner.note_route("label_fallback" if intent is not None else "rules")
     if contextual is None and intent is not None and rules_intent is not None and intent != rules_intent:
         _logger.info("Router disagreement: model=%s rules=%s transcript=%r (model wins)", intent, rules_intent, text)
     if intent is None:
@@ -87,6 +155,8 @@ def _parse(text, context=None):
         # leading "naya patient" and leaves just the name/age/phone).
         intent = "register_patient"
     if intent is None:
+        if planner is not None and planner.asked:
+            planner.note_route("rephrase")
         raise UnrecognizedCommand(text)
 
     if intent == "register_patient":

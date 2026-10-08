@@ -75,7 +75,7 @@ document.addEventListener("DOMContentLoaded", function () {
       notes.push(item.slots.agent_note);
     }
     var card = ReviewCard.build(
-      { intent: item.intent, slots: item.slots, resolved: { patient_id: item.slots && item.slots.patient_id ? item.slots.patient_id : item.patient_id } },
+      { intent: item.intent, slots: item.slots, resolved: { patient_id: item.slots && item.slots.patient_id ? item.slots.patient_id : item.patient_id, phone_problem: item.phone_problem || null } },
       {
         approveUrl: "/wa/" + item.id + "/approve",
         notes: notes,

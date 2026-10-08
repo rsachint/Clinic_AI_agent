@@ -24,9 +24,13 @@ window.DashboardRefresh = (function () {
 
         copyContent(doc, "stat-row");
         copyContent(doc, "citation-line");
+        // The server renders the first 10 patients; put back any further rows the user had opened.
+        var patientsShown = window.PatientsList ? window.PatientsList.shown() : 0;
         copyContent(doc, "patients-table-card");
+        if (patientsShown > 10 && window.PatientsList) window.PatientsList.restore(patientsShown);
         copyContent(doc, "missed-followups-card");
         copyContent(doc, "attendance-card");
+        copyContent(doc, "fu-patient-list");
         copyContent(doc, "audit-table-card");
         // The Queue panel follows the date picker (which may not be today),
         // so it is re-fetched for that date rather than copied from "/".

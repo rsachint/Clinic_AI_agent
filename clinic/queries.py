@@ -3,16 +3,19 @@ from datetime import date, timedelta
 from clinic import branches
 
 
-def _appointment_select(conn):
+def _appointment_select(conn, with_patient_id=False):
     """The columns every appointment listing returns, plus the joins they need.
     `branch` / `doctor` are display names; `branch_id` is the appointment's own
-    branch (an old row with none belongs to the default branch)."""
+    branch (an old row with none belongs to the default branch). `with_patient_id` adds the
+    registered patient's id (None for a walk-in); the on-screen listings leave it out."""
     default = int(branches.default_branch_id(conn))
     columns = (
         "a.id, a.appt_date, a.start_time, a.duration_minutes, a.status, a.notes, "
         "COALESCE(p.name, a.patient_name) AS patient_name, COALESCE(p.phone, a.patient_phone) AS patient_phone, "
         "COALESCE(a.branch_id, {d}) AS branch_id, a.doctor_id, b.name AS branch, b.code AS branch_code, d.name AS doctor"
     ).format(d=default)
+    if with_patient_id:
+        columns += ", a.patient_id AS patient_id"
     joins = (
         "LEFT JOIN patients p ON p.id = a.patient_id "
         "LEFT JOIN branches b ON b.id = COALESCE(a.branch_id, {d}) "
@@ -28,10 +31,17 @@ def missed_followups(conn, as_of=None):
         SELECT f.id, p.name, p.phone, f.due_date
         FROM followups f
         JOIN patients p ON p.id = f.patient_id
-        WHERE f.status = 'pending' AND f.due_date <= ?
+        LEFT JOIN appointments a ON a.id = f.appointment_id
+        WHERE f.status = 'pending'
+          AND (
+            (f.appointment_id IS NULL AND f.due_date <= ?)
+            -- a follow-up with a booked slot is only overdue once its day is past
+            -- (or the patient was marked a no-show), not while the visit is still ahead today
+            OR (f.appointment_id IS NOT NULL AND (f.due_date < ? OR a.status = 'no_show'))
+          )
         ORDER BY f.due_date
         """,
-        (as_of,),
+        (as_of, as_of),
     ).fetchall()
 
 
@@ -156,24 +166,33 @@ def attendance_register(conn, on_date=None):
 
 
 def registered_names(conn):
-    """Names the voice name-extractor can recognise without asking the model:
-    patients with at least two words (a lone first name is too easily the start
-    of a different, new person's name) and every staff member. Best effort:
-    any database problem just means "no shortcut", never an error."""
+    """Names the voice name-extractor can recognise without asking a model: every patient and every staff
+    member. A name of ONE word is only taken by the matcher's stricter rule (clinic/nlu/llm_slots.py: exactly
+    one person fits it and the sentence does not continue it with another name), so a lone first name is
+    never mistaken for the start of a different, new person's name. Best effort: any database problem just
+    means "no shortcut", never an error."""
     try:
-        names = [r[0] for r in conn.execute("SELECT name FROM patients") if r[0] and len(r[0].split()) >= 2]
-        names += [r[0] for r in conn.execute("SELECT name FROM staff") if r[0]]
+        names = [r[0] for r in conn.execute("SELECT name FROM patients") if r[0] and r[0].strip()]
+        names += [r[0] for r in conn.execute("SELECT name FROM staff") if r[0] and r[0].strip()]
         return names
     except Exception:
         return []
 
 
 def appointment_option(conn, appointment_id):
-    """One booked appointment as a review-card dropdown option, or None."""
-    return conn.execute(
-        "SELECT id, appt_date, start_time, duration_minutes FROM appointments "
-        "WHERE id = ? AND status IN ('booked', 'confirmed')", (appointment_id,)
+    """One booked appointment as a review-card option, or None: its id, date, time and length, plus what the
+    card shows as text (who, phone, status, branch and doctor names; never the notes)."""
+    columns, joins, _ = _appointment_select(conn)
+    row = conn.execute(
+        "SELECT {} FROM appointments a {} WHERE a.id = ? AND a.status IN ('booked', 'confirmed')".format(columns, joins),
+        (appointment_id,),
     ).fetchone()
+    if row is None:
+        return None
+    return {"id": row["id"], "appt_date": row["appt_date"], "start_time": row["start_time"],
+            "duration_minutes": row["duration_minutes"], "who": row["patient_name"],
+            "patient_phone": row["patient_phone"], "status": row["status"],
+            "branch_id": row["branch_id"], "branch": row["branch"], "doctor": row["doctor"]}
 
 
 # What a person-name search lists: everything that actually happened or is still
@@ -181,19 +200,16 @@ def appointment_option(conn, appointment_id):
 NAMED_LIST_STATUSES = ("booked", "confirmed", "completed", "no_show")
 
 
-def _name_score(name, who, first_name_ok):
-    """How well the heard `name` fits the written `who`. A single spoken word
-    ("Amit") also counts as a full match for any one word of the written name
-    ("Amit Dua", "Amit Anand"), when `first_name_ok`."""
+def _name_score(name, who):
+    """1.0 when the heard `name` is exactly the written `who` (or a single word equal to its first
+    name: "Amit" for "Amit Dua"), otherwise 0.0."""
     from clinic.entity_resolution import similarity
 
-    score = similarity(name, who)
-    if first_name_ok and len(name.split()) == 1:
-        score = max([score] + [similarity(name, word) for word in who.split()])
-    return score
+    return similarity(name, who)
 
 
-def _appointments_matching(conn, name, start, end, statuses, min_score, closeness, first_name_ok, branch_id=None):
+def _appointments_matching(conn, name, start, end, statuses, min_score, closeness, branch_id=None,
+                           with_patient_id=False):
     """Appointments (with the person shown in `patient_name`, as in
     scheduled_appointments) in [start, end] with one of `statuses` (any, if
     empty) whose person sounds like `name`: (score, row) pairs of the
@@ -204,7 +220,7 @@ def _appointments_matching(conn, name, start, end, statuses, min_score, closenes
     name = (name or "").strip()
     if not name:
         return []
-    columns, joins, default = _appointment_select(conn)
+    columns, joins, default = _appointment_select(conn, with_patient_id)
     where, params = ["1 = 1"], []
     if branch_id is not None:
         where.append("COALESCE(a.branch_id, ?) = ?")
@@ -223,7 +239,7 @@ def _appointments_matching(conn, name, start, end, statuses, min_score, closenes
             columns, joins, " AND ".join(where)),
         params,
     ).fetchall()
-    scored = [(_name_score(name, r["patient_name"], first_name_ok), r) for r in rows if r["patient_name"]]
+    scored = [(_name_score(name, r["patient_name"]), r) for r in rows if r["patient_name"]]
     scored = [(score, r) for score, r in scored if score >= min_score]
     if not scored:
         return []
@@ -242,7 +258,7 @@ def appointments_named(conn, name, start=None, end=None, statuses=NAMED_LIST_STA
     # Who is meant is decided over every appointment, whatever its day or status;
     # only then is the person's list narrowed. Otherwise "Amit Anand" with nothing
     # on the day asked would quietly turn into whichever other Amit has something.
-    matches = _appointments_matching(conn, name, None, None, (), min_score, closeness, first_name_ok=True,
+    matches = _appointments_matching(conn, name, None, None, (), min_score, closeness,
                                      branch_id=branch_id)
     return [
         dict(r) for _, r in matches
@@ -261,13 +277,49 @@ def upcoming_appointments_named(conn, name, today=None, min_score=0.6, closeness
 
     today = today or _date.today().isoformat()
     matches = _appointments_matching(conn, name, today, None, ("booked", "confirmed"), min_score, closeness,
-                                     first_name_ok=False, branch_id=branch_id)
+                                     branch_id=branch_id, with_patient_id=True)
     return [
         {"id": r["id"], "appt_date": r["appt_date"], "start_time": r["start_time"],
          "duration_minutes": r["duration_minutes"], "who": r["patient_name"], "score": round(score, 3),
-         "branch_id": r["branch_id"], "branch": r["branch"], "branch_code": r["branch_code"]}
+         "patient_id": r["patient_id"], "patient_phone": r["patient_phone"],
+         "branch_id": r["branch_id"], "branch": r["branch"], "branch_code": r["branch_code"],
+         "doctor": r["doctor"], "status": r["status"]}
         for score, r in matches
     ]
+
+
+def upcoming_appointments_by_patient_id(conn, patient_id, today=None, branch_id=None):
+    """The booked / confirmed appointments from `today` on (today's earlier ones included, as in
+    upcoming_appointments_named) of ONE registered patient, found by id and never by name, so two
+    patients who share a name are never mixed. Same row shape as upcoming_appointments_named."""
+    from datetime import date as _date
+
+    today = today or _date.today().isoformat()
+    columns, joins, default = _appointment_select(conn, with_patient_id=True)
+    where, params = ["a.patient_id = ?", "a.status IN ('booked', 'confirmed')", "a.appt_date >= ?"], [patient_id, today]
+    if branch_id is not None:
+        where.append("COALESCE(a.branch_id, ?) = ?")
+        params.extend([default, int(branch_id)])
+    rows = conn.execute(
+        "SELECT {} FROM appointments a {} WHERE {} ORDER BY a.appt_date, a.start_time, a.id".format(
+            columns, joins, " AND ".join(where)),
+        params,
+    ).fetchall()
+    return [
+        {"id": r["id"], "appt_date": r["appt_date"], "start_time": r["start_time"],
+         "duration_minutes": r["duration_minutes"], "who": r["patient_name"], "score": 1.0,
+         "patient_id": r["patient_id"], "patient_phone": r["patient_phone"],
+         "branch_id": r["branch_id"], "branch": r["branch"], "branch_code": r["branch_code"],
+         "doctor": r["doctor"], "status": r["status"]}
+        for r in rows
+    ]
+
+
+def appointment_patient_id(conn, appointment_id):
+    """The registered patient an appointment belongs to, or None (a walk-in, or no such appointment)."""
+    row = conn.execute("SELECT patient_id FROM appointments WHERE id = ?", (appointment_id,)).fetchone() \
+        if appointment_id else None
+    return row["patient_id"] if row else None
 
 
 CALENDAR_STATUSES = ("booked", "confirmed", "completed", "no_show")

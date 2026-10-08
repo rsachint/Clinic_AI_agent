@@ -17,6 +17,12 @@ to the original (within CLOSE_ENOUGH_MINUTES). When nothing fits, the default is
 "leave this one alone" (never a silent cancel) and the options list offers
 other branches and the next few days. A person can change every row before
 applying.
+
+Staff can also name where everyone should go ("move all appointments to Branch
+C"): plan(preferred_branch_id=...) tries that branch first for every patient --
+it needs a doctor and a free time within the same CLOSE_ENOUGH_MINUTES window --
+and otherwise falls back to the nearest-branch order above, saying so in the
+row's note.
 """
 
 import logging
@@ -142,9 +148,29 @@ def _candidates(conn, row, targets, taken, now):
     return options[:MAX_OPTIONS]
 
 
-def plan(conn, branch_id, start_date, end_date, start_time=None, end_time=None, doctor_id=None, now=None):
+def _preferred(conn, preferred_branch_id, branch_id, targets):
+    """(preferred branch dict or None, the targets with it first, a plan-level note or None)."""
+    if preferred_branch_id in (None, ""):
+        return None, targets, None
+    try:
+        preferred = branches.get_branch(conn, int(preferred_branch_id))
+    except (TypeError, ValueError):
+        preferred = None
+    if preferred is None:
+        raise ClosureError("The branch to move patients to does not exist.")
+    if preferred["id"] == branch_id:
+        raise ClosureError("Choose a different branch to move the patients to.")
+    listed = [b for b in targets if b["id"] == preferred["id"]]
+    if not listed:
+        return preferred, targets, "{} is closed, so patients are offered the nearest open branches instead.".format(preferred["name"])
+    return preferred, listed + [b for b in targets if b["id"] != preferred["id"]], None
+
+
+def plan(conn, branch_id, start_date, end_date, start_time=None, end_time=None, doctor_id=None, now=None,
+         preferred_branch_id=None):
     """The proposed batch. Writes nothing. Returns
-    {'scope': {...}, 'moves': [ {appointment_id, name, phone, from, action, to, options, note} ], 'counts': {...}}."""
+    {'scope': {...}, 'moves': [ {appointment_id, name, phone, from, action, to, options, note} ], 'counts': {...}}.
+    `preferred_branch_id` names the branch to try first for every patient."""
     now = _now(now)
     branch_id, doctor_id = _scope(conn, branch_id, doctor_id)
     try:
@@ -154,6 +180,7 @@ def plan(conn, branch_id, start_date, end_date, start_time=None, end_time=None, 
     closing = branches.get_branch(conn, branch_id)
     targets = [b for b in branches.nearest_branches(conn, closing.get("pin_code"), include_closed=False)
                if b["id"] != branch_id]
+    preferred, targets, preferred_note = _preferred(conn, preferred_branch_id, branch_id, targets)
     rows = affected(conn, branch_id, start_date, end_date, start_time, end_time, doctor_id, now)
     taken = set()
     moves = []
@@ -166,13 +193,21 @@ def plan(conn, branch_id, start_date, end_date, start_time=None, end_time=None, 
                 choice = option
                 break
         note = None
+        missed_preferred = None
+        if preferred and not preferred_note and not (choice and choice["branch_id"] == preferred["id"]):
+            missed_preferred = "{} has no free time within {} hours of {}.".format(
+                preferred["name"], CLOSE_ENOUGH_MINUTES // 60, row["start_time"])
         if choice:
             taken.add((choice["branch_id"], choice["date"], choice["time"]))
             if choice["time"] != row["start_time"]:
                 note = "Closest free time at {} ({} instead of {}).".format(choice["branch"], choice["time"], row["start_time"])
+            if missed_preferred:
+                note = "{} Moved to {} instead.".format(missed_preferred, choice["branch"])
         else:
             note = ("No free time within {} hours at another branch that day. Pick another day, cancel, or leave it."
                     .format(CLOSE_ENOUGH_MINUTES // 60)) if targets else "There is no other open branch to move this patient to."
+            if missed_preferred:
+                note = "{} {}".format(missed_preferred, note)
         moves.append({
             "appointment_id": row["id"], "name": row["name"], "phone": row["phone"], "duration": duration,
             "from": {"branch_id": row["branch_id"], "branch": branches.branch_label(conn, row["branch_id"]),
@@ -180,14 +215,16 @@ def plan(conn, branch_id, start_date, end_date, start_time=None, end_time=None, 
             "action": "move" if choice else "leave", "to": choice,
             "options": [option for _, option in options], "note": note,
         })
-    return {
-        "scope": {"branch_id": branch_id, "branch": closing["name"], "doctor_id": doctor_id,
-                  "doctor": branches.doctor_label(conn, doctor_id) if doctor_id else None,
-                  "start_date": start_date, "end_date": end_date, "start_time": start_time, "end_time": end_time},
-        "moves": moves,
-        "counts": {"total": len(moves), "movable": sum(1 for m in moves if m["to"]),
-                   "unresolved": sum(1 for m in moves if not m["to"])},
-    }
+    counts = {"total": len(moves), "movable": sum(1 for m in moves if m["to"]),
+              "unresolved": sum(1 for m in moves if not m["to"])}
+    if preferred:
+        counts["to_preferred"] = sum(1 for m in moves if m["to"] and m["to"]["branch_id"] == preferred["id"])
+    scope = {"branch_id": branch_id, "branch": closing["name"], "doctor_id": doctor_id,
+             "doctor": branches.doctor_label(conn, doctor_id) if doctor_id else None,
+             "start_date": start_date, "end_date": end_date, "start_time": start_time, "end_time": end_time}
+    if preferred:       # only when a destination was asked for, so an ordinary plan is unchanged
+        scope.update(preferred_branch_id=preferred["id"], preferred_branch=preferred["name"], preferred_note=preferred_note)
+    return {"scope": scope, "moves": moves, "counts": counts}
 
 
 # ---------------------------------------------------------------------------

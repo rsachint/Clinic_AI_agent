@@ -14,3 +14,9 @@ os.environ["GOOGLE_CALENDAR_SYNC"] = "1"
 # it: switch it off here; the tests that exercise it patch the call or turn it
 # on explicitly.
 os.environ["INTENT_LLM_ENABLED"] = "0"
+# Same for the tool-calling planner (clinic/nlu/planner.py): the suite never calls
+# it live. The tests of the planner itself use a fake backend and switch it on.
+os.environ["INTENT_PLANNER_ENABLED"] = "0"
+# And the hosted planner (clinic/nlu/sarvam.py): a developer's .env may select it, and no test may reach Sarvam.
+# The tests of the backend itself use a fake HTTP transport and set what they need.
+os.environ["PLANNER_BACKEND"] = "local"

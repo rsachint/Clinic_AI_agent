@@ -21,7 +21,7 @@ import re
 import unicodedata
 from collections import namedtuple
 
-from clinic import branches
+from clinic import branches, query_tool
 
 # branch: the matched branch dict (the last one named); every: "all branches";
 # mine: "my branch"; text: the command with those words removed.
@@ -29,7 +29,7 @@ Mention = namedtuple("Mention", ["branch", "every", "mine", "text"])
 
 # Intents whose card or answer is about one branch, and how a missing branch is filled.
 BOOK_INTENTS = frozenset(("book_appointment",))
-READ_INTENTS = frozenset(("check_availability", "list_appointments", "queue_status"))
+READ_INTENTS = frozenset(("check_availability", "list_appointments", "queue_status", "query"))
 QUEUE_INTENTS = frozenset(("queue_check_in", "queue_call_next", "queue_mark_done", "queue_mark_no_show"))
 # An appointment keeps its own branch unless the person names another.
 MOVE_INTENTS = frozenset(("reschedule_appointment",))
@@ -164,6 +164,18 @@ def find(conn, text, bare=False, tail=False):
     return Mention(branch, bool(every) and branch is None, bool(mine) and branch is None and not every, cut)
 
 
+def named_branches(conn, text):
+    """Every distinct branch named in `text`, in the order they are said (the
+    closing one first in "Branch B will be closed, move everyone to Branch C")."""
+    norm = _norm(text)
+    found = {}
+    for branch in (branches.list_branches(conn) if branches.multi_branch(conn) else []):
+        for pattern in _patterns_for(branch):
+            for m in pattern.finditer(norm):
+                found[branch["id"]] = min(found.get(branch["id"], (m.start(), branch))[0], m.start()), branch
+    return [branch for _, branch in sorted(found.values(), key=lambda item: item[0])]
+
+
 def is_switch_command(text):
     """True for "switch to Branch C" / "change my branch to B" / "I'm at Branch B":
     a statement about which branch this computer works for, not a request about
@@ -192,8 +204,10 @@ def default_branch(conn, intent, slots, context):
         slots.pop("all_branches", None)
     if intent in MOVE_INTENTS or slots.get("branch_id") or slots.get("all_branches"):
         return slots
-    if intent == "list_appointments" and slots.get("patient_name"):
+    if intent in ("list_appointments", "query") and slots.get("patient_name"):
         return slots          # one person's appointments: wherever they are, unless a branch was named
+    if intent == "query" and slots.get("entity") not in query_tool.MY_BRANCH_DEFAULT:
+        return slots          # staff, doctors, closures ...: clinic-wide unless a branch was named
     if intent in BOOK_INTENTS or intent in READ_INTENTS or intent in QUEUE_INTENTS:
         chosen = context.current_branch() if context is not None else None
         if chosen:

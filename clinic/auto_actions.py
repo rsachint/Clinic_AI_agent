@@ -28,7 +28,7 @@ import threading
 from collections import namedtuple
 from datetime import datetime
 
-from clinic import auto_policy, core, patient_activity, scheduling
+from clinic import auto_policy, booking_phone, core, patient_activity, scheduling
 from clinic.entity_resolution import last10_digits
 
 _logger = logging.getLogger(__name__)
@@ -157,6 +157,9 @@ def _commit(conn, intent, slots, wa_id, patient_id, patient_name, msg_id, now, h
     # else: it does not register the sender as a patient (a staff-approved
     # booking does).
     handler_slots["unattended"] = True
+    if intent == "book_appointment" and not handler_slots.get("patient_phone"):
+        # A new booking needs a phone: the sender's own number is always known on this path.
+        handler_slots["patient_phone"] = last10_digits(wa_id or "") or None
     before = None
     if intent != "book_appointment":
         handler_slots["require_active"] = True
@@ -176,6 +179,14 @@ def _commit(conn, intent, slots, wa_id, patient_id, patient_name, msg_id, now, h
             meta=dict(meta, code="blocked" if blocked else "slot_taken", reason=reason, **_slot_meta(slots)), now=now)
         return _outcome("retry", reason=reason, code="blocked" if blocked else "slot_taken", intent=intent,
                         proposal_id=proposal_id)
+    except booking_phone.PhoneRequiredError:
+        _reject_quietly(conn, proposal_id)
+        reason = "the patient has no valid phone number"
+        patient_activity.log(
+            conn, event="escalated", source=SOURCE, wa_id=wa_id, patient_id=patient_id, patient_name=patient_name,
+            appointment_id=slots.get("appointment_id"), detail="Sent to staff: {}".format(reason),
+            proposal_id=proposal_id, meta=dict(meta, code="no_phone", reason=reason, **_slot_meta(slots)), now=now)
+        return _outcome("escalate", reason=reason, code="no_phone", intent=intent, proposal_id=proposal_id)
     except Exception as exc:
         _logger.exception("automatic %s failed at commit; sending it to staff", intent)
         _reject_quietly(conn, proposal_id)

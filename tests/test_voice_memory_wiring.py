@@ -30,7 +30,9 @@ class FrontEndWiringTests(unittest.TestCase):
             self.assertIn('socket.emit("%s"' % event, self.js)
 
     def test_a_card_is_closed_on_both_approve_and_reject(self):
-        self.assertEqual(self.js.count("cardClosed(cardId);"), 2)  # once on approve, once on reject
+        # once on approve, once on reject; each says how it ended (for the planner log)
+        self.assertEqual(self.js.count('cardClosed(cardId, "approved");'), 1)
+        self.assertEqual(self.js.count('cardClosed(cardId, "rejected");'), 1)
 
     def test_cards_carry_an_id_and_can_be_updated_in_place(self):
         self.assertIn("data-card-id", self.card)

@@ -89,8 +89,9 @@ class AppointmentsNamedQueryTests(NamedDataTestCase):
         self.assertEqual(self.ids(queries.appointments_named(self.conn, "अमित")), both)
         self.assertEqual(self.ids(queries.appointments_named(self.conn, "amit")), both)
 
-    def test_a_surname_alone_finds_that_person(self):
-        self.assertEqual(self.ids(queries.appointments_named(self.conn, "Dua")), [self.dua_today])
+    def test_a_surname_alone_finds_nobody(self):
+        # Only the full name, or the first name, is matched (exactly).
+        self.assertEqual(queries.appointments_named(self.conn, "Dua"), [])
 
     def test_a_similar_but_different_first_name_is_left_out(self):
         self.book(None, "Amita Rao", 4, "10:00")
@@ -154,11 +155,11 @@ class AppointmentsNamedQueryTests(NamedDataTestCase):
         rows = queries.upcoming_appointments_named(self.conn, "Amit Dua")
         self.assertEqual(self.ids(rows), [self.dua_today])
         self.assertNotIn(past, self.ids(rows))
-        self.assertEqual(list(rows[0].keys()), ["id", "appt_date", "start_time", "duration_minutes", "who", "score", "branch_id", "branch", "branch_code"])
+        self.assertEqual(list(rows[0].keys()), ["id", "appt_date", "start_time", "duration_minutes", "who", "score", "patient_id", "patient_phone", "branch_id", "branch", "branch_code", "doctor", "status"])
         self.assertEqual(rows[0]["who"], "Amit Dua")
         self.assertEqual(rows[0]["score"], 1.0)
-        # A bare first name still keeps only the single best-sounding person there (no first-name rule).
-        self.assertEqual(self.ids(queries.upcoming_appointments_named(self.conn, "Amit")), [self.dua_today])
+        # A bare first name now finds everyone with exactly that first name (the card asks which).
+        self.assertEqual(self.ids(queries.upcoming_appointments_named(self.conn, "Amit")), [self.dua_today, self.anand_tomorrow])
         self.assertEqual(self.ids(self.adapter.upcoming_appointments_named(self.conn, "अमित दुआ")), [self.dua_today])
 
 

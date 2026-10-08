@@ -23,7 +23,18 @@ CREATE TABLE IF NOT EXISTS followups (
     due_date TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'done', 'missed', 'cancelled')),
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    completed_at TEXT
+    completed_at TEXT,
+    -- A follow-up with a real booked slot (clinic/followups.py): the doctor advised
+    -- a return visit at this date + time. appointment_id is the calendar slot that
+    -- holds it; NULL = a legacy date-only recall (no slot, no reminders). Added to
+    -- existing databases by clinic/db.py's ensure_columns().
+    due_time TEXT,                  -- 'HH:MM'
+    doctor_id INTEGER REFERENCES doctors(id),
+    branch_id INTEGER REFERENCES branches(id),
+    appointment_id INTEGER REFERENCES appointments(id),
+    -- INTERNAL ONLY, staff-editable. Never copied into any patient-facing message.
+    diagnosis TEXT,
+    batch_id INTEGER                -- the "Schedule follow-ups" batch that created it
 );
 
 -- Real appointment/time-slot scheduling, separate from `followups` (which is
@@ -166,7 +177,11 @@ CREATE TABLE IF NOT EXISTS notifications (
     -- JSON spec of reply buttons / a list message to send with `body` (see
     -- clinic/whatsapp.py build_interactive_body); NULL for plain text. Added to
     -- existing databases by clinic/db.py's ensure_columns().
-    interactive_json TEXT
+    interactive_json TEXT,
+    -- JSON spec of the Meta-approved template to send INSTEAD of `body` when the
+    -- patient is outside WhatsApp's 24-hour window (see clinic/whatsapp.py
+    -- build_template_body); NULL = no template, so such a row waits as blocked.
+    template_json TEXT
 );
 
 -- Per-sender state of the WhatsApp conversation agent (clinic/conversation.py).
@@ -411,3 +426,110 @@ CREATE TABLE IF NOT EXISTS closure_moves (
 );
 CREATE INDEX IF NOT EXISTS idx_closure_moves_closure ON closure_moves (closure_id);
 CREATE INDEX IF NOT EXISTS idx_closure_moves_appointment ON closure_moves (appointment_id);
+
+
+-- ---------------------------------------------------------------------------
+-- Follow-up visits with a booked slot and two WhatsApp reminders
+-- (clinic/followups.py). All additive.
+-- ---------------------------------------------------------------------------
+-- One "Schedule follow-ups" batch: the rows staff reviewed and applied together.
+-- Undo cancels the appointments and follow-ups it created.
+CREATE TABLE IF NOT EXISTS followup_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    status TEXT NOT NULL DEFAULT 'applied' CHECK (status IN ('applied', 'undone')),
+    undone_at TEXT
+);
+
+-- The two reminders of a follow-up, per SLOT: moving the slot gives the new slot
+-- its own rows (and cancels the old slot's unsent ones). kind '2d' = the early
+-- reminder, '4h' = the one just before the visit. state: scheduled (waiting for
+-- due_at), enqueued (handed to the notifications outbox -- its real status lives
+-- there), skipped (never sent, see `reason`), cancelled (slot moved / visit
+-- cancelled), manual (staff sent it by hand). due_at is the clinic's local wall
+-- clock, 'YYYY-MM-DD HH:MM'.
+CREATE TABLE IF NOT EXISTS followup_reminders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    followup_id INTEGER NOT NULL REFERENCES followups(id),
+    kind TEXT NOT NULL CHECK (kind IN ('2d', '4h')),
+    slot_date TEXT NOT NULL,
+    slot_time TEXT NOT NULL,
+    due_at TEXT,
+    state TEXT NOT NULL DEFAULT 'scheduled'
+        CHECK (state IN ('scheduled', 'enqueued', 'skipped', 'cancelled', 'manual')),
+    reason TEXT,
+    notification_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT,
+    UNIQUE (followup_id, kind, slot_date, slot_time)
+);
+CREATE INDEX IF NOT EXISTS idx_followup_reminders_state ON followup_reminders (state, due_at);
+
+-- Numbers that asked to stop follow-up reminders ("STOP"), by their last 10 digits.
+CREATE TABLE IF NOT EXISTS reminder_opt_outs (
+    phone10 TEXT PRIMARY KEY,
+    opted_out_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- A local record of every staff command that reached the tool-calling planner
+-- (clinic/nlu/planner.py): what was said, what the planner called, which route
+-- decided the outcome and how long it took. It exists to be reviewed by a person
+-- (scripts/export_planner_log.py turns it into labelled test cases) and never
+-- leaves this database. Transcripts contain patient names. Turn it off with the
+-- app setting planner_log_enabled = 0. `outcome` is filled in later, when the
+-- review card is approved or rejected.
+CREATE TABLE IF NOT EXISTS planner_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL DEFAULT (datetime('now')),
+    source TEXT NOT NULL DEFAULT 'voice' CHECK (source IN ('voice', 'wa_staff')),
+    transcript TEXT NOT NULL,
+    previous_turn TEXT,
+    planner_tool TEXT,
+    planner_args_json TEXT,
+    -- rules: the keyword rules decided; planner: the tool call was used;
+    -- label_fallback: the planner failed and the one-word label picker decided;
+    -- rephrase: nothing could place the command
+    route_taken TEXT NOT NULL CHECK (route_taken IN ('rules', 'planner', 'label_fallback', 'rephrase')),
+    final_intent TEXT,
+    latency_ms INTEGER,
+    override_notes TEXT,
+    outcome TEXT CHECK (outcome IS NULL OR outcome IN ('approved', 'rejected', 'edited')),
+    -- which model planned it ('local' or 'sarvam'; NULL before this was recorded) and, for a Sarvam call that
+    -- answered, its token counts and cost in whole paise at Sarvam's published prices (0 when nothing was billed)
+    backend TEXT,
+    tokens_in INTEGER,
+    tokens_out INTEGER,
+    cost_paise INTEGER,
+    -- for a 'rules' row, which precise rule decided it ("rule:move", "rule:context", "rule:count", "rule:branch",
+    -- "rule:closure", "rule:keywords"; "+name_fill" when the small hosted name read ran); NULL for a planner row.
+    -- planner_args_json then lists which slots were found / missing (names only, never values)
+    route_detail TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_planner_log_ts ON planner_log (ts);
+
+
+-- Questions the assistant could not answer (clinic/unanswered.py): a staff command that was
+-- plainly a request to see, count or find information, but nothing the app can read covers it.
+-- Kept so a PERSON can review them (scripts/export_unanswered.py), add a whitelist entry to
+-- clinic/query_tool.py and mark the question resolved; the user is then told once that it
+-- works. The app never turns this text into SQL or a whitelist entry. `key` is the normalised
+-- question (lowercase, punctuation stripped, spaces collapsed): one row per key, `times_asked`
+-- counts the repeats. Transcripts contain patient names: the table is as private as `patients`
+-- and is written only while the planner_log_enabled setting is on. Times are the clinic's
+-- local wall clock, as text.
+CREATE TABLE IF NOT EXISTS unanswered_questions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    first_asked_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    last_asked_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    times_asked INTEGER NOT NULL DEFAULT 1,
+    key TEXT NOT NULL UNIQUE,
+    example_transcript TEXT NOT NULL,
+    wanted TEXT,                           -- what the planner said they wanted, in a few words
+    rejected_spec_json TEXT,               -- the planner's rejected query spec: a HINT for the developer only
+    source TEXT NOT NULL DEFAULT 'voice' CHECK (source IN ('voice', 'typed')),
+    status TEXT NOT NULL DEFAULT 'new' CHECK (status IN ('new', 'building', 'resolved', 'dismissed')),
+    resolved_note TEXT,                    -- what the user can now ask ("Ask: who is on duty now")
+    resolved_at TEXT,
+    notified_at TEXT                       -- when the user was told it works (shown once)
+);
+CREATE INDEX IF NOT EXISTS idx_unanswered_status ON unanswered_questions (status, times_asked);

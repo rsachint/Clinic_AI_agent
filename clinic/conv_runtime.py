@@ -134,15 +134,17 @@ def write_activity(conn, wa_id, result, now):
             meta=item.get("meta"), now=now)
 
 
-def process_inbound(conn, msg_id, wa_id, text, choice_id=None, *, now=None, picker=None, auto=None):
+def process_inbound(conn, msg_id, wa_id, text, choice_id=None, *, now=None, picker=None, auto=None, followup=None):
     """Run the dialog manager on one stored inbound message, queue its
     replies and record the outcome on the inbox row. Does NOT send: the
     caller flushes (see flush_replies). Raises only if the agent itself
     breaks, in which case the caller falls back to staff handling. `auto`
-    is the automatic-commit callable (see conversation.handle_inbound)."""
+    is the automatic-commit callable and `followup` the follow-up button runner
+    (see conversation.handle_inbound)."""
     with sender_lock(wa_id):
         result = conversation.handle_inbound(
-            conn, wa_id, text, choice_id=choice_id, now=now, msg_id=msg_id, intent_picker=picker, auto=auto)
+            conn, wa_id, text, choice_id=choice_id, now=now, msg_id=msg_id, intent_picker=picker, auto=auto,
+            followup=followup)
         enqueue_replies(conn, wa_id, msg_id, result)
         record_outcome(conn, msg_id, text, result)
         write_activity(conn, wa_id, result, now)

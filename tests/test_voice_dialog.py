@@ -172,7 +172,7 @@ class CardEditTests(DialogTestCase):
 class AskingTests(DialogTestCase):
     def test_book_an_appointment_asks_patient_then_day_then_time(self):
         ask = self.say("book an appointment")
-        self.assertEqual((ask.kind, ask.question), ("patient", "Which patient?"))
+        self.assertEqual((ask.kind, ask.question), ("patient", "I couldn't tell who the patient is. Which patient?"))
         ask = self.say("Rakesh Verma")
         self.assertEqual((ask.kind, ask.question), ("date", "Which day?"))
         ask = self.say("tomorrow")
@@ -193,7 +193,7 @@ class AskingTests(DialogTestCase):
 
     def test_hinglish_questions_when_the_language_is_hindi(self):
         ask = self.say("book an appointment", language="hi-IN")
-        self.assertEqual(ask.question, "Kaun sa patient?")
+        self.assertEqual(ask.question, "Mujhe samajh nahi aaya ki patient kaun hai. Kaun sa patient?")
 
     def test_a_new_unregistered_patient_is_accepted_for_a_booking(self):
         self.say("book an appointment")

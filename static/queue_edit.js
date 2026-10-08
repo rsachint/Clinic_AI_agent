@@ -134,9 +134,18 @@ document.addEventListener("DOMContentLoaded", function () {
   if (todayBtn) todayBtn.addEventListener("click", function () { dateInput.value = todayIso; refreshQueue(); });
 
   // --- New appointment ---------------------------------------------------
+  // The phone is needed whenever the booking has no registered patient with a valid number on file
+  // (clinic/booking_phone.py is the rule; the server checks it too).
+  var phoneLabel = document.getElementById("new-appt-phone-label");
+  function patientPhoneOnFile() {
+    var chosen = patientSel.options[patientSel.selectedIndex];
+    var phone = chosen ? chosen.getAttribute("data-phone") : null;
+    return window.BookingPhone ? BookingPhone.valid(phone) : phone;
+  }
   function syncUnregistered() {
     var registered = !!patientSel.value;
     document.querySelectorAll(".new-appt-unreg").forEach(function (el) { el.hidden = registered; });
+    if (phoneLabel) phoneLabel.hidden = registered && !!patientPhoneOnFile();
   }
   patientSel.addEventListener("change", syncUnregistered);
   syncUnregistered();
@@ -156,6 +165,12 @@ document.addEventListener("DOMContentLoaded", function () {
   if (newBranch) newBranch.addEventListener("change", function () { loadSlots(apptTime, apptDate.value, hint, null, branchValue(newBranch)); });
 
   function submitNew(override) {
+    // A new booking needs a phone: typed here, or the registered patient's own on file.
+    if (window.BookingPhone && !patientPhoneOnFile() && !BookingPhone.valid(phoneInput.value)) {
+      showFlash(patientSel.value ? BookingPhone.PATIENT_NO_PHONE : BookingPhone.REQUIRED, false);
+      phoneInput.focus();
+      return Promise.resolve();
+    }
     var body = {
       patient_id: patientSel.value ? parseInt(patientSel.value, 10) : null,
       patient_name: nameInput.value,

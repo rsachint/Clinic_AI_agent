@@ -1,6 +1,6 @@
 from datetime import date, timedelta
 
-from clinic import branches, entity_resolution, scheduling, token_queue
+from clinic import booking_phone, branches, entity_resolution, scheduling, token_queue
 
 # A booking under a name and phone that are already registered reuses that
 # patient instead of registering a second copy (a heard "Kavitha" for a
@@ -71,14 +71,26 @@ def set_followup(conn, slots):
     return "followup", followup_id, {"patient_id": patient_id, "due_date": due_date}
 
 
+def _refuse_slot_followup(conn, followup_id):
+    """A follow-up that holds a booked slot (clinic/followups.py) is changed through
+    its appointment, which keeps the calendar, the patient and the reminders in step.
+    The older date-only follow-ups (no appointment) are unaffected."""
+    row = conn.execute("SELECT appointment_id FROM followups WHERE id = ?", (followup_id,)).fetchone()
+    if row is not None and row["appointment_id"]:
+        raise ValueError("That follow-up has a booked appointment: move or cancel the appointment "
+                         "(Queue tab) and the follow-up follows it.")
+
+
 def cancel_followup(conn, slots):
     followup_id = slots["followup_id"]
+    _refuse_slot_followup(conn, followup_id)
     conn.execute("UPDATE followups SET status = 'cancelled' WHERE id = ?", (followup_id,))
     return "followup", followup_id, {"status": "cancelled"}
 
 
 def reschedule_followup(conn, slots):
     followup_id = slots["followup_id"]
+    _refuse_slot_followup(conn, followup_id)
     new_due_date = slots["new_due_date"]
     conn.execute("UPDATE followups SET due_date = ? WHERE id = ?", (new_due_date, followup_id))
     return "followup", followup_id, {"due_date": new_due_date}
@@ -127,12 +139,22 @@ def book_appointment(conn, slots):
     # automatic WhatsApp path passes `unattended`). With a name only (a walk-in),
     # patient_id stays None and the raw patient_name/patient_phone are kept as
     # display fields.
+    #
+    # Every NEW booking needs a valid phone (clinic/booking_phone.py): the
+    # registered patient's own, or the one given here. Checked first, before
+    # anything is registered or the slot is looked at; rescheduling and
+    # cancelling never come through here.
+    booking_phone.check(conn, slots)
     patient_id = slots.get("patient_id")
     registered_now = False
     if not patient_id and not slots.get("unattended"):
         patient_id, registered_now = _patient_for_new_booking(conn, slots.get("patient_name"), slots.get("patient_phone"))
     patient_name = slots.get("patient_name") if not patient_id else None
     patient_phone = slots.get("patient_phone") if not patient_id else None
+    if patient_id and not booking_phone.patient_phone_on_file(conn, patient_id)[1]:
+        # A registered patient whose own number is unusable: the phone given on this booking is the
+        # one it is made under (kept on the appointment only; patients.phone is never rewritten here).
+        patient_phone = booking_phone.valid_phone(slots.get("patient_phone")) or None
     appt_date = slots["appt_date"]
     start_time = slots["start_time"]
     duration_minutes = slots.get("duration_minutes") or scheduling.SLOT_MINUTES

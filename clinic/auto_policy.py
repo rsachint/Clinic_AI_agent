@@ -16,7 +16,8 @@ Checks, in order
 all intents   automation switched on; staff have not taken over the chat
 book          valid slot on the slot grid; not in the past; within 30
               days; inside the chosen branch's doctor hours; not in a staff block; slot free;
-              fewer than 3 active bookings for this number; a name for an
+              fewer than 3 active bookings for this number; a valid phone number
+              (the sender's, or the registered patient's); a name for an
               unregistered number; daily automation cap not reached
 cancel        the appointment exists, is the SENDER'S OWN (matched by
               patient or phone), is still booked/confirmed, has not been
@@ -29,7 +30,7 @@ reschedule    the same ownership / state checks, then the new slot passes the
 from collections import namedtuple
 from datetime import date, datetime, timedelta
 
-from clinic import branches, patient_activity, scheduling, settings
+from clinic import booking_phone, branches, patient_activity, scheduling, settings
 from clinic.entity_resolution import last10_digits, resolve_patient_by_phone
 from clinic.whatsapp_pipeline import sender_appointments
 
@@ -143,6 +144,12 @@ def evaluate(conn, intent, slots, wa_id, now):
                      if (a["appt_date"], a["start_time"]) >= now_key)
         if active >= MAX_ACTIVE_PER_NUMBER:
             return _no("number_cap", "this number already has {} active bookings".format(MAX_ACTIVE_PER_NUMBER))
+        # A phone number is mandatory for every new booking. The sender's own number is always known
+        # here, so this only fails for a registered patient whose number on file is unusable.
+        no_phone = booking_phone.problem(conn, dict(slots, patient_id=patient_id or slots.get("patient_id"),
+                                                    patient_phone=slots.get("patient_phone") or last10_digits(wa_id or "")))
+        if no_phone:
+            return _no("no_phone", "the patient has no valid phone number")
         if patient_id is None:
             name = (slots.get("patient_name") or "").strip()
             if not name:

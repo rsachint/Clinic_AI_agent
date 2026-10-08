@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from clinic import core, queries, scheduling
+from clinic.booking_phone import PhoneRequiredError
 from clinic.entity_resolution import resolve_patient, resolve_patient_by_phone, resolve_staff
 from clinic.intents import HANDLERS
 
@@ -176,10 +177,10 @@ class AppointmentWorkflowTests(unittest.TestCase):
     def patients(self):
         return [tuple(r) for r in self.conn.execute("SELECT name, phone FROM patients ORDER BY id")]
 
-    def test_a_walk_in_with_a_name_only_keeps_fallback_fields(self):
-        row, _ = self.book_raw(patient_name="Walk-in Ramesh")
-        self.assertIsNone(row["patient_id"])
-        self.assertEqual(row["patient_name"], "Walk-in Ramesh")
+    def test_a_walk_in_with_a_name_only_is_refused_now_that_a_phone_is_required(self):
+        with self.assertRaises(PhoneRequiredError):
+            self.book_raw(patient_name="Walk-in Ramesh")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM appointments").fetchone()[0], 0)
         self.assertEqual(self.patients(), [("Sunita Devi", "9876543210")])
 
     def test_booking_a_new_person_with_name_and_phone_registers_them_as_a_patient(self):
@@ -192,21 +193,28 @@ class AppointmentWorkflowTests(unittest.TestCase):
 
     def test_the_same_person_on_the_same_phone_is_not_registered_twice(self):
         self.book_raw(patient_name="Kavita", patient_phone="9876500301")
-        row, bid = self.book_raw("10:00", patient_name="Kavitha", patient_phone="+91 98765 00301")   # misheard, same phone
+        row, bid = self.book_raw("10:00", patient_name="Kavita", patient_phone="+91 98765 00301")   # same name, same phone
         self.assertEqual(len(self.patients()), 2)
         self.assertEqual(row["patient_id"], self.conn.execute("SELECT id FROM patients WHERE name = 'Kavita'").fetchone()[0])
         audit = self.conn.execute("SELECT payload_json FROM audit_log WHERE proposal_id = ?", (bid,)).fetchone()[0]
         self.assertNotIn("registered_patient_id", json.loads(audit))
+
+    def test_a_different_spelling_on_the_same_phone_is_not_the_same_person_at_this_level(self):
+        # Names are matched exactly. (Spoken commands match the phone first, in pipeline/voice_context;
+        # this is only the approve-time fallback for a raw name + phone, which stays cautious.)
+        self.book_raw(patient_name="Kavita", patient_phone="9876500301")
+        self.book_raw("10:00", patient_name="Kavitha", patient_phone="9876500301")
+        self.assertEqual([p[0] for p in self.patients()], ["Sunita Devi", "Kavita", "Kavitha"])
 
     def test_a_relative_on_a_shared_phone_gets_their_own_record(self):
         self.book_raw(patient_name="Kavita", patient_phone="9876500301")
         self.book_raw("10:00", patient_name="Ravi Kumar", patient_phone="9876500301")
         self.assertEqual([p[0] for p in self.patients()], ["Sunita Devi", "Kavita", "Ravi Kumar"])
 
-    def test_a_phone_that_is_not_ten_digits_does_not_make_a_patient(self):
-        row, _ = self.book_raw(patient_name="Short Number", patient_phone="12345")
-        self.assertIsNone(row["patient_id"])
-        self.assertEqual(row["patient_phone"], "12345")
+    def test_a_phone_that_is_not_ten_digits_is_refused_and_makes_no_patient(self):
+        with self.assertRaises(PhoneRequiredError):
+            self.book_raw(patient_name="Short Number", patient_phone="12345")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM appointments").fetchone()[0], 0)
         self.assertEqual(len(self.patients()), 1)
 
     def test_an_unattended_booking_never_registers_anyone(self):
@@ -326,9 +334,10 @@ class EntityResolutionTests(unittest.TestCase):
         self.assertEqual(candidates[0].label.split(" (")[0], "Sunita Devi")
         self.assertEqual(candidates[0].score, 1.0)
 
-    def test_fuzzy_name_match_ranks_closest_first(self):
+    def test_a_first_name_matches_exactly(self):
         candidates = resolve_patient(self.conn, "Sunita")
-        self.assertEqual(candidates[0].label.split(" (")[0], "Sunita Devi")
+        self.assertEqual([c.label.split(" (")[0] for c in candidates], ["Sunita Devi"])
+        self.assertEqual(candidates[0].score, 1.0)
 
     def test_resolve_staff_empty_when_none_registered(self):
         self.assertEqual(resolve_staff(self.conn, "Ramesh"), [])

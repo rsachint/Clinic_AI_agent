@@ -282,6 +282,81 @@ test("branch and doctor columns show only with several branches; their ids and c
   assert.deepStrictEqual(orderColumns(keys, true), ["id", "appt_date", "branch", "doctor", "notes"]);
 });
 
+// ---- patients_list.js (pure helpers) ----------------------------------------
+require("../static/patients_list.js");
+test("patients count text says how many of how many are shown", () => {
+  assert.strictEqual(window.patientsCountText(10, 27), "(showing 10 of 27)");
+  assert.strictEqual(window.patientsCountText(27, 27), "(showing 27 of 27)");
+});
+test("patients page rows already shown are dropped, order kept", () => {
+  const rows = [{ id: 7 }, { id: 6 }, { id: 5 }, { id: 5 }];
+  assert.deepStrictEqual(window.patientsNewRows(["8", "7"], rows).map((r) => r.id), [6, 5]);
+  assert.deepStrictEqual(window.patientsNewRows([], null), []);
+  assert.deepStrictEqual(window.patientsNewRows([1, 2], [{ id: "2" }, { id: "3" }]).map((r) => r.id), ["3"]);
+});
+
+// ---- save_tick.js (the bare check mark beside a Save button) ----------------
+(function () {
+  function node(tag) {
+    const n = {
+      tag, className: "", textContent: "", children: [], parentNode: null, attrs: {}, listeners: {},
+      setAttribute(k, v) { this.attrs[k] = v; },
+      get nextSibling() { const i = this.parentNode.children.indexOf(this); return this.parentNode.children[i + 1] || null; },
+      insertBefore(child, ref) { child.parentNode = this; const i = ref ? this.children.indexOf(ref) : this.children.length; this.children.splice(i, 0, child); },
+      appendChild(child) { this.insertBefore(child, null); },
+      remove() { if (this.parentNode) { this.parentNode.children.splice(this.parentNode.children.indexOf(this), 1); this.parentNode = null; } },
+      querySelectorAll(sel) {
+        const out = []; const walk = (x) => x.children.forEach((c) => { if (sel === ".save-tick" && c.className === "save-tick") out.push(c); walk(c); });
+        walk(this); return out;
+      },
+      closest() { return null; },
+      addEventListener(type, fn) { (this.listeners[type] = this.listeners[type] || []).push(fn); },
+      removeEventListener(type, fn) { this.listeners[type] = (this.listeners[type] || []).filter((f) => f !== fn); },
+      fire(type) { (this.listeners[type] || []).slice().forEach((fn) => fn()); },
+    };
+    return n;
+  }
+  global.document.createElement = node;
+  const timers = [];
+  const realSetTimeout = global.setTimeout;
+  global.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return timers.length; };
+  global.clearTimeout = () => {};
+  require("../static/save_tick.js");
+  global.setTimeout = realSetTimeout;
+
+  function setup() {
+    const row = node("div"); const save = node("button"); const after = node("span");
+    row.appendChild(save); row.appendChild(after);
+    return { row, save, after };
+  }
+  test("a save puts one bare check mark right after the button", () => {
+    const { row, save, after } = setup();
+    window.SaveTick.show(save);
+    const tick = row.children[1];
+    assert.strictEqual(tick.className, "save-tick");
+    assert.strictEqual(tick.textContent, "\u2713");
+    assert.strictEqual(tick.attrs["aria-label"], "Saved");
+    assert.strictEqual(row.children[2], after);
+  });
+  test("saving again replaces the check mark instead of stacking another", () => {
+    const { row, save } = setup();
+    window.SaveTick.show(save); window.SaveTick.show(save);
+    assert.strictEqual(row.querySelectorAll(".save-tick").length, 1);
+  });
+  test("changing something in the card takes the check mark away", () => {
+    const { row, save } = setup();
+    window.SaveTick.show(save);
+    row.fire("input");
+    assert.strictEqual(row.querySelectorAll(".save-tick").length, 0);
+  });
+  test("a button with no parent gets nothing, and clear removes it", () => {
+    assert.strictEqual(window.SaveTick.show(node("button")), null);
+    const { row, save } = setup();
+    window.SaveTick.show(save); window.SaveTick.clear(row);
+    assert.strictEqual(row.querySelectorAll(".save-tick").length, 0);
+  });
+})();
+
 // ---- branches.js (pure helpers) ---------------------------------------------
 require("../static/branches.js");
 const BR = [{ id: 1, name: "Branch A" }, { id: 2, name: "Branch B" }, { id: 3, name: "Branch C" }];
@@ -371,6 +446,82 @@ test("the closure summary says what happened and what the patients were told", (
   assert.strictEqual(window.closureSummaryLine({ moved: 2, cancelled: 0, failed: 0, left: 0 }, { sent: 1, waiting: 1, recorded: 0, failed: 0 }),
     "2 moved. 1 told on WhatsApp; 1 waiting to be sent (outside WhatsApp's 24-hour window).");
   assert.strictEqual(window.closureSummaryLine({ moved: 0, cancelled: 0, failed: 0, left: 0 }, null), "No appointments were touched.");
+});
+
+// ---- patients_subtabs.js (pure helpers) ---------------------------------------
+require("../static/patients_subtabs.js");
+const SUBTABS = ["patients", "missed", "attendance", "followups"];
+test("a remembered sub-tab is used only if it exists", () => {
+  assert.strictEqual(window.pickSubtab("followups", SUBTABS, "patients"), "followups");
+  assert.strictEqual(window.pickSubtab("missed", SUBTABS, "patients"), "missed");
+  for (const bad of [null, undefined, "", "queue", "Patients", "followups ", 3]) assert.strictEqual(window.pickSubtab(bad, SUBTABS, "patients"), "patients");
+});
+test("arrow keys move between sub-tabs and wrap round", () => {
+  assert.strictEqual(window.subtabNeighbour(SUBTABS, "patients", "ArrowRight"), "missed");
+  assert.strictEqual(window.subtabNeighbour(SUBTABS, "followups", "ArrowRight"), "patients");
+  assert.strictEqual(window.subtabNeighbour(SUBTABS, "patients", "ArrowLeft"), "followups");
+  assert.strictEqual(window.subtabNeighbour(SUBTABS, "missed", "ArrowLeft"), "patients");
+  assert.strictEqual(window.subtabNeighbour(SUBTABS, "missed", "Enter"), null);
+  assert.strictEqual(window.subtabNeighbour(SUBTABS, "nope", "ArrowRight"), null);
+});
+
+// ---- followups.js (pure helpers) ------------------------------------------------
+require("../static/followups.js");
+test("a follow-up day reads like 'Wed 7 Oct' and never slips across a month end", () => {
+  assert.strictEqual(window.fuDayLabel("2026-10-07"), "Wed 7 Oct");
+  assert.strictEqual(window.fuDayLabel("2026-12-31"), "Thu 31 Dec");
+  assert.strictEqual(window.fuDayLabel("2028-02-29"), "Tue 29 Feb");
+  assert.strictEqual(window.fuVisitLabel("2026-10-07", "10:30"), "Wed 7 Oct 10:30");
+  assert.strictEqual(window.fuVisitLabel("2026-10-07", ""), "Wed 7 Oct");
+  assert.strictEqual(window.fuDayLabel("soon"), "soon");
+});
+test("the patient box maps back to a patient id only on an exact match", () => {
+  const options = [{ value: "Sunita Devi · 9876543210", id: "4" }, { value: "Sunita Devi · 9876543299", id: "9" }];
+  assert.strictEqual(window.fuPatientId("Sunita Devi · 9876543299", options), 9);
+  assert.strictEqual(window.fuPatientId("  Sunita Devi · 9876543210 ", options), 4);
+  for (const bad of ["Sunita", "", null, undefined, "sunita devi · 9876543210"]) assert.strictEqual(window.fuPatientId(bad, options), null);
+});
+test("a form row becomes the payload the server expects", () => {
+  assert.deepStrictEqual(window.fuRowPayload({ patientId: 4, date: "2026-10-07", time: "10:30", doctor: "1", branch: "2", diagnosis: "  note  " }),
+    { patient_id: 4, due_date: "2026-10-07", due_time: "10:30", doctor_id: 1, branch_id: 2, diagnosis: "note" });
+  assert.deepStrictEqual(window.fuRowPayload({ patientId: null, date: "", time: "", doctor: "", branch: "", diagnosis: "   " }),
+    { patient_id: null, due_date: "", due_time: "", doctor_id: null, branch_id: null, diagnosis: null });
+});
+test("each reminder state has its own badge", () => {
+  assert.deepStrictEqual(window.fuReminderBadge({ status: "queued" }), { cls: "fu-badge fu-badge-queued", text: "Queued" });
+  assert.strictEqual(window.fuReminderBadge({ status: "blocked" }).text, "Blocked (outside 24h window)");
+  for (const s of ["sent", "failed", "skipped"]) assert.strictEqual(window.fuReminderBadge({ status: s }).cls, "fu-badge fu-badge-" + s);
+});
+test("the apply summary counts booked and failed rows", () => {
+  assert.strictEqual(window.fuApplySummary({ created: 1, failed: 0 }), "1 follow-up booked.");
+  assert.strictEqual(window.fuApplySummary({ created: 3, failed: 2 }), "3 follow-ups booked, 2 could not be booked.");
+  assert.strictEqual(window.fuApplySummary({ created: 0, failed: 1 }), "0 follow-ups booked, 1 could not be booked.");
+});
+test("reminder timing is checked the way the server checks it", () => {
+  const good = { days_before: "2", send_time: "10:00", hours_before: 4, earliest_send: "07:00" };
+  assert.deepStrictEqual(window.fuTimingProblems(good), []);
+  assert.strictEqual(window.fuTimingProblems(Object.assign({}, good, { days_before: "0" })).length, 1);
+  assert.strictEqual(window.fuTimingProblems(Object.assign({}, good, { days_before: "15" })).length, 1);
+  assert.strictEqual(window.fuTimingProblems(Object.assign({}, good, { days_before: "2.5" })).length, 1);
+  assert.strictEqual(window.fuTimingProblems(Object.assign({}, good, { send_time: "04:59" })).length, 1);
+  assert.strictEqual(window.fuTimingProblems(Object.assign({}, good, { send_time: "23:00" })).length, 1);
+  assert.strictEqual(window.fuTimingProblems(Object.assign({}, good, { hours_before: 13 })).length, 1);
+  assert.strictEqual(window.fuTimingProblems(Object.assign({}, good, { earliest_send: "" })).length, 1);
+  assert.strictEqual(window.fuTimingProblems({}).length, 4);
+  assert.deepStrictEqual(window.fuTimingProblems({ days_before: 14, send_time: "22:59", hours_before: 12, earliest_send: "05:00" }), []);
+});
+
+// ---- the planner's "thinking" state ------------------------------------------
+test("the thinking line says what is happening, and a bad event says nothing", () => {
+  const { thinkingNote } = window;
+  assert.strictEqual(thinkingNote({ transcript: "x", stage: "planner" }), "Working out what you meant…");
+  assert.strictEqual(thinkingNote({ transcript: "x" }), "Thinking…");
+  for (const bad of [null, undefined, "planner", 7]) assert.strictEqual(thinkingNote(bad), "");
+  assert.strictEqual(exported.thinkingNote, thinkingNote);
+});
+
+test("the page waits longer than the planner's 12 s limit plus the fallback before giving up", () => {
+  assert.ok(window.THINKING_SAFETY_MS >= 12000 + 15000, window.THINKING_SAFETY_MS);
 });
 
 if (failures.length) {

@@ -255,11 +255,11 @@ document.addEventListener("DOMContentLoaded", function () {
 
   function fillTip(a) {
     tip.innerHTML = "";
-    tip.appendChild(h("strong", null, label(a)));
-    tip.appendChild(h("div", "muted", window.cvDayLabel(a.appt_date) + " · " + a.start_time + "-" + a.end_time));
-    if (a.branch) tip.appendChild(h("div", null, a.branch + (a.doctor ? " · " + a.doctor : "")));
-    if (a.patient_phone) tip.appendChild(h("div", "muted", a.patient_phone));
-    tip.appendChild(h("div", "muted", "Status: " + a.status.replace("_", " ")));
+    // The lines are static/appt_details.js, shared with the Cancel / Reschedule review card.
+    window.ApptDetails.lines(a).forEach(function (line) {
+      tip.appendChild(line.kind === "name" ? h("strong", null, line.text)
+        : h("div", line.kind === "place" ? null : "muted", line.text));
+    });
     tip.appendChild(h("div", "cv-tip-hint", "Click to open in Queue"));
   }
 
