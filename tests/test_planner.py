@@ -327,8 +327,11 @@ class RejectedCalls(PlannerCase):
         self.assertFellBack()
 
     def test_missing_required_argument(self):
-        self.call("book_appointment", patient_name="Rakesh Verma", date=self.tomorrow.isoformat())
+        # A fee is something the app has no question for, so a visit without one is still thrown away. (A booking
+        # without its time is NOT rejected any more: the app asks "What time?"; tests/test_planner_missing_and_prose.py.)
+        self.call("record_visit", patient_name="Rakesh Verma")
         self.assertFellBack()
+        self.assertIn("missing_required", self.log_rows()[-1]["override_notes"])
 
     def test_a_branch_that_does_not_exist(self):
         self.call("switch_branch", branch="Q")

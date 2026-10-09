@@ -38,6 +38,10 @@ from datetime import date, datetime, timedelta
 from clinic import branches
 
 MAX_ROWS = 200
+# "Next available": how far ahead the free-slot read looks and how many slots it returns (clinic/next_available.py).
+DEFAULT_SEARCH_DAYS = 14
+MAX_SEARCH_DAYS = 30
+MAX_SLOTS = 20
 
 ENTITIES = ("patients", "appointments", "availability", "followups", "cashbook",
             "staff", "attendance", "branches", "doctors", "schedules", "visits", "expenses",
@@ -594,7 +598,9 @@ _TABLES = {
 # What each entity can show / be filtered by, for the planner prompt and tests.
 FIELDS = {name: tuple(table["fields"]) for name, table in _TABLES.items()}
 ENTITY_FILTERS = {name: table["filters"] for name, table in _TABLES.items()}
-ENTITY_FILTERS["availability"] = ("date", "branch")
+# availability is not a table: clinic/next_available.py reads it. `date` is the day (or where a forward search starts),
+# `date_to` ends a forward search, `doctor` limits it to that doctor's schedule.
+ENTITY_FILTERS["availability"] = ("date", "date_to", "branch", "doctor")
 FIELDS["availability"] = ()
 ENTITY_MEASURES = {name: tuple(table.get("measures", {})) for name, table in _TABLES.items()}
 ENTITY_GROUPS = {name: tuple(table.get("groups", {})) for name, table in _TABLES.items()}
@@ -706,7 +712,7 @@ def validate_spec(spec):
     never ignored."""
     if not isinstance(spec, dict):
         raise QueryError("a query spec is an object")
-    allowed_keys = {"entity", "aggregate", "fields", "limit", "order", "measure", "group_by"} | set(FILTERS)
+    allowed_keys = {"entity", "aggregate", "fields", "limit", "order", "measure", "group_by", "next"} | set(FILTERS)
     extra = sorted(str(k) for k in spec if k not in allowed_keys and spec[k] not in (None, ""))
     if extra:
         raise NotListed("unknown query key: {}".format(", ".join(extra)))
@@ -806,9 +812,15 @@ def validate_spec(spec):
 
     order = spec.get("order")
     if order not in (None, ""):
-        normalised = _normalise_order(entity, order, bool(out.get("group_by")))
-        if normalised:
-            out["order"] = normalised
+        if entity == "availability":
+            word = str(order).strip().lower()
+            if _ORDER_SYNONYMS.get(word, word) != "oldest" and word not in ("soonest", "next"):
+                raise QueryError("free slots can only be asked for earliest first")
+            out["next"] = True
+        else:
+            normalised = _normalise_order(entity, order, bool(out.get("group_by")))
+            if normalised:
+                out["order"] = normalised
 
     fields = spec.get("fields")
     if fields not in (None, "", []):
@@ -825,7 +837,26 @@ def validate_spec(spec):
             out["fields"] = chosen
     if spec.get("limit") not in (None, ""):
         out["limit"] = _whole(spec["limit"], "limit", 1, MAX_ROWS)
+    if _flag(spec.get("next")):
+        if entity != "availability":
+            raise QueryError("{} cannot be searched forward for the next free one".format(entity))
+        out["next"] = True
+    if entity == "availability":
+        # A forward search is asked for by `next`, by a number of slots, or by an end date; one date alone is the
+        # old one-day read. Slots are capped; the window (date .. date_to) is capped by clinic/next_available.py.
+        if "limit" in out:
+            out["limit"] = min(out["limit"], MAX_SLOTS)
+            out["next"] = True
+        if "date_to" in out:
+            out["next"] = True
     return out
+
+
+def _flag(value):
+    """True for a yes in any of the ways a model writes it (true, "true", "yes", 1); False for no / empty."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "y", "1")
+    return bool(value) and value is not None
 
 
 def _like_value(text):

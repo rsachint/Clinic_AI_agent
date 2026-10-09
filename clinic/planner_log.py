@@ -26,26 +26,30 @@ OUTCOMES = ("approved", "rejected", "edited")
 
 
 def record(conn, source, transcript, previous_turn, tool, args, route, final_intent, latency_ms, notes,
-           backend=None, tokens_in=None, tokens_out=None, cost_paise=0, route_detail=None):
+           backend=None, tokens_in=None, tokens_out=None, cost_paise=0, route_detail=None, state_card=None):
     """Write one row and return its id, or None when logging is off or fails. `backend` is 'local' or
     'sarvam'; tokens and cost (whole paise, from Sarvam's published prices) are set only for a hosted
     call that answered -- a failed or rate-limited call is not billed and has no tokens.
     `route_detail` (free text, NULL for a planner-routed command) says which precise rule decided a
     'rules' row: "rule:move", "rule:context", "rule:count", "rule:branch", "rule:closure", "rule:keywords",
     "rule:other"; "+name_fill" is appended when the small hosted name read ran (the route_taken CHECK
-    constraint of existing databases cannot take new values, so the detail lives in its own column)."""
+    constraint of existing databases cannot take new values, so the detail lives in its own column).
+    `state_card` is written only in model-first mode (clinic/architecture.py): the card sent with the command.
+    Without one the INSERT is exactly the one it always was."""
     if conn is None or route not in ROUTES or source not in SOURCES:
         return None
     try:
         if not settings.planner_log_enabled(conn):
             return None
-        cur = conn.execute(
-            "INSERT INTO planner_log (source, transcript, previous_turn, planner_tool, planner_args_json, route_taken, "
-            "final_intent, latency_ms, override_notes, backend, tokens_in, tokens_out, cost_paise, route_detail) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (source, transcript, previous_turn, tool, json.dumps(args, ensure_ascii=False) if args is not None else None,
-             route, final_intent, None if latency_ms is None else int(latency_ms),
-             "; ".join(notes) if notes else None, backend, tokens_in, tokens_out, int(cost_paise or 0), route_detail))
+        columns = ("source, transcript, previous_turn, planner_tool, planner_args_json, route_taken, final_intent, "
+                   "latency_ms, override_notes, backend, tokens_in, tokens_out, cost_paise, route_detail")
+        values = [source, transcript, previous_turn, tool, json.dumps(args, ensure_ascii=False) if args is not None else None,
+                  route, final_intent, None if latency_ms is None else int(latency_ms),
+                  "; ".join(notes) if notes else None, backend, tokens_in, tokens_out, int(cost_paise or 0), route_detail]
+        if state_card is not None:
+            columns += ", state_card"
+            values.append(state_card)
+        cur = conn.execute("INSERT INTO planner_log ({}) VALUES ({})".format(columns, ", ".join("?" * len(values))), values)
         conn.commit()
         return cur.lastrowid
     except sqlite3.Error:

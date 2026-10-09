@@ -17,8 +17,23 @@ from datetime import date, timedelta
 # "din baad").
 
 
+# Speech recognition writes "11 p.m.", "11 P.M", "11p.m.", "11 p m" as often as "11 pm". Every reader below
+# works on the plain "am" / "pm" spelling, so the dotted and spaced forms are rewritten to it first. A dot is
+# required after the letter for the dotted form, and the spaced form only follows a number, so words such as
+# "a morning" or "I am" are never touched.
+_MERIDIEM_DOTTED = re.compile(r"(?<![a-z])([ap])\s?\.\s?m(?![a-z])\.?")
+_MERIDIEM_SPACED = re.compile(
+    r"(\d|(?<![a-z])(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve))\s*([ap])\s+m(?![a-z])\.?")
+
+
+def normalize_meridiem(text):
+    """`text` (any case) with "a.m." / "P.M" / "p m" / "11p.m." written as "am" / "pm"; lower-cased."""
+    text = _MERIDIEM_DOTTED.sub(lambda m: m.group(1) + "m", text.lower())
+    return _MERIDIEM_SPACED.sub(lambda m: m.group(1) + " " + m.group(2) + "m", text)
+
+
 def _normalize(text):
-    return unicodedata.normalize("NFC", text).lower()
+    return normalize_meridiem(unicodedata.normalize("NFC", text))
 
 
 # ---------------------------------------------------------------------------

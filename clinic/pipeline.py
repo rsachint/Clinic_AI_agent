@@ -1,7 +1,10 @@
+import re
 from collections import namedtuple
 from datetime import date, datetime, timedelta
 
-from clinic import booking_phone, branches, closures, core, entity_resolution, query_tool, scheduling, unanswered, voice_branch, voice_closure
+from clinic import (booking_phone, branches, closures, core, entity_resolution, next_available, query_tool, scheduling, unanswered,
+                    voice_branch, voice_closure)
+from clinic.nlu import extract as nlu_extract
 from clinic.nlu import planner as planner_module
 from clinic.nlu.answer import compose_answer, compose_navigation
 from clinic.nlu.parser import QUEUE_WRITE_INTENTS, UnrecognizedCommand, parse
@@ -28,8 +31,10 @@ class PipelineError(Exception):
 WriteResult = namedtuple("WriteResult", ["proposal_id", "intent", "description"])
 # `scope_caption` is a short muted line the page shows above a table when what was
 # listed is not obvious from the table itself (see the list_appointments branch).
-ReadResult = namedtuple("ReadResult", ["intent", "data", "citation", "answer_text", "scope_caption"],
-                        defaults=(None,))
+# `options`: answer buttons the page shows under the answer ([{"label": ...}]) when the read ends with a question
+# (the booking offer after "next available ... and book it for <name>"); tapping one is the same as saying it.
+ReadResult = namedtuple("ReadResult", ["intent", "data", "citation", "answer_text", "scope_caption", "options"],
+                        defaults=(None, None))
 ParsedResult = namedtuple("ParsedResult", ["intent", "slots", "resolved"])
 # A navigation command (open_calendar): the dashboard switches tab / view and
 # nothing is read or written. `mode` is "week" / "month" / "agenda" or None.
@@ -497,6 +502,144 @@ def _slot_notes(conn, intent, slots):
     return notes
 
 
+# -- "next available" and the booking offer that can follow it ------------------------------------------------
+
+_UNKNOWN_DOCTOR = {
+    "en": "I couldn't find a doctor called {}. {}",
+    "hinglish": "{} naam ke doctor nahi mile. {}",
+    "hi": "{} नाम के डॉक्टर नहीं मिले। {}",
+}
+
+
+def _insert_before_source(answer, suffix):
+    """The answer with `suffix` (a question) ahead of its "Source: ..." tail."""
+    head, sep, source = (answer or "").partition(" Source:")
+    return "{} {}{}{}".format(head, suffix, sep, source)
+
+
+def _ask_doctor(conn, slots, status, found, spoken, text, language_code):
+    """Which doctor? when the spoken doctor matches nobody or several: the candidates (or every doctor) are the
+    options; the answer carries on with the same read. Never a guess."""
+    from clinic.voice_context import question_text
+    doctors = found if status == "several" else branches.list_doctors(conn)
+    if not doctors:
+        raise PipelineError("No doctors are set up yet.")
+    options = [{"label": d["name"], "doctor_name": d["name"]} for d in doctors[:8]]
+    lang = next_available.language_key(text, language_code)
+    question = question_text("doctor", language_code, heard=text)
+    if status == "none":
+        question = _UNKNOWN_DOCTOR[lang].format(re.sub(r"(?i)^\s*(?:dr|doctor|डॉक्टर|डॉ)\.?\s+", "", spoken).strip() or spoken, question)
+    keep = {k: v for k, v in slots.items() if k != "doctor"}
+    return AskResult("check_availability", dict(keep, doctor=spoken), "doctor", question, options)
+
+
+def _slot_label(conn, slot, multi):
+    return {"day": next_available.short_day(slot["date"]), "time": slot["time"],
+            "branch": branches.branch_label(conn, slot["branch_id"]) if multi else None}
+
+
+def _present_slots(conn, found, doctor, ids, days, start, clinical_adapter, language_code, text, context, offer_base):
+    """The "next available" answer: the sentence, a table of days with their times, the citation, and, when the
+    same sentence asked to book ("... and book it for Neha"), ONE follow-up question held open as a pending
+    question. The question only ever leads to a normal booking review card; nothing is written here."""
+    multi = branches.multi_branch(conn)
+    doctor_name = doctor["name"] if doctor else None
+    labels = [_slot_label(conn, s, multi) for s in found]
+    only = {s["branch_id"] for s in found} if found else {branches.resolve(conn, i) for i in ids}
+    branch_name = branches.branch_label(conn, next(iter(only))) if multi and len(only) == 1 else None
+    data = {"slots": labels, "doctor": doctor_name, "days": days}
+    citation = clinical_adapter.citation()
+    answer = compose_answer("next_available", data, citation, language_code, branch=branch_name)
+    options = None
+    if found and offer_base is not None and context is not None:
+        lang = offer_base.get("lang") or next_available.language_key(text, language_code)
+        slot = found[0]
+        booking = dict(offer_base["booking"], appt_date=slot["date"], start_time=slot["time"])
+        if multi:
+            booking["branch_id"] = slot["branch_id"]
+        question = next_available.offer_question(lang, offer_base["name"], slot, doctor_name,
+                                                 labels[0]["branch"] if multi and branch_name is None else None)
+        offer = dict(offer_base, booking=booking, slot=slot, lang=lang, branch_ids=list(ids), days=days, start=start)
+        choices = next_available.OFFER_CHOICES[lang]
+        options = [{"label": choices[0], "choice": "yes"}, {"label": choices[1], "choice": "next"}]
+        context.hold_question("book_appointment", dict(booking, _question=question, _offer=offer), "book_slot", options)
+        answer = _insert_before_source(answer, question)
+        options = [{"label": o["label"]} for o in options]
+    if context is not None and found:
+        context.remember_date(found[0]["date"])
+    rows = next_available.day_rows(conn, found) if found else None
+    return ReadResult("check_availability", rows, citation, answer, None, options)
+
+
+def _next_available(conn, slots, text, clinical_adapter, context, language_code):
+    """check_availability with a doctor and / or a forward search: the first free slot(s) from a day, the doctor's
+    own schedule at that branch, closures, blocks and bookings all honoured (clinic/next_available.py), or one
+    day's free slots for one doctor. The doctor is resolved in code: nobody or several is a question, not a guess."""
+    doctor = None
+    spoken = (slots.get("doctor") or "").strip()
+    if spoken:
+        status, found_doctors = next_available.resolve_doctor(conn, spoken)
+        if status != "one":
+            return _ask_doctor(conn, slots, status, found_doctors, spoken, text, language_code)
+        doctor = found_doctors[0]
+    doctor_id = doctor["id"] if doctor else None
+    now = _local_now()
+    branch_id, every, branch_name = _branch_scope(conn, slots)
+    ids = next_available.branch_ids_for(conn, branch_id, every, doctor_id)
+    start = slots.get("appt_date") or now.date().isoformat()
+    citation = clinical_adapter.citation()
+
+    if doctor and branch_id and not next_available.works_at(conn, doctor_id, branch_id):
+        data = {"slots": [], "doctor": doctor["name"], "days": 0, "not_at_branch": branches.branch_label(conn, branch_id)}
+        return ReadResult("check_availability", None, citation, compose_answer("next_available", data, citation, language_code))
+
+    if not slots.get("next_available"):
+        # one day's free slots, for one doctor
+        rows = []
+        for i in ids:
+            times = scheduling.generate_slots(conn, start, branch_id=branches.resolve(conn, i), only_doctor_id=doctor_id)
+            rows.append((branches.resolve(conn, i), times))
+        if context is not None:
+            context.remember_date(start)
+        if not rows:                       # a doctor who is scheduled at no branch: nothing is free
+            data = {"date": start, "slots": [], "doctor": doctor["name"] if doctor else None}
+            return ReadResult("check_availability", data, citation, compose_answer("check_availability", data, citation, language_code))
+        if len(rows) == 1:
+            data = {"date": start, "slots": rows[0][1], "doctor": doctor["name"] if doctor else None}
+            if branch_name or branches.multi_branch(conn):
+                data["branch"] = branch_name or branches.branch_label(conn, rows[0][0])
+            return ReadResult("check_availability", data, citation,
+                              compose_answer("check_availability", data, citation, language_code, branch=data.get("branch")))
+        data = [{"branch": branches.branch_label(conn, b), "date": start, "free_slots": len(t),
+                 "times": ", ".join(t[:8]) + (" ..." if len(t) > 8 else "")} for b, t in rows]
+        return ReadResult("check_availability", data, citation, compose_answer("check_availability", data, citation, language_code))
+
+    days = next_available.search_window(start, slots.get("end_date"))
+    found = next_available.search(conn, start, now, days, slots.get("limit") or 1, ids, doctor_id)
+    offer_base = None
+    if slots.get("then_book_for") and context is not None:
+        phone = nlu_extract.read_phone_exact(text or "") or nlu_extract.extract_phone(text or "")
+        offer_base = {"name": slots["then_book_for"], "doctor_id": doctor_id,
+                      "lang": next_available.language_key(text, language_code),
+                      "booking": {"patient_name": slots["then_book_for"], "patient_phone": phone, "duration_minutes": None,
+                                  "notes": "Requested: {}".format(doctor["name"]) if doctor else None}}
+    return _present_slots(conn, found, doctor, ids, days, start, clinical_adapter, language_code, text, context, offer_base)
+
+
+def offer_next(conn, offer, context, clinical_adapter, language_code, text):
+    """"Another time" to the booking question: the next free slot after the one offered (same doctor, branches and
+    window), offered the same way; or a note that nothing else is free. Read-only."""
+    doctor = branches.get_doctor(conn, offer["doctor_id"]) if offer.get("doctor_id") else None
+    slot = offer["slot"]
+    found = next_available.search(conn, offer["start"], _local_now(), offer["days"], 1, offer["branch_ids"],
+                                  offer.get("doctor_id"), after=(slot["date"], slot["time"]))
+    if not found:
+        return Note(next_available.no_other_text(offer["lang"], doctor["name"] if doctor else None, offer["days"]))
+    base = {k: offer[k] for k in ("name", "doctor_id", "lang", "booking")}
+    return _present_slots(conn, found, doctor, offer["branch_ids"], offer["days"], offer["start"], clinical_adapter,
+                          language_code, text, context, base)
+
+
 def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, language_code="hi-IN",
                       defer_intents=frozenset(), context=None, skipped=(), fresh=True):
     """Everything after the transcript has become an (intent, slots) pair.
@@ -522,6 +665,11 @@ def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, 
 
     if intent == "close_branch":
         return _close_branch(conn, slots, context, language_code)
+
+    if intent == "check_availability" and fresh:
+        # "next available", "with Dr. Mehta", "... and book it for Neha": read from the words where the planner
+        # left them out (clinic/next_available.py); a value the planner already gave is never overridden
+        slots = next_available.read_sentence(conn, text, slots)
 
     slots = voice_branch.default_branch(conn, intent, slots, context)
 
@@ -732,6 +880,9 @@ def respond_to_intent(conn, intent, slots, text, clinical_adapter, ops_adapter, 
 
     if intent == "query":
         return _generic_query(conn, slots, clinical_adapter, context, language_code)
+
+    if intent == "check_availability" and (slots.get("doctor") or slots.get("next_available")):
+        return _next_available(conn, slots, text, clinical_adapter, context, language_code)
 
     if intent == "check_availability":
         appt_date = slots.get("appt_date") or date.today().isoformat()

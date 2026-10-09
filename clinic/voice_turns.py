@@ -17,12 +17,12 @@ import re
 import uuid
 from datetime import date
 
-from clinic import branches, voice_branch
+from clinic import architecture, branches, next_available, voice_branch
 from clinic.nlu import tools
 from clinic.nlu.classify import classify
 from clinic.nlu.llm_slots import extract_name, staff_command
 from clinic.pipeline import (ClosurePlanResult, NOT_CLASSIFIED, NavigateResult, ParsedResult, PipelineError, ReadResult,
-                             SwitchBranchResult, respond_to_intent, transcript_to_response)
+                             SwitchBranchResult, offer_next, respond_to_intent, transcript_to_response)
 from clinic.unanswered import reply_language
 from clinic.voice_context import (
     AskResult, CardUpdate, Note, PATIENT_INTENTS, answer_time, ambiguous_patients, describe_edits,
@@ -109,13 +109,13 @@ def handle_pick(ctx, conn, index, clinical_adapter, ops_adapter, language="hi-IN
     ctx.turn_call = ctx.turn_command = ctx.planner_log_id = None
     option = pending["options"][index]
     ctx.pending = None
-    slots = dict(pending["slots"])
-    if pending["kind"] == "branch":
-        slots["branch_id"] = option["branch_id"]
-    else:
-        slots["patient_name"] = option["patient_name"]
-        if option.get("patient_id") is not None:
-            slots["patient_id"] = option["patient_id"]     # which of two same-named patients was tapped
+    if pending["kind"] == "book_slot":
+        result = answer_book_slot(ctx, conn, pending, option.get("choice") or "yes", option["label"], clinical_adapter,
+                                  ops_adapter, language, defer_intents)
+        _remember(ctx, result)
+        _remember_turn(ctx, option["label"], result)
+        return option["label"], result
+    slots = _slots_with_option(pending, option)
     result = _continue(ctx, conn, pending["intent"], slots, option["label"], clinical_adapter, ops_adapter,
                        language, defer_intents, pending["skipped"])
     _remember(ctx, result)
@@ -123,10 +123,36 @@ def handle_pick(ctx, conn, index, clinical_adapter, ops_adapter, language="hi-IN
     return option["label"], result
 
 
+def _slots_with_option(pending, option):
+    """The open question's slots with the chosen option merged in (a tap, or the model's choose_option)."""
+    slots = dict(pending["slots"])
+    if pending["kind"] == "branch":
+        slots["branch_id"] = option["branch_id"]
+    elif pending["kind"] == "doctor":
+        slots["doctor"] = option["doctor_name"]
+    else:
+        slots["patient_name"] = option["patient_name"]
+        if option.get("patient_id") is not None:
+            slots["patient_id"] = option["patient_id"]     # which of two same-named patients was tapped
+    return slots
+
+
 # -- routing ---------------------------------------------------------------
 
 
 def _route(ctx, conn, text, clinical_adapter, ops_adapter, language, defer_intents):
+    """Which architecture decides this sentence (clinic/architecture.py), read at every command. Classic is the
+    original rules-first routing below, untouched; model first hands the sentence to clinic/nlu/dialogue.py,
+    which falls back to the classic routing for any turn the planner cannot answer. The model-first modules are
+    imported only inside that branch, so with classic nothing of them is even loaded."""
+    if architecture.is_model_first(conn):
+        from clinic.nlu import dialogue
+        return dialogue.route(ctx, conn, text, clinical_adapter, ops_adapter, language, defer_intents,
+                              classic=_route_classic)
+    return _route_classic(ctx, conn, text, clinical_adapter, ops_adapter, language, defer_intents)
+
+
+def _route_classic(ctx, conn, text, clinical_adapter, ops_adapter, language, defer_intents):
     if ctx.pending:
         if is_never_mind(text):
             ctx.pending = None
@@ -143,9 +169,31 @@ def _route(ctx, conn, text, clinical_adapter, ops_adapter, language, defer_inten
     return transcript_to_response(conn, text, clinical_adapter, ops_adapter, language, defer_intents, context=ctx)
 
 
+def answer_book_slot(ctx, conn, pending, choice, text, clinical_adapter, ops_adapter, language, defer_intents):
+    """The reply to the booking offer ("Book Neha Gupta on Fri 9 Oct at 10:30 with Dr. Mehta?"): yes, another time,
+    or no. YES only builds the normal booking review card for that slot (patient, date, time, branch, doctor note
+    filled; a new patient's phone is still asked for); it never approves anything, nothing is written until a person
+    presses Approve on the card. The question is already closed (ctx.pending is None) when this runs."""
+    ctx.pending = None
+    offer = pending["slots"]["_offer"]
+    if choice == "yes":
+        return _continue(ctx, conn, "book_appointment", next_available.booking_slots(offer), text, clinical_adapter,
+                         ops_adapter, language, defer_intents, set())
+    if choice == "next":
+        return offer_next(conn, offer, ctx, clinical_adapter, language, text)
+    return Note(next_available.DROPPED[offer["lang"]])
+
+
 def _answer_pending(ctx, conn, text, clinical_adapter, ops_adapter, language, defer_intents):
     pending = ctx.pending
     intent, kind = pending["intent"], pending["kind"]
+    if kind == "book_slot":
+        # yes / "ok book it" / another time / no answer the offer BEFORE the keyword rules look at it ("book it"
+        # would otherwise read as a new booking command)
+        choice = next_available.read_answer(text)
+        if choice is not None:
+            ctx.pending = None
+            return answer_book_slot(ctx, conn, pending, choice, text, clinical_adapter, ops_adapter, language, defer_intents)
     # A sentence that clearly is a different command (the keyword rules
     # recognise it) is never swallowed as an "answer". The one exception: a
     # phone number said as "my phone number is ..." reads like a lookup to the
@@ -167,30 +215,10 @@ def _answer_pending(ctx, conn, text, clinical_adapter, ops_adapter, language, de
         name = _heard_name(text)
         if not name:
             return _ask_again(ctx, pending, language)
-        slots.pop("patient_id", None)          # a new name answers "which patient?": an older id must not outvote it
-        if intent in voice_context.APPOINTMENT_INTENTS and clinical_adapter.upcoming_appointments_named(conn, name):
-            # Cancel / reschedule are about an existing booking: the name as
-            # heard goes to the appointment search (it finds registered patients
-            # and walk-ins alike and keeps the best-sounding person), instead
-            # of being swapped for the nearest registered patient.
-            slots["patient_name"] = name
-            ctx.pending = None
-            return _continue(ctx, conn, intent, slots, text, clinical_adapter, ops_adapter, language,
-                             defer_intents, skipped)
-        candidates = clinical_adapter.resolve_patient(conn, name, 4, phone=slots.get("patient_phone"))
-        close = ambiguous_patients(candidates)
-        if close:
-            options = [{"label": c.label, "patient_name": voice_context._display_name(c.label), "patient_id": c.id}
-                       for c in close]
-            ctx.ask(intent, slots, "choose_patient", options, skipped)
-            return AskResult(intent, slots, "choose_patient", question_text("choose_patient", language), options)
-        if len(candidates) == 1:
-            slots["patient_name"] = voice_context._display_name(candidates[0].label)
-            slots["patient_id"] = candidates[0].id          # resolved once: carried from here on
-        elif intent == "book_appointment":
-            slots["patient_name"] = name  # a new, unregistered patient
-        else:
-            return _ask_again(ctx, pending, language, "I couldn't find {}. ".format(name))
+        settled = _answer_patient(ctx, conn, pending, slots, skipped, name, text, clinical_adapter, ops_adapter,
+                                  language, defer_intents)
+        if settled is not None:
+            return settled
     elif kind == "phone":
         number = voice_context.spoken_phone(text)
         if not number:
@@ -201,6 +229,15 @@ def _answer_pending(ctx, conn, text, clinical_adapter, ops_adapter, language, de
         if named is None:
             return _ask_again(ctx, pending, language)
         slots["branch_id"] = named["id"]
+    elif kind == "doctor":
+        picked = pick_option(text, pending["options"]) if pending["options"] else None
+        if picked is not None:
+            slots["doctor"] = pending["options"][picked]["doctor_name"]
+        else:
+            status, found = next_available.resolve_doctor(conn, text)
+            if status != "one":
+                return _ask_again(ctx, pending, language)
+            slots["doctor"] = found[0]["name"]
     elif kind == "choose_patient":
         index = pick_option(text, pending["options"])
         if index is None:
@@ -231,6 +268,39 @@ def _answer_pending(ctx, conn, text, clinical_adapter, ops_adapter, language, de
                      defer_intents, skipped)
 
 
+def _answer_patient(ctx, conn, pending, slots, skipped, name, text, clinical_adapter, ops_adapter, language,
+                    defer_intents):
+    """A patient's name answering "which patient?". Merges it into `slots` and returns None to carry on, or
+    returns the result that settles it here (a continued command, "which one?", or the question again).
+    Shared by the keyword route above and the model's answer_slot / new_patient (clinic/nlu/dialogue.py)."""
+    intent = pending["intent"]
+    slots.pop("patient_id", None)          # a new name answers "which patient?": an older id must not outvote it
+    if intent in voice_context.APPOINTMENT_INTENTS and clinical_adapter.upcoming_appointments_named(conn, name):
+        # Cancel / reschedule are about an existing booking: the name as
+        # heard goes to the appointment search (it finds registered patients
+        # and walk-ins alike and keeps the best-sounding person), instead
+        # of being swapped for the nearest registered patient.
+        slots["patient_name"] = name
+        ctx.pending = None
+        return _continue(ctx, conn, intent, slots, text, clinical_adapter, ops_adapter, language,
+                         defer_intents, skipped)
+    candidates = clinical_adapter.resolve_patient(conn, name, 4, phone=slots.get("patient_phone"))
+    close = ambiguous_patients(candidates)
+    if close:
+        options = [{"label": c.label, "patient_name": voice_context._display_name(c.label), "patient_id": c.id}
+                   for c in close]
+        ctx.ask(intent, slots, "choose_patient", options, skipped)
+        return AskResult(intent, slots, "choose_patient", question_text("choose_patient", language), options)
+    if len(candidates) == 1:
+        slots["patient_name"] = voice_context._display_name(candidates[0].label)
+        slots["patient_id"] = candidates[0].id          # resolved once: carried from here on
+    elif intent == "book_appointment":
+        slots["patient_name"] = name  # a new, unregistered patient
+    else:
+        return _ask_again(ctx, pending, language, "I couldn't find {}. ".format(name))
+    return None
+
+
 def _continue(ctx, conn, intent, slots, text, clinical_adapter, ops_adapter, language, defer_intents, skipped):
     """Carry on with the command once an answer has been merged in. If another
     detail is still missing the assistant asks for it, remembering which ones
@@ -249,7 +319,7 @@ def _ask_again(ctx, pending, language, prefix="", heard=None):
         raise PipelineError("{}I couldn't get that, so I stopped asking. Say the whole command again.".format(prefix))
     ctx.ask(pending["intent"], pending["slots"], pending["kind"], pending["options"], pending["skipped"], tries)
     return AskResult(pending["intent"], pending["slots"], pending["kind"],
-                     prefix + question_text(pending["kind"], language, heard), pending["options"])
+                     prefix + voice_context.pending_question(pending, language, heard), pending["options"])
 
 
 def _heard_name(text):
@@ -282,6 +352,13 @@ def _try_card_edit(ctx, conn, text):
         changes["branch_id"] = branch["id"]
     if not changes:
         return None
+    return apply_card_changes(ctx, conn, card, changes, branch)
+
+
+def apply_card_changes(ctx, conn, card, changes, branch=None):
+    """Put `changes` ({slot: value}) on the open card and say so. A change of WHO the card is about drops the
+    id it carried (an old id never outvotes what was just said), and the remembered patient with it. Shared by
+    the keyword card edit above and the model's correct_card (clinic/nlu/dialogue.py)."""
     dropped = voice_context.drop_stale_identity(conn, card["slots"], changes)
     if dropped is not None and ctx.patient and str(ctx.patient["id"]) == str(dropped):
         ctx.patient = None          # "him" must not mean the person the card was about before the edit
@@ -344,5 +421,5 @@ def _remember(ctx, result):
     elif isinstance(result, Note):
         pass
     else:
-        ctx.pending = None
+        ctx.pending = ctx.take_resume()      # None, except in model-first mode where a read keeps an open question
         ctx.last_intent = getattr(result, "intent", ctx.last_intent)

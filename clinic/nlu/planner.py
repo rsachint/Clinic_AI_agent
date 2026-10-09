@@ -49,7 +49,7 @@ from datetime import date, timedelta
 import httpx
 
 from clinic import branches, planner_log
-from clinic.nlu import date_guard, tools
+from clinic.nlu import date_guard, prose, tools
 from clinic.nlu.intent_llm import llm_enabled
 from clinic.nlu.llm_slots import KEEP_ALIVE, MODEL, OLLAMA_URL, ollama_options, staff_uses_sarvam
 
@@ -59,13 +59,29 @@ PLANNER_MODEL = os.environ.get("PLANNER_MODEL", "").strip() or MODEL
 DEFAULT_TIMEOUT_S = 12.0
 CALENDAR_DAYS = 15
 _OFF = ("0", "off", "false", "no")
+MAX_PROSE_CHARS = 2000      # how much of a plain-words reply a backend keeps in memory (the log keeps far less)
+
+
+# Set only by model-first mode (clinic/nlu/dialogue.py) while it hands a turn the planner could not answer to
+# the classic routing: that routing must not ask the planner a second time. Always False otherwise.
+_suppressed = contextvars.ContextVar("planner_suppressed", default=False)
+
+
+@contextlib.contextmanager
+def suppressed():
+    token = _suppressed.set(True)
+    try:
+        yield
+    finally:
+        _suppressed.reset(token)
 
 
 def planner_enabled():
     """INTENT_PLANNER_ENABLED=0/off/false rolls the app back to the one-word label
     picker with one environment variable. On by default; the test suite switches
     it off. It also needs the local model switch (INTENT_LLM_ENABLED) to be on."""
-    return os.environ.get("INTENT_PLANNER_ENABLED", "1").strip().lower() not in _OFF and llm_enabled()
+    return (os.environ.get("INTENT_PLANNER_ENABLED", "1").strip().lower() not in _OFF and llm_enabled()
+            and not _suppressed.get())
 
 
 def planner_scope():
@@ -96,13 +112,35 @@ ToolCall = namedtuple("ToolCall", ["name", "args"])
 class Backend:
     """`plan(system, user, tools) -> ToolCall | None`. None means the model made no
     tool call; raising means the call failed (timeout, connection). `name` is what the
-    planner log records; `last_usage` (hosted backends) is the latest call's token count."""
+    planner log records; `last_usage` (hosted backends) is the latest call's token count.
+    `last_text` is the words the model said INSTEAD of a tool call on the latest call (None when it
+    called a tool, said nothing, or the backend does not report it): clinic/nlu/prose.py decides what
+    may be done with it. It is only ever text to display or to log."""
 
     name = "local"
     last_usage = None
+    last_text = None
+    last_encoding = None
 
     def plan(self, system, user, tool_schemas):
         raise NotImplementedError
+
+    def plan_with_history(self, system, user, tool_schemas, history):
+        """The next tool call after earlier ones whose results the model should see (clinic/nlu/sql_reads.py,
+        model-reads mode only). `history` is a list of (ToolCall, result text), oldest first. The default encodes
+        the results as plain text after the user's message and calls `plan()`; a backend that speaks the
+        OpenAI-style `tool` role overrides it. `plan()` itself never changes."""
+        self.last_encoding = "user_message"
+        return self.plan(system, user + "\n\n" + history_user_text(history), tool_schemas)
+
+
+def history_user_text(history):
+    """Earlier tool calls and their results as plain text, for a model or API that does not take `tool` messages."""
+    parts = []
+    for call, result in history:
+        parts.append("You called {} with {}.\nQuery result: {}".format(
+            call.name, json.dumps(call.args, ensure_ascii=False, default=str), result))
+    return "\n\n".join(parts)
 
 
 class OllamaBackend(Backend):
@@ -116,6 +154,19 @@ class OllamaBackend(Backend):
         self.timeout = timeout
 
     def plan(self, system, user, tool_schemas):
+        return self._chat([{"role": "system", "content": system}, {"role": "user", "content": user}], tool_schemas)
+
+    def plan_with_history(self, system, user, tool_schemas, history):
+        """Ollama takes the earlier tool calls and their results as assistant `tool_calls` and `tool` messages."""
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        for call, result in history:
+            messages.append({"role": "assistant", "content": "",
+                             "tool_calls": [{"function": {"name": call.name, "arguments": call.args}}]})
+            messages.append({"role": "tool", "content": result, "tool_name": call.name})
+        self.last_encoding = "tool"
+        return self._chat(messages, tool_schemas)
+
+    def _chat(self, messages, tool_schemas):
         response = httpx.post(
             self.url,
             json={
@@ -123,7 +174,7 @@ class OllamaBackend(Backend):
                 # Tools are declared first and the system text is the same from one
                 # call to the next (only the day's calendar changes, once a day), so
                 # Ollama can reuse the prompt it already evaluated.
-                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                "messages": messages,
                 "tools": tool_schemas,
                 "stream": False,
                 "think": False,
@@ -133,8 +184,12 @@ class OllamaBackend(Backend):
             timeout=self.timeout or planner_timeout(),
         )
         response.raise_for_status()
-        calls = (response.json().get("message") or {}).get("tool_calls") or []
+        message = response.json().get("message") or {}
+        calls = message.get("tool_calls") or []
+        self.last_text = None
         if not calls:
+            content = message.get("content")
+            self.last_text = content[:MAX_PROSE_CHARS] if isinstance(content, str) and content.strip() else None
             return None
         if len(calls) > 1:
             _logger.info("Planner returned %d tool calls; using only the first", len(calls))
@@ -153,7 +208,8 @@ class FakeBackend(Backend):
     tuple (always that); a list (one entry per call, in order; an Exception entry
     is raised, None means no tool call); a dict {substring of the user message:
     call}; or a callable (system, user, tools) -> call. Every call is recorded in
-    `calls` as (system, user, tools)."""
+    `calls` as (system, user, tools). A `str` answer is a plain-words reply with no tool call: the call
+    returns None and the text is in `last_text`."""
 
     name = "fake"
 
@@ -161,9 +217,18 @@ class FakeBackend(Backend):
         self.script = script
         self.delay = delay
         self.calls = []
+        self.histories = []          # the `history` of every plan_with_history() call, in order
+
+    def plan_with_history(self, system, user, tool_schemas, history):
+        """A call that follows earlier ones (model-reads mode): recorded in `histories`, answered from the same
+        script as plan() (a list script gives its next entry), and `calls` records it as usual."""
+        self.histories.append(list(history))
+        self.last_encoding = "tool"
+        return self.plan(system, user, tool_schemas)
 
     def plan(self, system, user, tool_schemas):
         self.calls.append((system, user, tool_schemas))
+        self.last_text = None
         if self.delay:
             time.sleep(self.delay)
         script = self.script
@@ -177,6 +242,9 @@ class FakeBackend(Backend):
             answer = script
         if isinstance(answer, BaseException):
             raise answer
+        if isinstance(answer, str):
+            self.last_text = answer
+            return None
         if isinstance(answer, tuple) and not isinstance(answer, ToolCall):
             answer = ToolCall(*answer)
         return answer
@@ -240,6 +308,7 @@ _RULES = (
     "appointment time slot. A 'Previous turn' line, when present, is context for short follow-ups ('the names as "
     "well', 'and the day after?', 'cancel it', 'make it two days'): resolve them against it.\n"
     "query: 'how much'=sum, 'per X'=group_by, 'biggest'=order highest, 'last N'=order newest+limit N. "
+    "'next available / earliest / first free' = availability with next=true (doctor, limit); 'find it and book it for X' is that one query. "
     "Data no record type has: unsupported with wanted.\n"
 )
 
@@ -414,9 +483,7 @@ class PlannerRun:
         finally:
             self.usage = getattr(backend, "last_usage", None)
         if call is None:
-            self.error = "no tool call"
-            self.notes.append("planner made no tool call")
-            return None
+            return self.no_tool_call(backend)
         self.tool, self.args = call.name, call.args
         ctx = tools.ToolContext(self.conn, self.today, self.text)
         try:
@@ -439,6 +506,31 @@ class PlannerRun:
         self.notes.extend(overrides)
         _logger.info("Planner chose %s for transcript=%r (%s)", tools.describe_call(call.name, args), self.text, intent)
         return Planned(intent, slots, call.name, args, list(overrides))
+
+    def no_tool_call(self, backend):
+        """The model answered in plain words, or not at all. Its words (scrubbed, capped) go to the log row. A short
+        plain question (clinic/nlu/prose.py `as_question`) becomes the `clarify` tool: the assistant shows it as its own
+        question and the user's next sentence is planned with it as the previous turn, exactly as for a clarify call;
+        no second model call is made. Words that claim an action, run long, look like code or a link, or send the user
+        elsewhere are not shown (Planned is None and the caller falls back as before). The words are never executed
+        and never read for slot values. Returns the Planned `clarify`, or None."""
+        said = getattr(backend, "last_text", None)
+        if not isinstance(said, str) or not said.strip():
+            self.error = "no tool call"
+            self.notes.append("planner made no tool call")
+            return None
+        secrets = (os.environ.get("SARVAM_API_KEY", "").strip(),)
+        logged = prose.scrub(said, secrets)
+        question = prose.as_question(said, secrets)
+        if question is None:
+            self.error = "no tool call"
+            self.notes.append("planner made no tool call")
+            self.notes.append("prose reply (not shown): {}".format(logged))
+            return None
+        self.tool, self.args = "clarify", {"question": question}
+        self.notes.append("prose reply used as the question: {}".format(logged))
+        _logger.info("Planner answered in words; shown as a question for transcript=%r", self.text)
+        return Planned("clarify", {"question": question}, "clarify", dict(self.args), [])
 
     def note_route(self, route):
         self.route = route

@@ -47,18 +47,53 @@ def _check_availability_text(data, lang):
         return "Free slots on {} - {}.".format(date_str, "; ".join(parts))
     date_str = data["date"]
     slots = data["slots"]
+    doctor = data.get("doctor")            # one doctor's free slots only ("free slots tomorrow with Dr. Rao")
+    with_doctor = (" {} ke saath".format(doctor) if lang == "hi-IN" else " with {}".format(doctor)) if doctor else ""
     if not slots:
-        return ("{} ko koi slot khaali nahi hai.".format(date_str) if lang == "hi-IN"
-                else "No slots are free on {}.".format(date_str))
+        return ("{} ko{} koi slot khaali nahi hai.".format(date_str, with_doctor) if lang == "hi-IN"
+                else "No slots are free on {}{}.".format(date_str, with_doctor))
     count = len(slots)
     if count <= _MAX_NAMES_SPOKEN:
         times = ", ".join(slots)
         if lang == "hi-IN":
-            return "{} ko {} slot khaali hain: {}.".format(date_str, count, times)
-        return "{} free slot(s) on {}: {}.".format(count, date_str, times)
+            return "{} ko{} {} slot khaali hain: {}.".format(date_str, with_doctor, count, times)
+        return "{} free slot(s) on {}{}: {}.".format(count, date_str, with_doctor, times)
     if lang == "hi-IN":
-        return "{} ko {} slot khaali hain.".format(date_str, count)
-    return "{} free slots on {}.".format(count, date_str)
+        return "{} ko{} {} slot khaali hain.".format(date_str, with_doctor, count)
+    return "{} free slots on {}{}.".format(count, date_str, with_doctor)
+
+
+def _next_available_text(data, lang):
+    """"Next available with Dr. Mehta: Fri 9 Oct, 16:00." One slot reads with a comma, several are grouped by day
+    ("Fri 9 Oct 16:00, 16:30; Sat 10 Oct 09:00"). Nothing free says how far it looked; a doctor who is not at the
+    branch asked about says so. Day labels and the doctor's name are prepared by the caller."""
+    doctor = data.get("doctor")
+    hindi = lang == "hi-IN"
+    with_doctor = (" {} ke saath".format(doctor) if hindi else " with {}".format(doctor)) if doctor else ""
+    if data.get("not_at_branch"):
+        return ("{} {} par nahi baithte hain.".format(doctor, data["not_at_branch"]) if hindi
+                else "{} does not work at {}.".format(doctor, data["not_at_branch"]))
+    slots = data["slots"]
+    if not slots:
+        if hindi:
+            return "Agle {} din mein{} koi slot khaali nahi hai.".format(data["days"], with_doctor)
+        return "No free slot{} in the next {} days.".format(with_doctor, data["days"])
+    show_branch = len({s.get("branch") for s in slots}) > 1       # slots at more than one branch: say which
+    groups = []
+    for slot in slots:
+        key = (slot["day"], slot.get("branch") if show_branch else None)
+        if groups and groups[-1][0] == key:
+            groups[-1][1].append(slot["time"])
+        else:
+            groups.append((key, [slot["time"]]))
+    if len(slots) == 1:
+        (day, branch), times = groups[0]
+        when = "{}, {}{}".format(day, times[0], " at {}".format(branch) if branch else "")
+    else:
+        when = "; ".join("{} {}{}".format(day, ", ".join(times), " at {}".format(branch) if branch else "")
+                         for (day, branch), times in groups)
+    lead = ("Agla khaali slot" if len(slots) == 1 else "Agle khaali slot") if hindi else "Next available"
+    return "{}{}: {}.".format(lead, with_doctor, when)
 
 
 def _patient_count_text(data, lang):
@@ -141,6 +176,7 @@ _COMPOSERS = {
     "patient_lookup": _patient_lookup_text,
     "patient_count": _patient_count_text,
     "check_availability": _check_availability_text,
+    "next_available": _next_available_text,
     "list_appointments": _list_appointments_text,
     "next_appointment": _next_appointment_text,
 }

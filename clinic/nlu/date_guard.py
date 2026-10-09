@@ -98,7 +98,7 @@ _TIME_PATTERNS = (dx._TIME_COLON, dx._TIME_AMPM_NO_COLON, dx._TIME_BAJE, dx._TIM
 
 
 def time_phrase_count(text):
-    normalized = _norm(text)
+    normalized = dx.normalize_meridiem(_norm(text))
     spans = sorted(m.span() for pattern in _TIME_PATTERNS for m in pattern.finditer(normalized))
     count, last_end = 0, -1
     for start, end in spans:
@@ -252,7 +252,7 @@ def crosscheck(tool, args, text, today=None):
     if tool == "query" and not phrases:
         offset = month_phrase(text)
         allowed = query_tool.ENTITY_FILTERS.get(args.get("entity"), ())
-        if offset is not None and "date" in allowed and "date_to" in allowed:
+        if offset is not None and "date" in allowed and "date_to" in allowed and args.get("entity") != "availability":
             first, last = month_range(offset, today)
             if args.get("date") != first or args.get("date_to") != last:
                 notes.append("date {} -> {}, date_to {} -> {} (a month phrase in the transcript)".format(

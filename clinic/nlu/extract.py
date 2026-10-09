@@ -1,4 +1,5 @@
 import re
+import unicodedata
 
 from clinic.nlu.hindi_numbers import words_to_number
 
@@ -12,13 +13,121 @@ _DIGIT_RUN = re.compile(r"[\d](?:[\d ]{6,}[\d])?")
 def extract_phone(text):
     """Longest run of 8-10 digits, spaces stripped. May be short (ASR drops
     digits on long sequences) -- the proposal screen must show it for the
-    human to correct, never write it straight through."""
+    human to correct, never write it straight through. A complete 10-digit number
+    is also read when it is said in words ("nine eight seven ...") or with a
+    +91 / 0 prefix (read_phone_exact); that exact reading wins over a short run."""
     best = None
     for match in _DIGIT_RUN.finditer(text):
         digits = match.group().replace(" ", "")
         if 8 <= len(digits) <= 10 and (best is None or len(digits) > len(best)):
             best = digits
-    return best
+    if best is not None and len(best) == 10:
+        return best
+    return read_phone_exact(text) or best
+
+
+# Digits said one by one, the way phone numbers are read out (English, Hinglish, Devanagari).
+_DIGIT_WORDS = {
+    "zero": 0, "oh": 0, "shunya": 0, "sunya": 0, "शून्य": 0, "ज़ीरो": 0, "जीरो": 0,
+    "one": 1, "ek": 1, "एक": 1,
+    "two": 2, "do": 2, "दो": 2,
+    "three": 3, "teen": 3, "तीन": 3,
+    "four": 4, "char": 4, "chaar": 4, "चार": 4,
+    "five": 5, "paanch": 5, "panch": 5, "pach": 5, "पांच": 5, "पाँच": 5,
+    "six": 6, "chhe": 6, "chhah": 6, "che": 6, "cheh": 6, "छह": 6, "छः": 6, "छे": 6,
+    "seven": 7, "saat": 7, "sat": 7, "सात": 7,
+    "eight": 8, "aath": 8, "ath": 8, "आठ": 8,
+    "nine": 9, "nau": 9, "nao": 9, "नौ": 9,
+}
+_REPEATS = {"double": 2, "dubal": 2, "डबल": 2, "triple": 3, "ट्रिपल": 3}
+_PHONE_TOKEN = re.compile(r"[\w\u0900-\u097F+]+")
+
+
+def _ten_digits(number):
+    """The 10 digits of `number` (as read out: 10 digits, or 11 with a leading 0, or 12 with a leading 91),
+    or None. Fewer or more is not a phone number: it is never guessed at."""
+    if len(number) == 10 or (len(number) == 11 and number[0] == "0") or (len(number) == 12 and number[:2] == "91"):
+        return number[-10:]
+    return None
+
+
+def spoken_phone(text):
+    """The 10-digit phone number in an answer like "98765 00301", "+91 9876500301", "९८७६५००३०१" or digits read
+    out one by one ("nine eight seven six ..."), or None when there is no such number. Fewer or more than
+    10 digits (after a +91 / 0 prefix) is not a phone number: speech recognition drops digits on long
+    sequences, so a short run is asked again rather than guessed at.
+    This is the reader for the ANSWER to "What is the patient's phone number?": every digit in the answer
+    counts, whatever else is said around it. For a whole command see phone_in_words."""
+    digits, repeat = [], 1
+    for token in _PHONE_TOKEN.findall(unicodedata.normalize("NFC", text or "").lower()):
+        if token in _REPEATS:
+            repeat = _REPEATS[token]
+            continue
+        if token in _DIGIT_WORDS:
+            digits.extend([str(_DIGIT_WORDS[token])] * repeat)
+        else:
+            # a run of digits (any script's); anything else said around it is ignored
+            digits.extend(str(unicodedata.digit(ch)) for ch in token if unicodedata.category(ch) == "Nd")
+        repeat = 1
+    return _ten_digits("".join(digits))
+
+
+def _digit_runs(text):
+    """The digits of each unbroken run of digit words / digit tokens in `text` ("nine eight 7 6 double five"),
+    as strings. A run is broken by any other word, so the hour in "at five pm" or the day in "15 October"
+    is never joined to a number said elsewhere in the sentence. "double"/"triple" repeat the next single
+    digit; a "plus" opening a run (+91) is skipped."""
+    runs, digits, repeat = [], [], 1
+
+    def close():
+        if digits:
+            runs.append("".join(digits))
+        digits.clear()
+
+    for token in _PHONE_TOKEN.findall(unicodedata.normalize("NFC", text or "").lower()):
+        if token == "plus" and not digits:
+            repeat = 1
+            continue
+        if token in _REPEATS:
+            if repeat != 1:
+                close()
+            repeat = _REPEATS[token]
+            continue
+        if token in _DIGIT_WORDS:
+            digits.extend([str(_DIGIT_WORDS[token])] * repeat)
+        else:
+            number = token.lstrip("+")
+            if number and all(unicodedata.category(ch) == "Nd" for ch in number):
+                converted = [str(unicodedata.digit(ch)) for ch in number]
+                if repeat != 1 and len(converted) != 1:
+                    close()                         # "double 98765": not a repeat
+                else:
+                    digits.extend(converted * repeat)
+            else:
+                close()
+        repeat = 1
+    close()
+    return runs
+
+
+def phone_in_words(text):
+    """A complete phone number said inside a command, digits one by one in English, Hinglish or Devanagari
+    ("nine eight seven six five four three two one zero", "double nine ...", "plus nine one ..."), or None.
+    Exactly 10 digits (after a +91 / 0 prefix) in ONE unbroken run, else None: a short run such as the
+    "five" of "five pm" is ignored and nothing is ever guessed from fewer or more digits. When two
+    different numbers are said, None."""
+    found = {_ten_digits(run) for run in _digit_runs(text)} - {None}
+    return found.pop() if len(found) == 1 else None
+
+
+def read_phone_exact(text):
+    """The one complete 10-digit phone number in `text` (digits, a +91 / 0 prefix, or said in words), or
+    None. The deterministic reading a model's phone never outranks."""
+    runs = {m.group().replace(" ", "") for m in _DIGIT_RUN.finditer(text or "")}
+    exact = {r for r in runs if len(r) == 10}
+    if len(exact) > 1:
+        return None
+    return exact.pop() if exact else phone_in_words(text)
 
 
 # "34 साल" / "40 years" -- number before the unit word. A negative lookbehind

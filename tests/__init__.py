@@ -20,3 +20,10 @@ os.environ["INTENT_PLANNER_ENABLED"] = "0"
 # And the hosted planner (clinic/nlu/sarvam.py): a developer's .env may select it, and no test may reach Sarvam.
 # The tests of the backend itself use a fake HTTP transport and set what they need.
 os.environ["PLANNER_BACKEND"] = "local"
+# The idle internet check (clinic/network_health.py) opens real TCP connections; no test may. The tests of the
+# check itself inject fake targets and a fake connect.
+os.environ["NETWORK_PROBE_ENABLED"] = "0"
+# The built-in default of the command-understanding switch is the model-first mode with model-written reads
+# (clinic/architecture.py). The suite keeps testing the classic routing unless a test sets its own mode; the tests of
+# the switch itself remove this variable to check the real default.
+os.environ["INTENT_ARCHITECTURE"] = "classic"

@@ -111,6 +111,11 @@ def reset_known_names(token):
     _known_names.reset(token)
 
 
+def current_known_names():
+    """The registered names parse() made available for the command being read (empty outside parse())."""
+    return _known_names.get()
+
+
 # Words that may stand right next to a ONE-word registered name without being part of another name
 # (English, Hindi, Hinglish; Devanagari spelled out). Anything else next to it -- "Manju Sharma", "Sharma
 # Manju" -- might be a different, new person who only shares the first word, so the name is not taken.

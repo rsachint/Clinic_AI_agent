@@ -168,14 +168,17 @@ def is_slot_free(conn, appt_date, start_time, duration_minutes, exclude_appointm
     return True
 
 
-def generate_slots(conn, appt_date, include_blocked=False, branch_id=None):
+def generate_slots(conn, appt_date, include_blocked=False, branch_id=None, only_doctor_id=None):
     """All bookable slot start-times at a branch on `appt_date` (inside a
     doctor's window) that don't overlap an existing booked/confirmed
     appointment there (and aren't inside a booking block, unless
-    include_blocked), in chronological order."""
+    include_blocked), in chronological order. `only_doctor_id` keeps just the
+    windows that doctor is scheduled for (the "next free slot with Dr. X" read)."""
     booked = _booked_intervals(conn, appt_date, None, branch_id)
     free = set()
     for w_start, w_end, doctor_id in _windows(conn, appt_date, branch_id):
+        if only_doctor_id is not None and doctor_id != only_doctor_id:
+            continue
         blocked = [] if include_blocked else [(a, b) for a, b, _ in blocked_ranges(conn, appt_date, branch_id, doctor_id)]
         t = w_start
         while t + SLOT_MINUTES <= w_end:

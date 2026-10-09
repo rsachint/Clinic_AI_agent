@@ -29,7 +29,7 @@ import unicodedata
 from collections import namedtuple
 
 from clinic import booking_phone, branches, entity_resolution
-from clinic.nlu import datetime_extract, extract
+from clinic.nlu import datetime_extract, extract, llm_slots
 
 IDLE_SECONDS = 600  # 10 minutes
 
@@ -83,6 +83,8 @@ class VoiceContext:
         self.open_card = None      # {"card_id", "intent", "slots"}
         self.pending = None        # the question being asked, see ask()
         self.last_turn = None      # {"text", "call", "result"}: the previous turn, see remember_turn()
+        self.turns = []            # the last few turns, newest last (read by the model-first state card only)
+        self.resume_pending = None # model-first: a question a read interrupted, kept alive (see take_resume())
         # Set while one turn is being handled and read when it ends (voice_turns._remember):
         self.turn_call = None      # the planner's tool call this turn, when it made one
         self.turn_command = None   # (intent, slots) this turn ran as
@@ -153,11 +155,26 @@ class VoiceContext:
 
     def remember_turn(self, text, call, result):
         self.last_turn = {"text": text, "call": call, "result": result}
+        self.turns = (self.turns + [self.last_turn])[-3:]
+
+    def take_resume(self):
+        """The question a read paused (model-first mode only), handed back once; None otherwise."""
+        pending, self.resume_pending = self.resume_pending, None
+        return pending
 
     def ask(self, intent, slots, kind, options=None, skipped=(), tries=0):
         self.pending = {
             "intent": intent, "slots": dict(slots), "kind": kind,
             "options": list(options or []), "skipped": set(skipped), "tries": tries,
+        }
+
+    def hold_question(self, intent, slots, kind, options=None):
+        """A question that goes with a READ answer ("Book Neha on Fri 9 Oct at 10:30?" after "next available"):
+        the read's turn ends by clearing the pending question, so it is handed back once the turn is remembered
+        (see take_resume()). Nothing is asked of the person until then; nothing is written."""
+        self.resume_pending = {
+            "intent": intent, "slots": dict(slots), "kind": kind,
+            "options": list(options or []), "skipped": set(), "tries": 0,
         }
 
     # -- what the page and the model are told -----------------------------
@@ -239,6 +256,70 @@ def has_patient_reference(text):
     return bool(_PATIENT_REFERENCE.search(_norm(text)))
 
 
+# "her mobile number is ...", "uska number", "his phone": a pronoun that only owns a detail being given is not a
+# reference back to the patient discussed ("book her tomorrow" is). Whole attribute phrases only.
+_POSSESSIVE = ("her", "his", "their", "uska", "uski", "unka", "unki", "inka", "inki",
+               "उसका", "उसकी", "उनका", "उनकी", "इनका", "इनकी")
+_ATTRIBUTE = ("mobile", "phone", "cell", "contact", "whatsapp", "number", "num", "no", "new", "own", "correct",
+              "age", "address", "email", "umar", "नंबर", "नम्बर", "फोन", "मोबाइल", "नया", "नई", "उम्र", "पता")
+_POSSESSIVE_ATTRIBUTE = re.compile(
+    _EDGE_L + "(?:" + "|".join(re.escape(unicodedata.normalize("NFC", w)) for w in _POSSESSIVE) + r")\s+"
+    "(?:" + "|".join(re.escape(unicodedata.normalize("NFC", w)) for w in sorted(_ATTRIBUTE, key=len, reverse=True))
+    + r")(?:\.?\s+(?:" + "|".join(re.escape(unicodedata.normalize("NFC", w)) for w in _ATTRIBUTE) + "))*" + _EDGE_R,
+    re.IGNORECASE)
+
+
+def has_anaphoric_reference(text):
+    """True when the sentence points back at the patient just discussed ("book him", "cancel her", "uska
+    appointment", "same patient"). A pronoun that is only a possessive on a detail ("her mobile number is
+    ...", "uska number") does not count."""
+    return bool(_PATIENT_REFERENCE.search(_POSSESSIVE_ATTRIBUTE.sub(" ", _norm(text))))
+
+
+# Words that can follow "for" / "called" / "named" without being a person's name (command and function words,
+# days, months, numbers' words, kinds of visit, pronouns in every spelling), on top of the name reader's list.
+_NOT_A_NAME = frozenset("""
+same another other each every everyone everybody all both any anyone consultation consult checkup check-up review
+routine regular general medical health treatment test tests report reports dressing injection fever cold cough
+branch branches clinic doctor dr again once twice later earlier sooner new old first
+usi isi wahi vahi uske iske unke inke usko isko unko unhe inhe uska uski unka unki inka inki isi
+वही उसी इसी उसके इसके उनके इनके उसको इसको उनको उन्हें इन्हें
+""".split())
+_NOT_A_NAME = _NOT_A_NAME | frozenset(datetime_extract._WEEKDAYS) | frozenset(datetime_extract._MONTHS)
+_NAME_CUE = re.compile(
+    _EDGE_L + r"(?:for|called|named|naam|name)\s+(?:is\s+|hai\s+)?([^\s,.;:!?।]+)"
+    r"|([^\s,.;:!?।]+)\s+(?:ke|ki|ka|के|की|का)\s+(?:liye|lie|लिए)(?![\wऀ-ॿ])"
+    r"|(?:नाम)\s+([^\s,.;:!?।]+)",
+    re.IGNORECASE)
+_DOCTOR_PHRASE = re.compile(_EDGE_L + r"(?:dr|doctor|डॉक्टर|डॉ)\.?\s+[^\s,.;:!?।]+", re.IGNORECASE)
+
+
+def _could_be_name(word):
+    word = re.sub(r"['\u2019]s$", "", word.strip()).casefold()
+    return (len(word) >= 2 and any(ch.isalpha() for ch in word) and not any(ch.isdigit() for ch in word)
+            and word not in _NOT_A_NAME and word not in llm_slots._NEIGHBOUR_WORDS)
+
+
+def names_a_person(text, known_names=None):
+    """True when the sentence names someone (so "her" / "him" in it is not a call-back to the remembered
+    patient): a registered patient's name written in it (`known_names`, default the names the parser was given,
+    "Dr ..." phrases left out), or a word after "for" / "called" / "named" / "naam" / "<word> ke liye" that is not
+    a command, day, number or pronoun word. Deterministic; when it cannot tell it says True, because using the
+    remembered patient for a sentence that names somebody else is the worse mistake."""
+    normalized = unicodedata.normalize("NFC", text or "")
+    if not normalized.strip():
+        return False
+    without_doctors = _DOCTOR_PHRASE.sub(" ", normalized)
+    names = known_names if known_names is not None else llm_slots.current_known_names()
+    if names and llm_slots.match_known_name(without_doctors, names):
+        return True
+    for m in _NAME_CUE.finditer(without_doctors):
+        word = next((g for g in m.groups() if g), None)
+        if word and _could_be_name(word):
+            return True
+    return False
+
+
 def has_same_day_reference(text):
     return bool(_SAME_DAY.search(_norm(text)))
 
@@ -318,10 +399,13 @@ def contextual_intent(text, ctx):
             return "cancel_appointment"
         if _RESCHEDULE_VERB.search(normalized):
             return "reschedule_appointment"
-    if ctx.patient and has_patient_reference(normalized) and _BOOK_VERB.search(normalized):
-        return "book_appointment"
-    if ctx.patient and has_patient_reference(normalized) and _CANCEL_VERB.search(normalized):
-        return "cancel_appointment"
+    # "book him / cancel her" is a call-back to the remembered patient only when the sentence names nobody
+    # ("book a consultation for Priya, her mobile number is ..." is a new person: the planner reads it).
+    if ctx.patient and has_anaphoric_reference(normalized) and not names_a_person(text):
+        if _BOOK_VERB.search(normalized):
+            return "book_appointment"
+        if _CANCEL_VERB.search(normalized):
+            return "cancel_appointment"
     return None
 
 
@@ -353,10 +437,15 @@ def apply_context(intent, slots, text, ctx, fresh=True):
         # patient over. A bare "book an appointment" asks instead, so a stale
         # patient is never silently attached to the next card. The remembered patient's ID
         # is carried with the name, so two patients who share a name are never mixed up.
-        if fresh and ctx.patient and has_patient_reference(text):
+        if fresh and ctx.patient and has_anaphoric_reference(text):
             spoken = (slots.get("patient_name") or "").strip()
-            if not spoken or entity_resolution.name_match(spoken, ctx.patient["name"]) == 1.0:
+            if spoken:
                 # (a model may fill in the remembered name for "him"; a different name spoken is a new person)
+                carry = entity_resolution.name_match(spoken, ctx.patient["name"]) == 1.0
+            else:
+                # no name read: the remembered patient, unless the sentence itself names someone
+                carry = not names_a_person(text)
+            if carry:
                 slots["patient_name"] = ctx.patient["name"]
                 slots["patient_id"] = ctx.patient["id"]
 
@@ -387,6 +476,9 @@ _QUESTIONS = {
     "date": ("Which day?", "Kis din?"),
     "time": ("What time?", "Kitne baje?"),
     "branch": ("Which branch?", "Kaun si branch?"),
+    "doctor": ("Which doctor?", "Kaun se doctor?", "कौन से डॉक्टर?"),
+    # the booking offer after "next available ... and book it for <name>" carries its own full question (slots["_question"])
+    "book_slot": ("Shall I book it?", "Book kar doon?", "क्या बुक कर दूँ?"),
     # English, Hinglish, and (third) the Devanagari wording for an answer spoken in Hindi script.
     "phone": ("What is the patient's phone number?", "Patient ka phone number kya hai?",
               "मरीज़ का फ़ोन नंबर क्या है?"),
@@ -402,6 +494,12 @@ def question_text(kind, language, heard=None):
     if len(texts) > 2 and _DEVANAGARI.search(heard or ""):
         return texts[2]
     return texts[1] if language == "hi-IN" else texts[0]
+
+
+def pending_question(pending, language, heard=None):
+    """The question an open `pending` asks: its own full wording when it has one (the booking offer: "Book Neha
+    Gupta on Fri 9 Oct at 10:30 with Dr. Mehta?"), else the fixed question for its kind."""
+    return (pending.get("slots") or {}).get("_question") or question_text(pending["kind"], language, heard)
 
 
 def ambiguous_patients(candidates):
@@ -462,42 +560,11 @@ def booking_phone_missing(conn, slots, adapter):
     return booking_phone.problem(conn, dict(slots, patient_id=patient_id)) is not None
 
 
-# Digits said one by one, the way phone numbers are read out (English, Hinglish, Devanagari).
-_DIGIT_WORDS = {
-    "zero": 0, "oh": 0, "shunya": 0, "sunya": 0, "शून्य": 0, "ज़ीरो": 0, "जीरो": 0,
-    "one": 1, "ek": 1, "एक": 1,
-    "two": 2, "do": 2, "दो": 2,
-    "three": 3, "teen": 3, "तीन": 3,
-    "four": 4, "char": 4, "chaar": 4, "चार": 4,
-    "five": 5, "paanch": 5, "panch": 5, "pach": 5, "पांच": 5, "पाँच": 5,
-    "six": 6, "chhe": 6, "chhah": 6, "che": 6, "cheh": 6, "छह": 6, "छः": 6, "छे": 6,
-    "seven": 7, "saat": 7, "sat": 7, "सात": 7,
-    "eight": 8, "aath": 8, "ath": 8, "आठ": 8,
-    "nine": 9, "nau": 9, "nao": 9, "नौ": 9,
-}
-_REPEATS = {"double": 2, "dubal": 2, "डबल": 2, "triple": 3, "ट्रिपल": 3}
-
-
 def spoken_phone(text):
-    """The 10-digit phone number in an answer like "98765 00301", "+91 9876500301", "९८७६५००३०१" or digits read
-    out one by one ("nine eight seven six ..."), or None when there is no such number. Fewer or more than
-    10 digits (after a +91 / 0 prefix) is not a phone number: speech recognition drops digits on long
-    sequences, so a short run is asked again rather than guessed at."""
-    digits, repeat = [], 1
-    for token in re.findall(r"[\w\u0900-\u097F+]+", unicodedata.normalize("NFC", text or "").lower()):
-        if token in _REPEATS:
-            repeat = _REPEATS[token]
-            continue
-        if token in _DIGIT_WORDS:
-            digits.extend([str(_DIGIT_WORDS[token])] * repeat)
-        else:
-            # a run of digits (any script's); anything else said around it is ignored
-            digits.extend(str(unicodedata.digit(ch)) for ch in token if unicodedata.category(ch) == "Nd")
-        repeat = 1
-    number = "".join(digits)
-    if not (len(number) == 10 or (len(number) == 11 and number[0] == "0") or (len(number) == 12 and number[:2] == "91")):
-        return None
-    return booking_phone.valid_phone(number) or None
+    """The 10-digit phone number in an answer to "What is the patient's phone number?" ("98765 00301",
+    "+91 9876500301", digits read out one by one), or None. The reader lives in clinic/nlu/extract.py (the
+    first command reads a number said in words with it too); kept here under its old name."""
+    return extract.spoken_phone(text)
 
 
 def clinic_hour(hour):

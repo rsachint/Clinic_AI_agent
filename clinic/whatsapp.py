@@ -4,6 +4,8 @@ import time
 
 import httpx
 
+from clinic import network_health
+
 GRAPH_API_BASE = "https://graph.facebook.com/v21.0"
 
 # Fixed, non-AI-composed acknowledgment (plan §13.5) -- sent on every inbound
@@ -380,7 +382,16 @@ def _post_message(body):
     phone_number_id = os.environ["WHATSAPP_PHONE_NUMBER_ID"]
     url = "{}/{}/messages".format(GRAPH_API_BASE, phone_number_id)
     headers = {"Authorization": "Bearer {}".format(token)}
-    response = httpx.post(url, headers=headers, json=body, timeout=15)
+    started = time.monotonic()
+    try:
+        response = httpx.post(url, headers=headers, json=body, timeout=15)
+    except Exception as exc:
+        # Only a connection problem or a timeout is network evidence for the connection chip.
+        kind = network_health.classify(exc)
+        if kind:
+            network_health.record("whatsapp", False, (time.monotonic() - started) * 1000, kind)
+        raise
+    network_health.record("whatsapp", True, (time.monotonic() - started) * 1000)    # any reply: the network works
     response.raise_for_status()
     return response.json()
 

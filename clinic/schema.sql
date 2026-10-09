@@ -503,7 +503,11 @@ CREATE TABLE IF NOT EXISTS planner_log (
     -- for a 'rules' row, which precise rule decided it ("rule:move", "rule:context", "rule:count", "rule:branch",
     -- "rule:closure", "rule:keywords"; "+name_fill" when the small hosted name read ran); NULL for a planner row.
     -- planner_args_json then lists which slots were found / missing (names only, never values)
-    route_detail TEXT
+    route_detail TEXT,
+    -- model-first mode only (clinic/architecture.py): the state card sent to the planner with this command
+    -- (clinic/state_card.py: names and last four phone digits, never ids, notes or diagnoses); NULL otherwise.
+    -- route_detail is then "mf:<tool>" or "mf_fallback_classic" (the planner could not answer: classic ran)
+    state_card TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_planner_log_ts ON planner_log (ts);
 
@@ -533,3 +537,247 @@ CREATE TABLE IF NOT EXISTS unanswered_questions (
     notified_at TEXT                       -- when the user was told it works (shown once)
 );
 CREATE INDEX IF NOT EXISTS idx_unanswered_status ON unanswered_questions (status, times_asked);
+
+-- Internet trouble the app noticed (clinic/network_health.py): one row per FAILED network call to Sarvam speech,
+-- the Sarvam planner or WhatsApp (never a success, never an HTTP error such as a refused key). It exists so a person
+-- can see when patchy internet is why an answer was poor (Audit log -> Connection). `kind` is "timeout",
+-- "handshake", "connect" or "dropped"; `detail` is the fixed plain wording for it ("Could not connect"); nothing
+-- from the exception, no host, URL or key is ever stored. `duration_ms` is how long the call waited. `ts` is UTC
+-- text like the other tables. Pruned on every write to the newest 500 rows and at most 30 days.
+CREATE TABLE IF NOT EXISTS network_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL DEFAULT (datetime('now')),
+    service TEXT NOT NULL CHECK (service IN ('voice', 'planner', 'whatsapp')),
+    kind TEXT,
+    detail TEXT,
+    duration_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_network_events_ts ON network_events (ts);
+
+
+-- ---------------------------------------------------------------------------
+-- Read-only views for the "Model does all read operations" mode (clinic/sql_read.py).
+-- The Sarvam planner writes ONE SELECT over these views and nothing else: they are pre-joined, carry
+-- only the columns clinic/query_tool.py already exposes (no notes, diagnoses, message bodies, tokens,
+-- WhatsApp ids, raw audit payloads or payees), money in RUPEES and times in IST. Nothing reads them
+-- except that mode, so the classic and New modes are unaffected. clinic/read_schema.py describes every
+-- column (a test keeps the two in step). v_branches and v_roster_days use today_ist(), a function the
+-- read connection registers (clinic/sql_read.py); other connections simply cannot query those two.
+-- ---------------------------------------------------------------------------
+CREATE VIEW IF NOT EXISTS v_appointments AS
+SELECT a.id AS id,
+       a.appt_date AS appt_date,
+       a.start_time AS start_time,
+       substr(time(a.start_time, '+' || a.duration_minutes || ' minutes'), 1, 5) AS end_time,
+       a.duration_minutes AS minutes,
+       a.status AS status,
+       a.queue_state AS queue_state,
+       COALESCE(p.name, a.patient_name) AS patient_name,
+       COALESCE(p.phone, a.patient_phone) AS patient_phone,
+       d.name AS doctor_name,
+       b.code AS branch_code,
+       b.name AS branch_name,
+       substr(datetime(a.created_at, '+5 hours', '+30 minutes'), 1, 16) AS created_ist
+FROM appointments a
+LEFT JOIN patients p ON p.id = a.patient_id
+LEFT JOIN branches b ON b.id = COALESCE(
+    a.branch_id,
+    (SELECT CAST(s.value AS INTEGER) FROM app_settings s WHERE s.key = 'default_branch_id'
+        AND CAST(s.value AS INTEGER) IN (SELECT id FROM branches WHERE active = 1)),
+    (SELECT id FROM branches WHERE active = 1 ORDER BY sort_order, id LIMIT 1),
+    1)
+LEFT JOIN doctors d ON d.id = a.doctor_id;
+
+CREATE VIEW IF NOT EXISTS v_patients AS
+SELECT p.id AS id,
+       p.name AS name,
+       p.phone AS phone,
+       p.age AS age,
+       substr(datetime(p.registered_at, '+5 hours', '+30 minutes'), 1, 16) AS registered_ist
+FROM patients p;
+
+CREATE VIEW IF NOT EXISTS v_doctors AS
+SELECT d.name AS name, d.title AS title, d.specialty AS specialty
+FROM doctors d
+WHERE d.active = 1;
+
+CREATE VIEW IF NOT EXISTS v_branches AS
+SELECT b.code AS code,
+       b.name AS name,
+       b.address AS address,
+       b.pin_code AS pin_code,
+       b.phone AS phone,
+       b.status AS status,
+       substr(b.closed_reason, 1, 80) AS closed_reason,
+       CASE
+         WHEN b.status = 'closed' THEN 'no'
+         WHEN EXISTS (SELECT 1 FROM booking_blocks k
+                      WHERE k.active = 1 AND k.doctor_id IS NULL AND k.start_time IS NULL
+                        AND (k.branch_id IS NULL OR k.branch_id = b.id)
+                        AND k.start_date <= today_ist() AND k.end_date >= today_ist()) THEN 'no'
+         WHEN EXISTS (SELECT 1 FROM doctor_schedules s JOIN doctors d ON d.id = s.doctor_id
+                      WHERE s.branch_id = b.id
+                        AND s.weekday = ((CAST(strftime('%w', today_ist()) AS INTEGER) + 6) % 7)
+                        AND d.active = 1
+                        AND (s.valid_from IS NULL OR s.valid_from <= today_ist())
+                        AND (s.valid_to IS NULL OR s.valid_to >= today_ist())) THEN 'yes'
+         ELSE 'no'
+       END AS open_today
+FROM branches b
+WHERE b.active = 1;
+
+CREATE VIEW IF NOT EXISTS v_staff AS
+SELECT s.name AS name,
+       s.role AS role,
+       s.phone AS phone,
+       b.code AS branch_code,
+       COALESCE(b.name, 'Any') AS branch_name
+FROM staff s
+LEFT JOIN branches b ON b.id = s.branch_id;
+
+CREATE VIEW IF NOT EXISTS v_attendance AS
+SELECT att.attendance_date AS attendance_date,
+       s.name AS staff_name,
+       s.role AS role,
+       att.status AS status,
+       COALESCE(b.name, 'Any') AS branch_name
+FROM attendance att
+JOIN staff s ON s.id = att.staff_id
+LEFT JOIN branches b ON b.id = s.branch_id;
+
+CREATE VIEW IF NOT EXISTS v_followups AS
+SELECT p.name AS patient_name,
+       p.phone AS patient_phone,
+       f.due_date AS due_date,
+       f.due_time AS due_time,
+       f.status AS status,
+       d.name AS doctor_name,
+       b.code AS branch_code,
+       b.name AS branch_name,
+       CASE WHEN f.appointment_id IS NOT NULL THEN 'yes' ELSE 'no' END AS has_slot
+FROM followups f
+JOIN patients p ON p.id = f.patient_id
+LEFT JOIN doctors d ON d.id = f.doctor_id
+LEFT JOIN branches b ON b.id = f.branch_id;
+
+CREATE VIEW IF NOT EXISTS v_visits AS
+SELECT p.name AS patient_name,
+       v.visit_date AS visit_date,
+       ROUND(v.fee_paise / 100.0, 2) AS fee_rupees
+FROM visits v
+JOIN patients p ON p.id = v.patient_id;
+
+CREATE VIEW IF NOT EXISTS v_expenses AS
+SELECT e.expense_date AS expense_date,
+       e.description AS description,
+       ROUND(e.amount_paise / 100.0, 2) AS amount_rupees
+FROM expenses e;
+
+CREATE VIEW IF NOT EXISTS v_cashbook AS
+SELECT v.visit_date AS entry_date,
+       'fee' AS kind,
+       COALESCE(p.name, '') AS description,
+       ROUND(v.fee_paise / 100.0, 2) AS amount_rupees
+FROM visits v
+LEFT JOIN patients p ON p.id = v.patient_id
+UNION ALL
+SELECT e.expense_date, 'expense', e.description, ROUND(e.amount_paise / 100.0, 2)
+FROM expenses e;
+
+CREATE VIEW IF NOT EXISTS v_reminders AS
+SELECT COALESCE(p.name, a.patient_name,
+                (SELECT p2.name FROM patients p2
+                 WHERE n.wa_id IS NOT NULL AND substr(p2.phone, -10) = substr(n.wa_id, -10)
+                 ORDER BY p2.id LIMIT 1), '') AS patient_name,
+       n.event AS kind,
+       n.status AS status,
+       substr(datetime(COALESCE(n.sent_at, n.created_at), '+5 hours', '+30 minutes'), 1, 16) AS sent_ist
+FROM notifications n
+LEFT JOIN appointments a ON a.id = n.appointment_id
+LEFT JOIN patients p ON p.id = a.patient_id
+WHERE n.event <> 'conv_reply';
+
+CREATE VIEW IF NOT EXISTS v_closures AS
+SELECT b.code AS branch_code,
+       b.name AS branch_name,
+       d.name AS doctor_name,
+       c.start_date AS start_date,
+       c.end_date AS end_date,
+       substr(c.reason, 1, 80) AS reason,
+       c.status AS status,
+       COALESCE(m.moved, 0) AS patients_moved,
+       COALESCE(m.cancelled, 0) AS appointments_cancelled
+FROM closures c
+JOIN branches b ON b.id = c.branch_id
+LEFT JOIN doctors d ON d.id = c.doctor_id
+LEFT JOIN (SELECT closure_id,
+                  SUM(CASE WHEN action = 'move' AND result = 'done' THEN 1 ELSE 0 END) AS moved,
+                  SUM(CASE WHEN action = 'cancel' AND result = 'done' THEN 1 ELSE 0 END) AS cancelled
+           FROM closure_moves GROUP BY closure_id) m ON m.closure_id = c.id;
+
+CREATE VIEW IF NOT EXISTS v_blocks AS
+SELECT k.start_date AS start_date,
+       k.end_date AS end_date,
+       k.start_time AS start_time,
+       k.end_time AS end_time,
+       COALESCE(b.name, 'All branches') AS branch_name,
+       COALESCE(d.name, 'All doctors') AS doctor_name,
+       substr(k.reason, 1, 80) AS reason
+FROM booking_blocks k
+LEFT JOIN branches b ON b.id = k.branch_id
+LEFT JOIN doctors d ON d.id = k.doctor_id
+WHERE k.active = 1;
+
+CREATE VIEW IF NOT EXISTS v_activity AS
+SELECT substr(pa.created_at, 1, 16) AS activity_time,
+       pa.event AS event,
+       COALESCE(p.name, pa.patient_name) AS patient_name,
+       pa.source AS source
+FROM patient_activity pa
+LEFT JOIN patients p ON p.id = pa.patient_id;
+
+CREATE VIEW IF NOT EXISTS v_audit AS
+SELECT substr(datetime(a.logged_at, '+5 hours', '+30 minutes'), 1, 16) AS logged_ist,
+       a.intent AS action,
+       a.entity_type AS record_type
+FROM audit_log a;
+
+CREATE VIEW IF NOT EXISTS v_schedules AS
+SELECT d.name AS doctor_name,
+       b.code AS branch_code,
+       b.name AS branch_name,
+       CASE s.weekday WHEN 0 THEN 'Monday' WHEN 1 THEN 'Tuesday' WHEN 2 THEN 'Wednesday' WHEN 3 THEN 'Thursday'
+                      WHEN 4 THEN 'Friday' WHEN 5 THEN 'Saturday' ELSE 'Sunday' END AS weekday,
+       s.start_time AS start_time,
+       s.end_time AS end_time,
+       s.valid_from AS valid_from,
+       s.valid_to AS valid_to
+FROM doctor_schedules s
+JOIN doctors d ON d.id = s.doctor_id AND d.active = 1
+JOIN branches b ON b.id = s.branch_id AND b.active = 1;
+
+-- One row per day x branch x doctor for the next 60 days (today included): who is at which branch on a date,
+-- worked out from the weekday windows, their valid_from / valid_to dates and the branch / doctor being active
+-- and open, exactly as clinic/branches.py doctor_windows() does.
+CREATE VIEW IF NOT EXISTS v_roster_days AS
+WITH RECURSIVE roster_series(day, n) AS (
+    SELECT today_ist(), 0
+    UNION ALL
+    SELECT date(day, '+1 day'), n + 1 FROM roster_series WHERE n < 59
+)
+SELECT r.day AS roster_date,
+       CASE CAST(strftime('%w', r.day) AS INTEGER) WHEN 0 THEN 'Sunday' WHEN 1 THEN 'Monday' WHEN 2 THEN 'Tuesday'
+            WHEN 3 THEN 'Wednesday' WHEN 4 THEN 'Thursday' WHEN 5 THEN 'Friday' ELSE 'Saturday' END AS weekday,
+       b.code AS branch_code,
+       b.name AS branch_name,
+       d.name AS doctor_name,
+       group_concat(s.start_time || '-' || s.end_time, ', ' ORDER BY s.start_time) AS hours,
+       MIN(s.start_time) AS first_start,
+       MAX(s.end_time) AS last_end
+FROM roster_series r
+JOIN doctor_schedules s ON s.weekday = ((CAST(strftime('%w', r.day) AS INTEGER) + 6) % 7)
+                       AND (s.valid_from IS NULL OR s.valid_from <= r.day)
+                       AND (s.valid_to IS NULL OR s.valid_to >= r.day)
+JOIN doctors d ON d.id = s.doctor_id AND d.active = 1
+JOIN branches b ON b.id = s.branch_id AND b.active = 1 AND b.status <> 'closed'
+GROUP BY r.day, b.id, d.id;

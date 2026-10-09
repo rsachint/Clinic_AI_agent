@@ -8,8 +8,8 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
 from flask_socketio import SocketIO
 
-from clinic import (auto_actions, booking_blocks, booking_phone, branches, closures, conv_runtime, conversation, core, followup_notify, followups,
-                    gcal_client, gcal_config, gcal_sync, notify, patient_activity, planner_log, scheduler, scheduling, settings,
+from clinic import (architecture, auto_actions, booking_blocks, booking_phone, branches, closures, conv_runtime, conversation, core, followup_notify, followups,
+                    gcal_client, gcal_config, gcal_sync, network_health, notify, patient_activity, planner_log, scheduler, scheduling, settings,
                     token_queue, unanswered, whatsapp as wa)
 from clinic.adapters.registry import build_write_handlers, get_adapters
 from clinic.asr import transcribe
@@ -1391,6 +1391,24 @@ def settings_sarvam_usage():
     return jsonify(ok=True, data=data)
 
 
+@app.route("/settings/intent-architecture")
+def settings_intent_architecture():
+    """Which way commands are understood (clinic/architecture.py): the mode in force and the two choices."""
+    return jsonify(ok=True, data=architecture.view(get_conn()))
+
+
+@app.route("/settings/intent-architecture", methods=["POST"])
+def settings_intent_architecture_save():
+    """Switch between Classic and New (model first). Read at every command, so it takes effect on the next
+    sentence; switching back is the same one click."""
+    conn = get_conn()
+    try:
+        architecture.set_mode(conn, _json_body().get("mode"))
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    return jsonify(ok=True, data=architecture.view(conn))
+
+
 # ---------------------------------------------------------------------------
 # Settings -> Branches / Doctors / Schedules. Every route returns the full
 # branch context so the page can redraw from one response.
@@ -1666,6 +1684,33 @@ def unanswered_notified(item_id):
     return jsonify(ok=True, changed=unanswered.mark_notified(get_conn(), item_id, _clinic_now()))
 
 
+def wire_network_health():
+    """Connect the connection monitor (clinic/network_health.py) to this app's database and Socket.IO: a failed
+    network call is written to network_events (in a short thread, on its own connection), and a change of the
+    state or of a service's status is pushed to every open page as `network_status`. Called from __main__ only:
+    importing app (tests) wires nothing, so a test can never write to clinic.db."""
+    network_health.configure(
+        sink=network_health.make_db_sink(lambda: connect(DB_PATH), background=True),
+        emit=lambda payload: socketio.emit("network_status", payload))
+
+
+@app.route("/network/status")
+def network_status():
+    """The connection chip: {state, label, services: [{key, name, status, label, detail}], last_checked}.
+    No patient data, hosts, URLs or keys."""
+    return jsonify(ok=True, **network_health.status())
+
+
+@app.route("/network/incidents")
+def network_incidents():
+    """Audit log -> Connection: today's count, the current state and the last 50 failed network calls."""
+    conn = get_conn()
+    try:
+        return jsonify(ok=True, **network_health.incidents(conn))
+    finally:
+        conn.close()
+
+
 if __name__ == "__main__":
     # socketio.run (not app.run): Flask-SocketIO needs to own the dev
     # server's request loop so the /socket.io WebSocket transport (see
@@ -1687,6 +1732,7 @@ if __name__ == "__main__":
         if branches.ensure_seed(_startup_conn):
             _logger.info("Created the example branches B and C (edit them in Settings -> Branches).")
         branches.backfill_branch(_startup_conn)
+    wire_network_health()
     scheduler.start(get_conn, sender_override=lambda: NOTIFY_SENDER, calendar_client=_gcal_client)
     socketio.run(app, debug=False, port=int(os.environ.get("PORT", "5050")), use_reloader=False,
                  allow_unsafe_werkzeug=True)

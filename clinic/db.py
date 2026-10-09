@@ -30,7 +30,7 @@ _ADDED_COLUMNS = {
     "staff": (("branch_id", "INTEGER"),),
     "slot_holds": (("branch_id", "INTEGER"),),
     "planner_log": (("backend", "TEXT"), ("tokens_in", "INTEGER"), ("tokens_out", "INTEGER"), ("cost_paise", "INTEGER"),
-                    ("route_detail", "TEXT")),
+                    ("route_detail", "TEXT"), ("state_card", "TEXT")),
 }
 
 

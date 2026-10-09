@@ -7,7 +7,9 @@ declaration is the single source for three things:
   * validation of what the model sends back (`validate()`): unknown tool or
     argument, wrong type, bad enum, a date that is not ISO, a time that is not
     HH:MM, a branch that does not exist, a missing required argument -> ToolError,
-    and the planner treats the whole call as invalid and falls back;
+    and the planner treats the whole call as invalid and falls back. The one
+    exception is a detail the APP ITSELF ASKS FOR (see `askable` below): a call
+    that is otherwise valid but lacks it is accepted, so the app asks;
   * the mapping to the rest of the app (`to_parse_result()`): the (intent, slots)
     pair that clinic/nlu/parser.py's parse() produces today for the equivalent
     sentence, so entity resolution, the propose / review-card flow, the answers,
@@ -65,7 +67,16 @@ _DATE_WINDOW_DAYS = 800          # a date further out than this is a typo, not a
 
 
 class Tool:
-    def __init__(self, name, description, params, required, mapper, intents, writes=False, check=None):
+    """`askable`: the required arguments whose absence is NOT an error because the app already asks the person
+    for them (clinic/voice_context.py next_question: the patient "Which patient?" / "Which one?", the day
+    "Which day?", the time "What time?"; the phone of a booking is asked too and is never required here).
+    A call missing only askable arguments is mapped with those slots empty and the existing slot-filling takes
+    over, instead of the whole call being thrown away and the classic rules guessing. A call with NO argument at
+    all is still rejected (a model that calls book_appointment() for small talk has understood nothing), and any
+    required argument that is not askable (a fee, a number of days, an amount, a doctor, a branch letter, ...)
+    keeps the strict `missing_required` rejection, because the app has no question for it."""
+
+    def __init__(self, name, description, params, required, mapper, intents, writes=False, check=None, askable=()):
         self.name = name
         self.description = description
         self.params = params                  # name -> Param
@@ -74,6 +85,8 @@ class Tool:
         self.intents = frozenset(intents)     # every intent label this tool can map to
         self.writes = writes                  # True when the mapped intent ends in a review card / proposal
         self.check = check                    # optional cross-field validation: check(args, ctx)
+        self.askable = frozenset(askable)     # required arguments the app asks for when they are missing
+        assert self.askable <= set(self.required)
 
     def schema(self):
         properties = {}
@@ -96,7 +109,7 @@ class Tool:
 
 
 def _json_type(kind):
-    return {"int": "integer", "fields": "array"}.get(kind, "string")
+    return {"int": "integer", "fields": "array", "flag": "boolean"}.get(kind, "string")
 
 
 # -- validation ------------------------------------------------------------------------
@@ -179,6 +192,12 @@ def _check_value(param, value, ctx):
         return _branch_code(ctx.conn, value, kind == "branch_or_all")
     if kind == "int":
         return _whole(value, param.minimum, param.maximum)
+    if kind == "flag":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lower() in ("true", "yes", "false", "no"):
+            return value.strip().lower() in ("true", "yes")
+        raise ToolError("bad_value", "expected true or false")
     if kind == "phone":
         digits = re.sub(r"\D", "", value if isinstance(value, str) else str(value))
         if len(digits) > 10 and digits.startswith("91"):
@@ -198,13 +217,14 @@ def _check_value(param, value, ctx):
     raise ToolError("bad_value", "unknown parameter kind")
 
 
-def validate(name, args, ctx=None, strict=True):
+def validate(name, args, ctx=None, strict=True, dialogue=False):
     """The clean arguments for tool `name`, or ToolError. Empty values (null,
     "", []) mean "not given" and are dropped. With `strict` (the planner's
     setting) an argument the tool does not declare rejects the whole call;
-    without it unknown arguments are silently dropped."""
+    without it unknown arguments are silently dropped. `dialogue` (model-first
+    mode only) also accepts the five conversation tools of DIALOGUE_TOOLS."""
     ctx = ctx or ToolContext()
-    tool = BY_NAME.get(name)
+    tool = BY_NAME.get(name) or (DIALOGUE_BY_NAME.get(name) if dialogue else None)
     if tool is None:
         raise ToolError("unknown_tool", "no such tool: {!r}".format(name))
     if isinstance(args, str):
@@ -232,6 +252,8 @@ def validate(name, args, ctx=None, strict=True):
             raise ToolError(code, "{}.{}: {}".format(name, key, exc), key=key)
     for key in tool.required:
         if key not in clean:
+            if key in tool.askable and clean:
+                continue          # the app asks for it (Tool.askable); the slot stays empty, nothing is invented
             raise ToolError("missing_required", "{} needs {}".format(name, key))
     if tool.check:
         tool.check(clean, ctx)
@@ -257,7 +279,8 @@ def _map_book(a, ctx):
     notes = "Requested: {}".format(a["doctor_name"]) if a.get("doctor_name") else None
     slots = {
         "patient_name": a.get("patient_name"),
-        "patient_phone": a.get("phone") or extract.extract_phone(ctx.text or ""),
+        # a complete number read from the words wins over the model's (it never outranks the deterministic reader)
+        "patient_phone": extract.read_phone_exact(ctx.text or "") or a.get("phone") or extract.extract_phone(ctx.text or ""),
         "appt_date": a.get("date"),
         "start_time": a.get("time"),
         "duration_minutes": None,
@@ -316,7 +339,8 @@ def _map_leave(a, ctx):
 
 
 def _map_register_patient(a, ctx):
-    return "register_patient", {"name": a.get("name"), "phone": a.get("phone") or extract.extract_phone(ctx.text or ""),
+    return "register_patient", {"name": a.get("name"),
+                                "phone": extract.read_phone_exact(ctx.text or "") or a.get("phone") or extract.extract_phone(ctx.text or ""),
                                 "age": a.get("age")}
 
 
@@ -416,7 +440,17 @@ def _map_query(a, ctx):
                 and aggregate == "list":
             return "patient_lookup", {"patient_name": name}
     elif entity == "availability":
-        return routed("check_availability", {"appt_date": spec.get("date")})
+        # free slots: one day, or (next) a forward search from that day for the first free slot(s); the doctor is
+        # spoken text that clinic/next_available.py resolves, never an id
+        slots = {"appt_date": spec.get("date")}
+        if spec.get("doctor"):
+            slots["doctor"] = spec["doctor"]
+        if spec.get("next"):
+            slots["next_available"] = True
+            for key, name in (("limit", "limit"), ("date_to", "end_date")):
+                if spec.get(key):
+                    slots[name] = spec[key]
+        return routed("check_availability", slots)
     elif entity == "appointments":
         only = ("patient_name", "date", "date_to", "limit")
         if name and spec.get("limit") == 1 and _plain(spec, "patient_name", "limit") and aggregate == "list":
@@ -442,8 +476,8 @@ def _map_query(a, ctx):
 
 # -- the registry ---------------------------------------------------------------------
 
-def _tool(name, description, params, required, mapper, intents, writes=False, check=None):
-    return Tool(name, description, params, required, mapper, intents, writes, check)
+def _tool(name, description, params, required, mapper, intents, writes=False, check=None, askable=()):
+    return Tool(name, description, params, required, mapper, intents, writes, check, askable)
 
 
 _PATIENT_NAME = _p("name", _NAME)
@@ -454,15 +488,17 @@ TOOLS = [
           {"patient_name": _PATIENT_NAME, "date": DATE, "time": TIME, "branch": BRANCH,
            "doctor_name": _p("name", "Doctor, only if the user asked for one."),
            "phone": _p("phone", "Patient mobile number, only if said.")},
-          ["patient_name", "date", "time"], _map_book, ["book_appointment"], writes=True),
+          ["patient_name", "date", "time"], _map_book, ["book_appointment"], writes=True,
+          askable=("patient_name", "date", "time")),
     _tool("reschedule_appointment",
           "Move, shift or postpone a patient's existing appointment to another date, time or branch ('move', 'shift', 'reschedule', 'badal do'). Never query.",
           {"patient_name": _PATIENT_NAME, "current_date": DATE, "new_date": DATE, "new_time": TIME,
-           "new_branch": BRANCH}, ["patient_name"], _map_reschedule, ["reschedule_appointment"], writes=True),
+           "new_branch": BRANCH}, ["patient_name"], _map_reschedule, ["reschedule_appointment"], writes=True,
+          askable=("patient_name",)),
     _tool("cancel_appointment",
           "Cancel a patient's booked appointment (a time slot): any 'cancel', 'radd', 'hata do' about an appointment. Not a follow-up recall, and never query.",
           {"patient_name": _PATIENT_NAME, "date": DATE}, ["patient_name"], _map_cancel, ["cancel_appointment"],
-          writes=True),
+          writes=True, askable=("patient_name",)),
     _tool("close_branch",
           "Close a whole branch for one or more days; its booked appointments are listed for moving or cancelling.",
           {"branch": BRANCH, "start_date": DATE, "end_date": _p("date", "Last closed day, ISO YYYY-MM-DD; omit for one day."),
@@ -487,18 +523,19 @@ TOOLS = [
     _tool("record_visit",
           "Log a patient's visit and the consultation fee paid.",
           {"patient_name": _PATIENT_NAME, "fee": _p("int", "Fee in rupees.", minimum=1, maximum=1000000)},
-          ["patient_name", "fee"], _map_visit, ["record_visit"], writes=True),
+          ["patient_name", "fee"], _map_visit, ["record_visit"], writes=True, askable=("patient_name",)),
     _tool("set_followup",
           "Schedule a follow-up recall (come back after N days) for a patient. Not an appointment slot.",
           {"patient_name": _PATIENT_NAME, "days": _p("int", "Days from now.", minimum=1, maximum=365)},
-          ["patient_name", "days"], _map_followup, ["set_followup"], writes=True),
+          ["patient_name", "days"], _map_followup, ["set_followup"], writes=True, askable=("patient_name",)),
     _tool("cancel_followup",
           "Cancel a patient's pending follow-up recall (not an appointment).",
-          {"patient_name": _PATIENT_NAME}, ["patient_name"], _map_cancel_followup, ["cancel_followup"], writes=True),
+          {"patient_name": _PATIENT_NAME}, ["patient_name"], _map_cancel_followup, ["cancel_followup"], writes=True,
+          askable=("patient_name",)),
     _tool("reschedule_followup",
           "Change the due date of a patient's pending follow-up recall (not an appointment).",
           {"patient_name": _PATIENT_NAME, "new_date": DATE}, ["patient_name"], _map_reschedule_followup,
-          ["reschedule_followup"], writes=True),
+          ["reschedule_followup"], writes=True, askable=("patient_name",)),
     _tool("log_expense",
           "Log a clinic expense that was paid.",
           {"amount": _p("int", "Amount in rupees.", minimum=1, maximum=10000000),
@@ -517,7 +554,7 @@ TOOLS = [
     _tool("query",
           "READ-ONLY lookup: show, list, count, sum or find records. Never changes anything; do NOT use it to cancel, "
           "move, book or record anything. Also use it to continue the previous question.",
-          {"entity": _p("enum", "patients; appointments; availability (free slots); followups; cashbook (fees+expenses); staff; "
+          {"entity": _p("enum", "patients; appointments; availability (free slots; next=true: the next free one); followups; cashbook (fees+expenses); staff; "
                                 "attendance (who is in); branches (address, why closed); doctors; schedules (time=now: who is on duty); "
                                 "visits (fees); expenses; reminders (WhatsApp sent); closures (patients moved); blocks; "
                                 "audit (what staff approved); activity (what happened to appointments).", query_tool.ENTITIES),
@@ -536,7 +573,8 @@ TOOLS = [
            "group_by": _p("text", "doctor, branch, status, date, month, weekday, patient, description."),
            "order": _p("text", "newest, oldest, highest, lowest or name."),
            "fields": _p("fields", "Columns wanted."),
-           "limit": _p("int", "At most this many rows. limit=1 with entity=appointments and patient_name is that patient's NEXT appointment.", minimum=1, maximum=query_tool.MAX_ROWS)},
+           "limit": _p("int", "At most this many rows. limit=1 with entity=appointments and patient_name is that patient's NEXT appointment.", minimum=1, maximum=query_tool.MAX_ROWS),
+           "next": _p("flag", "availability: true for next available / earliest / first free; searches ahead from date (default today); limit = slots.")},
           ["entity"], _map_query,
           ["patient_count", "patient_lookup", "check_availability", "list_appointments", "next_appointment",
            "missed_followups", "day_end_cashbook", "query"], check=_check_query),
@@ -558,20 +596,98 @@ TOOLS = [
 BY_NAME = {tool.name: tool for tool in TOOLS}
 assert len(TOOLS) == 19 and len(BY_NAME) == 19
 
+# -- the conversation tools (model-first mode only) -------------------------------------
+# They answer or edit what the assistant already has open (clinic/state_card.py describes it to the model);
+# clinic/nlu/dialogue.py maps each onto the voice machinery that handles a tap, a typed answer or a card edit.
+# None of them is a write, and there is deliberately NO approve / confirm tool: approval is a human pressing
+# Approve on the screen, never a command (the dispatcher refuses anything approval-like).
+
+ANSWER_SLOTS = ("date", "time", "phone", "branch", "patient_name")
+CARD_FIELDS = ("date", "time", "phone", "branch", "patient_name", "fee", "days", "age", "status")
+_SLOT_KIND = {"date": "date", "time": "time", "phone": "phone", "branch": "branch", "patient_name": "name",
+              "fee": "int", "days": "int", "age": "int", "status": "enum"}
+
+
+def _check_slot_value(field, value, ctx):
+    """`value` read the way the field's own kind is (a date is ISO, a time HH:MM, a phone digits, a branch a
+    letter, a whole number a number) -> the clean value, or ToolError."""
+    kind = _SLOT_KIND[field]
+    if kind == "int":
+        low, high = {"fee": (1, 1000000), "days": (1, 365), "age": (0, 130)}[field]
+        return str(_check_value(_p("int", minimum=low, maximum=high), value, ctx))      # text, so it validates twice
+    if kind == "enum":
+        return _check_value(_p("enum", enum=ATTENDANCE), value, ctx)
+    return _check_value(_p(kind), value, ctx)
+
+
+def _check_answer_slot(a, ctx):
+    a["value"] = _check_slot_value(a["slot"], a["value"], ctx)
+
+
+def _check_correct_card(a, ctx):
+    a["value"] = _check_slot_value(a["field"], a["value"], ctx)
+
+
+def _map_choose_option(a, ctx):
+    return "choose_option", {"index": a["index"]}
+
+
+def _map_answer_slot(a, ctx):
+    return "answer_slot", {"slot": a["slot"], "value": a["value"]}
+
+
+def _map_correct_card(a, ctx):
+    return "correct_card", {"field": a["field"], "value": a["value"]}
+
+
+def _map_new_patient(a, ctx):
+    return "new_patient", {"name": a["name"]}
+
+
+def _map_cancel_task(a, ctx):
+    return "cancel_task", {}
+
+
+DIALOGUE_TOOLS = [
+    _tool("choose_option",
+          "The user picks one of the numbered options of the question you are waiting on ('the second one', 'the one ending 6543', 'Rahul with the Devanagari name'). index is the option's number.",
+          {"index": _p("int", "The option number from the STATE CARD.", minimum=1, maximum=20)},
+          ["index"], _map_choose_option, ["choose_option"]),
+    _tool("answer_slot",
+          "The user answers the question you are waiting on with a day, a time, a phone number, a branch or a patient's name. The task in progress carries on.",
+          {"slot": _p("enum", "Which detail the answer is.", ANSWER_SLOTS),
+           "value": _p("text", "The answer: ISO date, 24-hour time, digits, branch letter or the name as spoken.")},
+          ["slot", "value"], _map_answer_slot, ["answer_slot"], check=_check_answer_slot),
+    _tool("correct_card",
+          "The user changes one field of the card on screen ('make it 7', 'actually Friday', 'the phone is ...').",
+          {"field": _p("enum", "Which field of the card.", CARD_FIELDS),
+           "value": _p("text", "The new value: ISO date, 24-hour time, digits, branch letter, number or name.")},
+          ["field", "value"], _map_correct_card, ["correct_card"], check=_check_correct_card),
+    _tool("new_patient",
+          "While you are waiting for which patient, the user says the person is a NEW patient with this name ('it's a new patient called Nalin'). The task in progress keeps all it has heard.",
+          {"name": _PATIENT_NAME}, ["name"], _map_new_patient, ["new_patient"]),
+    _tool("cancel_task",
+          "The user drops the task or question in progress ('never mind', 'forget it', 'rehne do'). Nothing is changed.",
+          {}, [], _map_cancel_task, ["cancel_task"]),
+]
+DIALOGUE_BY_NAME = {tool.name: tool for tool in DIALOGUE_TOOLS}
+assert len(DIALOGUE_TOOLS) == 5 and not set(DIALOGUE_BY_NAME) & set(BY_NAME)
+
 # Tools that can open a review card or proposal (every write intent), as opposed to
 # reads, navigation, plans and questions.
 WRITE_TOOLS = frozenset(tool.name for tool in TOOLS if tool.writes)
 
 
-def schemas():
-    """The tool list in Ollama's `tools` format. Built once per call from the registry."""
-    return [tool.schema() for tool in TOOLS]
+def schemas(dialogue=False):
+    """The tool list in Ollama's `tools` format. Built once per call from the registry. With `dialogue`
+    (model-first mode) the five conversation tools are appended; the 19 above are never changed."""
+    return [tool.schema() for tool in (TOOLS + DIALOGUE_TOOLS if dialogue else TOOLS)]
 
 
 def to_parse_result(name, args, ctx):
     """(intent, slots) for a VALIDATED call: exactly what parse() yields today for
     the equivalent sentence. Raises ToolError if a lookup (branch, doctor) fails."""
-    tool = BY_NAME.get(name)
+    tool = BY_NAME.get(name) or DIALOGUE_BY_NAME.get(name)
     if tool is None:
         raise ToolError("unknown_tool", "no such tool: {!r}".format(name))
     return tool.mapper(args, ctx)
@@ -607,7 +723,9 @@ def describe_intent(intent, slots, today=None):
                                        "date": slots.get("date") or (None if named else today),
                                        "patient_name": named})
     if intent == "check_availability":
-        return describe_call("query", {"entity": "availability", "date": slots.get("appt_date") or today})
+        return describe_call("query", {"entity": "availability", "date": slots.get("appt_date") or today,
+                                       "doctor": slots.get("doctor"), "next": True if slots.get("next_available") else None,
+                                       "limit": slots.get("limit"), "date_to": slots.get("end_date")})
     if intent == "next_appointment":
         return describe_call("query", {"entity": "appointments", "patient_name": slots.get("patient_name"), "limit": 1})
     if intent == "missed_followups":

@@ -206,6 +206,8 @@ def default_branch(conn, intent, slots, context):
         return slots
     if intent in ("list_appointments", "query") and slots.get("patient_name"):
         return slots          # one person's appointments: wherever they are, unless a branch was named
+    if intent == "check_availability" and slots.get("doctor"):
+        return slots          # one doctor's free slots: wherever that doctor works, unless a branch was named
     if intent == "query" and slots.get("entity") not in query_tool.MY_BRANCH_DEFAULT:
         return slots          # staff, doctors, closures ...: clinic-wide unless a branch was named
     if intent in BOOK_INTENTS or intent in READ_INTENTS or intent in QUEUE_INTENTS:

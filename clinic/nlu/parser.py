@@ -1,5 +1,6 @@
 import logging
 
+from clinic import next_available
 from clinic.nlu import extract
 from clinic.nlu.classify import calendar_mode, classify, is_move_command, is_patient_count
 from clinic.nlu.datetime_extract import extract_appt_date, extract_appt_time, mentions_unreadable_date
@@ -121,6 +122,11 @@ def _parse(text, context=None, planner=None):
     elif is_patient_count(text):
         intent = "patient_count"   # "how many patients are registered": a count, never a registration
         _note_rule(planner, "count")
+    elif rules_intent == "check_availability" and next_available.asks_next(text):
+        # "next available / earliest / first free ...": read by plain rules (the doctor and any "and book it for X"
+        # tail are read by clinic/next_available.py); a label picker could only mistake it for a booking
+        intent = "check_availability"
+        _note_rule(planner, "next")
     else:
         planned = planner.ask() if planner is not None and planner.wants(rules_intent) else None
         if planned is not None:

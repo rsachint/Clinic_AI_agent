@@ -377,7 +377,12 @@ document.addEventListener("DOMContentLoaded", function () {
   // saying it. Nothing is saved by answering; the card still needs Approve.
   function showQuestionTurn(bubble, data) {
     bubble.appendChild(el("div", { class: "assistant-question", text: data.question }));
-    var options = data.options || [];
+    appendOptions(bubble, data.options);
+  }
+
+  // The answer buttons of an open question; tapping one is the same as saying it.
+  function appendOptions(bubble, options) {
+    options = options || [];
     if (options.length) {
       var row = el("div", { class: "option-row" });
       options.forEach(function (option, index) {
@@ -425,7 +430,12 @@ document.addEventListener("DOMContentLoaded", function () {
           var tr = el("tr");
           columns.forEach(function (k) {
             var shown = fmt ? fmt.cell(k, row[k]) : { text: row[k] === null || row[k] === undefined ? "-" : row[k], numeric: false };
-            var cell = el("td", { text: shown.text });
+            var cell = el("td", shown.chips ? {} : { text: shown.text });
+            if (shown.chips) {
+              // a list (the free slots of a day) wraps as pills inside the cell instead of one clipped line
+              cell.className = "cell-chips";
+              shown.chips.forEach(function (piece) { cell.appendChild(el("span", { class: "slot-chip", text: piece })); });
+            }
             if (shown.numeric) cell.className = "cell-num";
             if (String(k).toLowerCase() === "notes") cell.className = "cell-notes";   // the one column allowed to wrap
             tr.appendChild(cell);
@@ -439,6 +449,7 @@ document.addEventListener("DOMContentLoaded", function () {
       class: "muted", style: "font-size:12px;margin-top:10px;",
       text: "Source: " + data.citation.source + ", " + data.citation.as_of,
     }));
+    appendOptions(bubble, data.options);       // a booking offer that goes with the answer ("Book Neha ...?")
   }
 
   // "Open the calendar" and friends: pure navigation, nothing to approve and
@@ -470,6 +481,7 @@ document.addEventListener("DOMContentLoaded", function () {
   // takes a moment to open) are buffered here and flushed in order, so the first
   // words are not lost.
   var socket = io();
+  window.clinicSocket = socket;   // the page's one connection: static/network_chip.js listens on it too
   var seq = 0;
   var current = null;   // the listen for the most recent press
   var listens = {};     // id -> listen, until the server reports it ended

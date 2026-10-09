@@ -223,8 +223,16 @@ _CANCEL_WORDS = ["cancel", "कैंसिल", "रद्द"]
 _RESCHEDULE_WORDS = ["reschedule", "रीशेड्यूल", "postpone", "date badlo", "दूसरे दिन", "किसी और दिन", "shift karo"]
 # "move Amit to Branch B at 3", "shift his appointment": whole words only ("remove" is not "move").
 _MOVE_WORD = re.compile(r"(?<![a-z])(?:move|moved|transfer|transferred|shift|shifted)(?![a-z])|शिफ्ट|ट्रांसफर")
-_AVAILABILITY_WORDS = ["free", "available", "उपलब्ध", "khaali", "खाली", "khali", "vacant"]
+_AVAILABILITY_WORDS = ["free", "available", "उपलब्ध", "khaali", "खाली", "khali", "vacant",
+                       # "earliest slot with Dr. Mehta": a request for the next free time, without the word free
+                       "earliest slot", "soonest slot", "earliest opening", "soonest opening", "jaldi se jaldi slot",
+                       "earliest appointment", "soonest appointment"]
 _DATE_WORDS = ["kal", "आज", "aaj", "today", "tomorrow"]
+# "next available with Dr. Mehta", "earliest free", "agla khaali": asking for the next free time needs no appointment
+# noun or day word (clinic/next_available.py answers it).
+_NEXT_FREE = re.compile(
+    r"(?<![\wऀ-ॿ])(?:next|first|earliest|soonest|agla|agle|pehla|pehle|अगला|अगले|पहला|पहले)\s+"
+    r"(?:available|free|vacant|open|khaali|khali|उपलब्ध|खाली|फ्री)(?![\wऀ-ॿ])")
 _NEXT_APPOINTMENT_PHRASES = [
     "next appointment", "agla appointment", "अगली अपॉइंटमेंट", "अगला अपॉइंटमेंट",
     "kab hai appointment", "appointment kab hai", "when is the appointment", "when is my appointment",
@@ -257,7 +265,7 @@ _BOOK_VERB_WORDS = ["book ", "fix ", "बुक", "फिक्स"]
 _AT_HOUR = re.compile(r"(?<![\w])(?:at|around|by)\s+\d{1,2}(?![\w:./-])")
 
 _TIME_HINT = re.compile(
-    r"\d{1,2}\s*(?::\d{2})?\s*(?:am|pm|baje|बजे)"
+    r"\d{1,2}\s*(?::\d{2})?\s*(?:am|pm|[ap]\s?\.\s?m(?![a-z])|[ap]\s+m(?![a-z])|baje|बजे)"
     r"|सुबह|दोपहर|शाम|रात|subah|dopahar|shaam|sham|raat",
     re.IGNORECASE,
 )
@@ -312,7 +320,7 @@ def _classify_appointment_related(normalized):
         return "reschedule_appointment"
 
     if _any(normalized, _AVAILABILITY_WORDS) and (
-        is_appt_context or _any(normalized, _DATE_WORDS)
+        is_appt_context or _any(normalized, _DATE_WORDS) or _NEXT_FREE.search(normalized)
     ):
         return "check_availability"
 

@@ -29,3 +29,9 @@ node_modules/
 
 # scratch scripts kept out of the project
 test_sarvam.py
+
+# replay reports (made-up conversations, and what the real model was sent in live runs)
+replay_results/
+
+# exports of clinic data (patient names and phones): never publish
+exports/

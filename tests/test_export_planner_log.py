@@ -112,6 +112,50 @@ class Export(unittest.TestCase):
         self.assertEqual(tables, {"patients"})
 
 
+class ModelFirstRows(unittest.TestCase):
+    """Model-first rows (route_detail "mf:<tool>", a state_card) export like any other, with or without the column."""
+
+    def test_a_model_first_row_exports_and_says_which_path_decided_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "mf_test.db")
+            conn = db.connect(path)
+            planner_log.record(conn, "voice", "it's a new patient called Nalin", "user said: 'x'; you called c(); result: r",
+                               "new_patient", {"name": "Nalin"}, "planner", "book_appointment", 900, [], backend="sarvam",
+                               route_detail="mf:new_patient", state_card="STATE CARD (names and last four phone digits only; no ids)")
+            planner_log.record(conn, "voice", "book Amit", None, None, None, "rules", "book_appointment", 5001, ["sarvam: timeout"],
+                               route_detail="mf_fallback_classic", state_card="STATE CARD ...")
+            conn.close()
+            ro = export.open_read_only(path)
+            self.addCleanup(ro.close)
+            cases = [export.to_case(r) for r in export.fetch(ro)]
+            self.assertEqual(cases[0][:3], ("it's a new patient called Nalin", "new_patient", {"name": "Nalin"}))
+            self.assertIn("route=planner/mf:new_patient", cases[0][4])
+            self.assertIn("route=rules/mf_fallback_classic", cases[1][4])
+            self.assertEqual(len(export.fetch(ro, problems=True)), 1)          # the fallback is a problem row; the planner row is not
+
+    def test_a_database_from_before_the_column_still_exports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "old_test.db")
+            old = sqlite3.connect(path)
+            old.executescript("""CREATE TABLE planner_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL DEFAULT (datetime('now')),
+                source TEXT NOT NULL DEFAULT 'voice', transcript TEXT NOT NULL, previous_turn TEXT, planner_tool TEXT,
+                planner_args_json TEXT, route_taken TEXT NOT NULL, final_intent TEXT, latency_ms INTEGER, override_notes TEXT,
+                outcome TEXT);
+                INSERT INTO planner_log (transcript, planner_tool, planner_args_json, route_taken, final_intent)
+                VALUES ('book Amit kal', 'book_appointment', '{"patient_name": "Amit"}', 'planner', 'book_appointment');""")
+            old.commit()
+            old.close()
+            ro = export.open_read_only(path)
+            self.addCleanup(ro.close)
+            rows = export.fetch(ro)
+            self.assertNotIn("state_card", rows[0])
+            self.assertEqual(export.to_case(rows[0])[:3], ("book Amit kal", "book_appointment", {"patient_name": "Amit"}))
+            conn = db.connect(path)                               # opening it with the app adds the nullable column in place
+            self.addCleanup(conn.close)
+            self.assertIn("state_card", {r[1] for r in conn.execute("PRAGMA table_info(planner_log)")})
+            self.assertIsNone(conn.execute("SELECT state_card FROM planner_log").fetchone()[0])
+
+
 class Readme(unittest.TestCase):
     def test_the_log_and_its_privacy_are_documented(self):
         readme = (ROOT / "README.md").read_text()

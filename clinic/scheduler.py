@@ -12,7 +12,11 @@ thread that, about once a minute,
       (bounded retries) and queues a full reconcile of today..+30 days about
       every 10 minutes (clinic/gcal_sync.py). This step runs LAST and is
       best-effort, so a slow or failing Google can never hold up patient
-      notifications.
+      notifications, and
+  (d) starts the idle internet check (clinic/network_health.py: a bare TCP
+      connect to Sarvam and WhatsApp) in its own short-lived thread, so a bad
+      network can never delay the tick, and re-evaluates the connection state
+      with the passage of time. NETWORK_PROBE_ENABLED=0 turns the check off.
 
 Design points:
   * start() is called from app.py's __main__ block only -- never at import
@@ -28,19 +32,21 @@ Design points:
 import logging
 import threading
 
-from clinic import followups, gcal_client, gcal_sync, notify
+from clinic import followups, gcal_client, gcal_sync, network_health, notify
 
 _logger = logging.getLogger(__name__)
 
 TICK_SECONDS = 60
 
 
-def tick(conn, sender=None, dry_run=False, now=None, calendar_client=None):
+def tick(conn, sender=None, dry_run=False, now=None, calendar_client=None, network_probe=None):
     """One scheduler pass. `sender`/`dry_run` as for notify.flush; `now` is a
     notify.Now (both clocks), injectable for tests. `calendar_client` is the
     Google Calendar client (a fake in tests); None means calendar sync is not
-    configured and that step is skipped. Returns a small summary dict; never
-    raises."""
+    configured and that step is skipped. `network_probe` is a callable run in a
+    background thread as the idle internet check (a fake in tests); None runs
+    the real check unless NETWORK_PROBE_ENABLED=0. Returns a small summary
+    dict; never raises."""
     now = now or notify.Now.real()
     summary = {"reminders_created": 0, "followup_reminders": 0, "flushed": {}, "errors": 0, "calendar": None}
 
@@ -70,6 +76,9 @@ def tick(conn, sender=None, dry_run=False, now=None, calendar_client=None):
             flushed = flushed or {}
             flushed[status] = flushed.get(status, 0) + count
     summary["flushed"] = flushed or {}
+    # The idle internet check runs in its own thread: starting it never waits for the network.
+    step("network-probe", lambda: network_health.start_probe(network_probe))
+    step("network-status", network_health.refresh)
     # Google Calendar sync last: it makes network calls that may be slow.
     if calendar_client is not None:
         summary["calendar"] = step("calendar", lambda: gcal_sync.tick(conn, calendar_client, now=now))

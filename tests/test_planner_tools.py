@@ -57,7 +57,7 @@ class Registry(unittest.TestCase):
             self.assertEqual(params["type"], "object")
             self.assertTrue(set(params["required"]) <= set(params["properties"]), fn["name"])
             for prop in params["properties"].values():
-                self.assertIn(prop["type"], ("string", "integer", "array"))
+                self.assertIn(prop["type"], ("string", "integer", "array", "boolean"))
 
     def test_the_schemas_never_offer_an_id_argument(self):
         for schema in tools.schemas():
@@ -101,8 +101,11 @@ class Validation(WithBranches):
         self.assertEqual(clean, {"patient_name": "Amit", "date": "2026-10-07", "time": "10:00"})
 
     def test_missing_required_argument(self):
-        self.bad("book_appointment", {"patient_name": "Amit", "date": "2026-10-07"}, "missing_required")
+        # book_appointment lacking its time is no longer an error (the app asks for it; Tool.askable, see
+        # tests/test_planner_missing_and_prose.py); a fee, a day count or an amount has no question, so these stay strict
         self.bad("record_visit", {"patient_name": "Amit"}, "missing_required")
+        self.bad("set_followup", {"patient_name": "Amit"}, "missing_required")
+        self.bad("log_expense", {}, "missing_required")
 
     def test_wrong_types_and_shapes(self):
         self.bad("record_visit", {"patient_name": "Amit", "fee": "a lot"}, "bad_value")

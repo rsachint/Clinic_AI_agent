@@ -26,6 +26,7 @@ database:
 """
 
 import base64
+import contextlib
 import logging
 import queue
 import threading
@@ -34,6 +35,7 @@ import uuid
 
 from flask import request
 from sarvamai import SarvamAI
+from websockets.exceptions import WebSocketException
 from sarvamai.types.realtime_audio_input import RealtimeAudioInput
 from sarvamai.types.realtime_end import RealtimeEnd
 from sarvamai.types.realtime_error import RealtimeError as SarvamRealtimeError
@@ -43,7 +45,7 @@ from sarvamai.types.realtime_transcript_partial import RealtimeTranscriptPartial
 from sarvamai.types.realtime_vad_speech_end import RealtimeVadSpeechEnd
 from sarvamai.types.realtime_vad_speech_start import RealtimeVadSpeechStart
 
-from clinic import branches, planner_log
+from clinic import branches, network_health, planner_log
 from clinic.nlu import planner
 from clinic.pipeline import (ClosurePlanResult, NavigateResult, ParsedResult, PipelineError, ReadResult,
                              SwitchBranchResult, WriteResult)
@@ -86,6 +88,49 @@ def _sarvam_stt_connect(api_key):
         encoding=_STT_ENCODING,
         sample_rate=_STT_SAMPLE_RATE,
     )
+
+
+# Opening the speech connection can fail for a moment (a Wi-Fi blip, a slow TLS handshake: the library gives
+# up after ~10 s). Audio spoken meanwhile waits in the listen's queue, so one quick retry costs nothing but time.
+_CONNECT_ATTEMPTS = 2
+_CONNECT_PAUSE_S = 0.5
+CONNECT_FAILED_MESSAGE = "Couldn't reach the speech service. Check the internet connection and try again."
+
+
+def is_network_error(exc):
+    """A failure to reach the speech service (timeout, refused/reset connection, TLS or websocket handshake
+    problem), as opposed to a refused key or a bug."""
+    return isinstance(exc, (OSError, TimeoutError, WebSocketException))
+
+
+@contextlib.contextmanager
+def _connect_with_retry(factory, api_key, attempts=None, pause_s=None, cancelled=lambda: False, wait=time.sleep):
+    """Open the speech connection, trying again after a short pause when it cannot be reached. Only network
+    errors are retried; any other error (a refused key, a bug) is raised at once. Errors raised while the
+    connection is in use are never retried here."""
+    attempts = attempts or _CONNECT_ATTEMPTS
+    pause_s = _CONNECT_PAUSE_S if pause_s is None else pause_s
+    stack = contextlib.ExitStack()
+    client = None
+    for attempt in range(1, attempts + 1):
+        started = time.monotonic()
+        try:
+            client = stack.enter_context(factory(api_key))
+            network_health.record("voice", True, (time.monotonic() - started) * 1000)
+            break
+        except Exception as exc:
+            # Only a real network failure counts for the connection chip; a refused key or a bug does not.
+            kind = network_health.classify(exc, "connect")
+            if kind:
+                network_health.record("voice", False, (time.monotonic() - started) * 1000, kind)
+            if not is_network_error(exc) or attempt >= attempts or cancelled():
+                raise
+            _logger.warning("Speech connection attempt %d/%d failed (%s); retrying", attempt, attempts, exc)
+            wait(pause_s)
+            if cancelled():
+                raise
+    with stack:
+        yield client
 
 
 class _Listen:
@@ -245,7 +290,8 @@ class VoiceSession:
         graceful = False
         deadline = time.monotonic() + self._max_listen_s
         try:
-            with self._stt_factory(self._api_key) as socket_client:
+            with _connect_with_retry(self._stt_factory, self._api_key, cancelled=listen.cancelled.is_set,
+                                     wait=listen.cancelled.wait) as socket_client:
                 reader = threading.Thread(target=self._run_reader, args=(socket_client, listen), daemon=True)
                 reader.start()
                 while not listen.cancelled.is_set():
@@ -262,9 +308,11 @@ class VoiceSession:
                             break
                         try:
                             socket_client.send_realtime_audio_input(RealtimeAudioInput(audio=payload))
-                        except Exception:
+                        except Exception as exc:
                             if not listen.cancelled.is_set():
                                 listen.reason = "error"
+                                if network_health.classify(exc):      # lost mid-use, not a refused key or a bug
+                                    network_health.record("voice", False, kind="dropped")
                                 self._emit("voice_error", {"message": "Lost the connection to the speech service."})
                             break
                     elif kind == _STOP:
@@ -292,7 +340,8 @@ class VoiceSession:
             listen.reason = "error"
             if not listen.cancelled.is_set():
                 _logger.exception("STT realtime connection failed for sid=%s", self.sid)
-                self._emit("voice_error", {"message": "Could not reach the speech service: {}".format(exc)})
+                self._emit("voice_error", {"message": CONNECT_FAILED_MESSAGE if is_network_error(exc)
+                                           else "Could not reach the speech service: {}".format(exc)})
         finally:
             with self._lock:
                 if self._active is listen:
@@ -536,6 +585,8 @@ class VoiceSession:
                 "data": json_data,
                 "citation": {"source": result.citation.source, "as_of": result.citation.as_of},
                 "scope_caption": result.scope_caption,
+                # a question that goes with the answer (the booking offer): buttons, tapping one is saying it
+                "options": [{"label": o["label"]} for o in (result.options or [])],
             })
             return
 

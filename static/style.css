@@ -108,7 +108,7 @@ tbody tr:hover td, table tr:not(:first-child):hover td { background: #fafbfc; }
 .stat .label { font-size: 12px; color: var(--muted); font-weight: 500; }
 .stat .value { font-family: var(--font-data); font-size: 26px; font-weight: 700; letter-spacing: -.01em; margin-top: 2px; font-variant-numeric: tabular-nums; }
 
-.review-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+.review-fields { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; min-width: min(320px, 100%); max-width: 420px; }
 .field-row { display: flex; flex-direction: column; gap: 6px; }
 .field-row label { font-size: 12px; color: var(--muted); font-weight: 600; }
 .field-row input, .field-row select { padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; font: inherit; background: #fff; }
@@ -330,6 +330,9 @@ details.card table { margin-top: 12px; }
 .bubble-assistant.bubble-wide { align-self: stretch; max-width: 100%; overflow-x: auto; }
 .bubble-assistant table th, .bubble-assistant table td { white-space: nowrap; }
 .bubble-assistant table td.cell-notes { white-space: normal; min-width: 180px; }
+/* a list in a cell (the free slots of a day) wraps as pills inside the card, never one clipped line */
+.bubble-assistant table td.cell-chips { white-space: normal; min-width: 160px; max-width: 520px; }
+.slot-chip { display: inline-block; margin: 2px 6px 2px 0; padding: 2px 10px; border: 1px solid var(--accent-line); border-radius: 999px; background: var(--accent-soft); color: var(--accent-dark); font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
 /* ---- branches: sidebar switcher, Settings, per-branch queue ---- */
 .branch-switcher { margin: 0 6px 14px; padding: 10px 12px; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; display: flex; flex-direction: column; gap: 6px; }
@@ -498,3 +501,46 @@ details.card table { margin-top: 12px; }
 #unanswered-card .unanswered-actions { white-space: normal; }
 #unanswered-card input.unanswered-note { font: inherit; min-width: 260px; padding: 7px 10px; border: 1px solid var(--border); border-radius: 8px; background: #fff; color: var(--text); }
 #unanswered-card .unanswered-closed { margin-top: 12px; }
+
+/* connection chip (static/network_chip.js): one status chip under the date, a popover on click */
+.net-chip-wrap { position: relative; margin-top: 10px; }
+.net-chip { display: inline-flex; align-items: center; gap: 7px; padding: 4px 11px; border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid var(--border); background: var(--bg); color: var(--muted); }
+.net-chip .net-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex: 0 0 auto; }
+.net-chip.net-good { background: var(--ok-soft); border-color: var(--ok-line); color: var(--ok-text); }
+.net-chip.net-good .net-dot { background: var(--ok); }
+.net-chip.net-slow { background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn-text); }
+.net-chip.net-slow .net-dot { background: var(--warn-border); }
+.net-chip.net-down { background: var(--danger-soft); border-color: var(--danger-line); color: var(--danger-dark); }
+.net-chip.net-down .net-dot { background: var(--danger); }
+.net-popover { position: absolute; z-index: 20; top: calc(100% + 8px); left: 0; width: 272px; max-width: calc(100vw - 32px); background: var(--card); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow-lg); padding: 14px 16px; font-size: 13px; }
+.net-popover[hidden], .net-pop-note[hidden] { display: none; }
+.net-pop-title { font-weight: 600; font-size: 13.5px; margin-bottom: 10px; }
+.net-pop-list { list-style: none; margin: 0 0 10px; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.net-pop-list li { display: flex; flex-direction: column; gap: 1px; }
+.net-pop-name { color: var(--text); }
+.net-pop-status { font-size: 12.5px; font-weight: 600; }
+.net-pop-status.net-ok { color: var(--ok-text); }
+.net-pop-status.net-slow { color: var(--warn-text); }
+.net-pop-status.net-down { color: var(--danger-dark); }
+.net-pop-note { font-size: 12px; color: var(--danger-dark); margin-bottom: 8px; }
+.net-pop-foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; border-top: 1px solid var(--border); padding-top: 10px; }
+.net-pop-checked { color: var(--muted); font-size: 12px; }
+.net-pop-link { background: transparent; border: none; padding: 2px 0; color: var(--accent); font-size: 12.5px; font-weight: 600; text-decoration: underline; cursor: pointer; }
+.net-pop-link:hover { color: var(--accent-dark); }
+
+/* Settings: Command understanding (static/settings_architecture.js) */
+.architecture-current { font-weight: 600; margin: 0 0 10px; }
+.architecture-option { display: flex; align-items: center; gap: 8px; padding: 6px 0; cursor: pointer; }
+.architecture-option input { width: auto; margin: 0; }
+.architecture-help { margin: -2px 0 8px 26px; font-size: 13px; }
+
+/* ---- Settings: collapsible configuration cards (static/settings_collapse.js) ---- */
+.settings-collapse-bar { display: flex; justify-content: flex-end; gap: 14px; margin: 0 0 10px; }
+.settings-collapse-bar .btn-link { background: none; border: none; padding: 2px 0; color: var(--accent); font-size: 13px; font-weight: 500; cursor: pointer; }
+.settings-collapse-bar .btn-link:hover { text-decoration: underline; }
+.card.collapsible > h2 { display: flex; align-items: center; cursor: pointer; user-select: none; border-radius: 8px; }
+.card.collapsible > h2:focus-visible { outline: 2px solid var(--accent-line); outline-offset: 4px; }
+.card.collapsible.collapsed > h2 { margin-bottom: 0; }
+.card-chevron { display: inline-block; flex: none; width: 7px; height: 7px; margin: 0 12px 2px 2px; border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted); transform: rotate(45deg); transition: transform .15s ease; }
+.card.collapsible.collapsed > h2 .card-chevron { transform: rotate(-45deg); }
+@media (prefers-reduced-motion: reduce) { .card-chevron { transition: none; } }

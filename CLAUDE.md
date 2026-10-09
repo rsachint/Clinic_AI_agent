@@ -28,6 +28,8 @@ product; this file is what you need to work in the code safely.
   suite was not run, and offer it in one line; run it only after a yes. Never bundle it into a restart or any other
   command. When launching a sub-agent, tell it in its brief not to run the full suite unless the user approved it: it
   runs targeted tests and reports.
+- **No visuals unless the user asks.** Explain in plain text: no diagrams, mockups, charts, widgets or artifacts, until
+  the user says so in that message. Approval for one visual does not carry over.
 - Other people's overlapping edits are normal here. Edit surgically; never reformat or revert unrelated code.
 
 ## Run and test

@@ -150,6 +150,89 @@ class AdditiveSchemaTests(unittest.TestCase):
             conn.close()
             conn2.close()
 
+    def test_planner_log_gains_the_state_card_column_in_place(self):
+        # planner_log exactly as it was before model-first mode (everything up to route_detail), with a row in it.
+        before = """
+        CREATE TABLE planner_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL DEFAULT (datetime('now')),
+            source TEXT NOT NULL DEFAULT 'voice' CHECK (source IN ('voice', 'wa_staff')),
+            transcript TEXT NOT NULL,
+            previous_turn TEXT,
+            planner_tool TEXT,
+            planner_args_json TEXT,
+            route_taken TEXT NOT NULL CHECK (route_taken IN ('rules', 'planner', 'label_fallback', 'rephrase')),
+            final_intent TEXT,
+            latency_ms INTEGER,
+            override_notes TEXT,
+            outcome TEXT CHECK (outcome IS NULL OR outcome IN ('approved', 'rejected', 'edited')),
+            backend TEXT, tokens_in INTEGER, tokens_out INTEGER, cost_paise INTEGER, route_detail TEXT
+        );"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "old.db")
+            old = sqlite3.connect(path)
+            old.executescript(before)
+            old.execute("INSERT INTO planner_log (transcript, route_taken, route_detail) VALUES ('move Manju', 'rules', 'rule:move')")
+            old.commit()
+            old.close()
+            conn = db.connect(path)
+            conn2 = db.connect(path)    # idempotent
+            self.assertIn("state_card", columns(conn, "planner_log"))
+            row = conn.execute("SELECT * FROM planner_log").fetchone()
+            self.assertEqual((row["transcript"], row["route_detail"], row["state_card"]), ("move Manju", "rule:move", None))
+            sql = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'planner_log'").fetchone()[0]
+            self.assertIn("'rules', 'planner', 'label_fallback', 'rephrase'", sql)        # the route CHECK is untouched
+            from clinic import planner_log
+            planner_log.record(conn, "voice", "book Amit", None, "book_appointment", {}, "planner", "book_appointment", 10, [],
+                               route_detail="mf:book_appointment", state_card="STATE CARD")
+            planner_log.record(conn, "voice", "plain", None, None, None, "rules", "x", 1, [])      # classic rows leave it NULL
+            self.assertEqual([r[0] for r in conn.execute("SELECT state_card FROM planner_log ORDER BY id")], [None, "STATE CARD", None])
+            conn.close()
+            conn2.close()
+
+    def test_a_fresh_database_has_the_state_card_column_and_nothing_else_new(self):
+        conn = db.connect(":memory:")
+        self.assertTrue({"route_detail", "state_card"} <= columns(conn, "planner_log"))
+        self.assertEqual(conn.execute("SELECT value FROM app_settings WHERE key = 'intent_architecture'").fetchone(), None)   # classic by default
+
+    def test_the_read_views_are_added_in_place_idempotently_and_change_no_table(self):
+        from clinic import read_schema
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "old.db")
+            self.make_old(path)                      # a database from before the read views existed
+            conn = db.connect(path)
+            conn2 = db.connect(path)                 # idempotent: CREATE VIEW IF NOT EXISTS
+            views = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'view'")}
+            self.assertEqual(views, set(read_schema.VIEW_NAMES))
+            first = {r[0]: r[1] for r in conn.execute("SELECT name, sql FROM sqlite_master WHERE type = 'view'")}
+            conn3 = db.connect(path)
+            self.assertEqual({r[0]: r[1] for r in conn3.execute("SELECT name, sql FROM sqlite_master WHERE type = 'view'")}, first)
+            row = conn.execute("SELECT * FROM wa_messages").fetchone()
+            self.assertEqual((row["raw_text"], row["status"]), ("hello", "classified"))     # existing rows untouched
+            with self.assertRaises(sqlite3.OperationalError):                               # a view is not a table: nothing can be written to it
+                conn.execute("INSERT INTO v_patients (name) VALUES ('x')")
+            conn.close()
+            conn2.close()
+            conn3.close()
+
+    def test_views_that_call_a_function_only_the_read_connection_has_do_not_block_other_work_on_the_database(self):
+        conn = db.connect(":memory:")
+        # v_branches and v_roster_days call today_ist(), which this ordinary connection does not have ...
+        with self.assertRaises(sqlite3.OperationalError):
+            conn.execute("SELECT * FROM v_branches").fetchall()
+        # ... and that must not stop anything else: more columns, other queries, a second connect (schema re-run)
+        conn.execute("ALTER TABLE patients ADD COLUMN extra_test_column TEXT")
+        db.ensure_columns(conn)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM v_patients").fetchone()[0], 0)
+        conn.execute("PRAGMA integrity_check")
+        conn.close()
+
+    def test_the_views_exist_on_a_fresh_database_and_the_other_tables_are_the_same_as_before(self):
+        conn = db.connect(":memory:")
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        self.assertFalse([t for t in tables if t.startswith("v_")])
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'view'").fetchone()[0], 17)
+
     def test_session_table_constraints(self):
         conn = db.connect(":memory:")
         with self.assertRaises(sqlite3.IntegrityError):
@@ -158,6 +241,24 @@ class AdditiveSchemaTests(unittest.TestCase):
             conn.execute("INSERT INTO wa_sessions (wa_id, goal) VALUES ('2', 'register')")
         conn.execute("INSERT INTO wa_sessions (wa_id) VALUES ('3')")
         self.assertEqual(conn.execute("SELECT mode, goal FROM wa_sessions").fetchone()[:], ("agent", None))
+
+    def test_network_events_is_a_new_table_added_in_place_and_nothing_else_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "old.db")
+            self.make_old(path)                      # a database from before the connection log existed
+            conn = db.connect(path)
+            conn2 = db.connect(path)                 # idempotent
+            self.assertEqual(columns(conn, "network_events"),
+                             {"id", "ts", "service", "kind", "detail", "duration_ms"})
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM network_events").fetchone()[0], 0)
+            row = conn.execute("SELECT * FROM wa_messages").fetchone()
+            self.assertEqual((row["raw_text"], row["status"]), ("hello", "classified"))    # existing rows untouched
+            conn.execute("INSERT INTO network_events (service, kind, detail, duration_ms) "
+                         "VALUES ('voice', 'connect', 'Could not connect', 10001)")
+            with self.assertRaises(sqlite3.IntegrityError):                                # fixed service names only
+                conn.execute("INSERT INTO network_events (service) VALUES ('telephone')")
+            conn.close()
+            conn2.close()
 
 
 if __name__ == "__main__":
