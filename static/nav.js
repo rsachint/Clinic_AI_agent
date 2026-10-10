@@ -15,6 +15,7 @@ var NAV_TABS = [
   { id: "connectors", label: "Connectors", icon: "🔌" },
   { id: "audit", label: "Audit log", icon: "📜" },
   { id: "settings", label: "Settings", icon: "⚙️" },
+  { id: "help", label: "Need help", icon: "🛟" },
   { id: "profile", label: "Profile", icon: "👤" },
   { id: "login", label: "Login/Logout", icon: "🔑" },
 ];

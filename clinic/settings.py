@@ -13,6 +13,10 @@ switch live here:
                              planner records each command it handled in the
                              local `planner_log` table (clinic/planner_log.py).
 
+  help_sla_hours             integer, default 24  -- the target time, in wall-clock hours from sending, for a
+                             "Need help" request to be resolved (clinic/help_requests.py). Each request
+                             copies the value when it is sent, so changing it only affects new requests.
+
   fu_days_before / fu_send_time / fu_hours_before / fu_earliest_send
                              when the two follow-up reminders go out (clinic/followups.py):
                              N days before at HH:MM, and N hours before the slot but never
@@ -33,6 +37,7 @@ from datetime import datetime
 AUTO_ENABLED = "auto_appointments_enabled"
 AUTO_DAILY_CAP = "auto_daily_cap"
 PLANNER_LOG = "planner_log_enabled"
+HELP_SLA_HOURS = "help_sla_hours"
 
 FU_DAYS_BEFORE = "fu_days_before"
 FU_SEND_TIME = "fu_send_time"
@@ -49,6 +54,7 @@ DEFAULTS = {
     FU_EARLIEST_SEND: "07:00",
     FU_APPROVED_TEMPLATES: "[]",
     PLANNER_LOG: "1",
+    HELP_SLA_HOURS: "24",
 }
 
 MAX_DAILY_CAP = 1000
@@ -201,3 +207,33 @@ def planner_log_enabled(conn):
 
 def set_planner_log_enabled(conn, enabled):
     set_value(conn, PLANNER_LOG, "1" if enabled else "0")
+
+
+# ---------------------------------------------------------------------------
+# "Need help": the target time to resolve a request
+# ---------------------------------------------------------------------------
+
+MIN_HELP_SLA_HOURS, MAX_HELP_SLA_HOURS = 1, 720      # one hour to thirty days
+
+
+def help_sla_hours(conn):
+    """The target hours for a new help request; a bad stored value falls back to the default."""
+    try:
+        hours = int(get(conn, HELP_SLA_HOURS))
+    except (TypeError, ValueError):
+        return int(DEFAULTS[HELP_SLA_HOURS])
+    return hours if MIN_HELP_SLA_HOURS <= hours <= MAX_HELP_SLA_HOURS else int(DEFAULTS[HELP_SLA_HOURS])
+
+
+def set_help_sla_hours(conn, hours):
+    """Validate and save. Raises ValueError with a message meant for staff."""
+    label = "Hours"
+    if isinstance(hours, bool):
+        raise ValueError("{} must be a whole number.".format(label))
+    try:
+        number = int(str(hours).strip())
+    except (TypeError, ValueError):
+        raise ValueError("{} must be a whole number.".format(label))
+    if not MIN_HELP_SLA_HOURS <= number <= MAX_HELP_SLA_HOURS:
+        raise ValueError("{} must be between {} and {}.".format(label, MIN_HELP_SLA_HOURS, MAX_HELP_SLA_HOURS))
+    set_value(conn, HELP_SLA_HOURS, number)

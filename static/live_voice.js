@@ -871,6 +871,137 @@ document.addEventListener("DOMContentLoaded", function () {
     setState("error");
     flashCaption(data.message, 0);
   });
+
+  // ---- dictation (the "Need help" box, static/help.js) --------------------------------------
+  // Click to start, click to stop. The same microphone capture (startCapture / releaseCapture above) and the
+  // same speech connection as hold-to-talk, but on its OWN socket events, so nothing here touches the
+  // assistant's conversation, its talk key or its status line. The recognised text is only handed to the page
+  // that asked for it, through the handlers given to window.Dictation.start; the server never treats it as a
+  // command (clinic/realtime_voice.py, dictation mode).
+  //
+  // handlers: onState("starting"|"listening"|"finishing"|"idle"), onText(text), onPartial(text),
+  //           onError(message), onEnd({ heard, reason }).
+  var DICTATION_MAX_MS = 120000;       // the server stops it at 120 s too
+  var DICTATION_END_WAIT_MS = 9000;    // after stop: give up waiting for the server's closing event
+  var dictation = null;                // { id, serverReady, buffer[], over, stopRequested, chunks, handlers, ... }
+
+  function dictationFlush(d) {
+    var chunks = d.buffer;
+    d.buffer = [];
+    chunks.forEach(function (audio) { socket.emit("dictation_audio", { id: d.id, audio: audio }); });
+  }
+
+  function dictationFinish(d, state) {
+    if (!d || d.done) return;
+    d.done = true;
+    clearTimeout(d.cap);
+    clearTimeout(d.endWait);
+    clearInterval(d.pump);
+    releaseCapture(d);                 // the microphone is released whatever way this ends
+    if (dictation === d) dictation = null;
+    if (d.handlers.onState) d.handlers.onState(state || "idle");
+  }
+
+  // Something went wrong: tell the server to drop it, give the microphone back, tell the page.
+  function dictationFail(d, message) {
+    if (!d || d.done) return;
+    socket.emit("dictation_cancel", { id: d.id });
+    dictationFinish(d, "idle");
+    if (d.handlers.onError) d.handlers.onError(message);
+  }
+
+  function dictationStop() {
+    var d = dictation;
+    if (!d || d.stopRequested || d.done) return false;
+    d.stopRequested = true;
+    releaseCapture(d);                 // microphone off immediately
+    if (d.chunks === 0) {
+      // Nothing was captured (the microphone was still opening): nothing to send.
+      socket.emit("dictation_cancel", { id: d.id });
+      dictationFinish(d, "idle");
+      if (d.handlers.onError) d.handlers.onError("The microphone was not ready. Try again.");
+      return true;
+    }
+    if (d.handlers.onState) d.handlers.onState("finishing");
+    if (d.serverReady) {
+      dictationFlush(d);
+      socket.emit("dictation_stop", { id: d.id });
+    }                                  // else: sent right after the buffered audio, when the server is ready
+    d.endWait = setTimeout(function () { dictationFinish(d, "idle"); }, DICTATION_END_WAIT_MS);
+    return true;
+  }
+
+  function dictationCancel() {
+    var d = dictation;
+    if (!d) return false;
+    socket.emit("dictation_cancel", { id: d.id });
+    dictationFinish(d, "idle");
+    return true;
+  }
+
+  function dictationStart(handlers) {
+    if (dictation) return false;
+    var h = handlers || {};
+    if (!socket.connected) {
+      if (h.onError) h.onError("Not connected to the server. Wait a moment, or reload the page.");
+      return false;
+    }
+    seq += 1;
+    var d = { id: seq, ready: false, serverReady: false, buffer: [], over: false, stopRequested: false, done: false,
+              chunks: 0, handlers: h };
+    dictation = d;
+    if (h.onState) h.onState("starting");
+    // d.ready stays false on purpose: startCapture then keeps every chunk in d.buffer, and the pump below
+    // sends them on the dictation event once the server has opened the speech connection.
+    d.pump = setInterval(function () { if (d.serverReady && !d.done) dictationFlush(d); }, 100);
+    d.cap = setTimeout(dictationStop, DICTATION_MAX_MS);
+    socket.emit("dictation_start", { id: d.id });
+    startCapture(d).then(function () {
+      if (!d.over && !d.done && h.onState) h.onState("listening");
+    }).catch(function (err) {
+      if (d.over || d.done) return;
+      dictationFail(d, "Microphone access failed: " + err.message + ". Allow microphone access and try again.");
+    });
+    return true;
+  }
+
+  window.Dictation = {
+    supported: function () { return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia); },
+    start: dictationStart,
+    stop: dictationStop,
+    cancel: dictationCancel,
+    active: function () { return !!dictation; },
+  };
+
+  socket.on("dictation_ready", function (data) {
+    var d = dictation;
+    if (!d || !data || d.id !== data.id || d.serverReady) return;
+    d.serverReady = true;
+    dictationFlush(d);
+    if (d.stopRequested) socket.emit("dictation_stop", { id: d.id });
+  });
+  socket.on("dictation_partial", function (data) {
+    var d = dictation;
+    if (d && data && d.id === data.id && d.handlers.onPartial) d.handlers.onPartial(String(data.text || ""));
+  });
+  socket.on("dictation_text", function (data) {
+    var d = dictation;
+    if (d && data && d.id === data.id && d.handlers.onText) d.handlers.onText(String(data.text || ""));
+  });
+  socket.on("dictation_end", function (data) {
+    var d = dictation;
+    if (!d || !data || d.id !== data.id) return;
+    var handlers = d.handlers;
+    dictationFinish(d, "idle");
+    if (handlers.onEnd) handlers.onEnd({ heard: !!data.heard, reason: data.reason || "stopped" });
+  });
+  socket.on("dictation_error", function (data) {
+    dictationFail(dictation, (data && data.message) || "Dictation stopped.");
+  });
+  socket.on("disconnect", function () {
+    dictationFail(dictation, "Lost the connection. Dictation stopped.");
+  });
+  window.addEventListener("pagehide", function () { dictationCancel(); });
 });
 
 if (typeof module !== "undefined" && module.exports) {

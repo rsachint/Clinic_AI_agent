@@ -23,6 +23,13 @@ database:
   `transcript_to_response`) -- never LLM-phrased -- shown as text only; this
   module never speaks a reply back (no echo-back by design, see the
   `read_answer` event).
+
+A second, separate mode exists for the "Need help" panel: DICTATION (see `_MODE_DICTATION`). It reuses the same
+microphone stream and the same Sarvam connection code, but its final transcripts are emitted as `dictation_text`
+and go NOWHERE else: never to `handle_turn`, the planner, review cards, voice memory or any intent. It has its own
+socket events (`dictation_start` / `dictation_audio` / `dictation_stop` / `dictation_cancel` in, `dictation_ready`
+/ `dictation_partial` / `dictation_text` / `dictation_error` / `dictation_end` out), so the assistant's
+hold-to-talk handlers neither see nor change it.
 """
 
 import base64
@@ -70,9 +77,32 @@ _STT_ENCODING = "linear16"
 _MAX_LISTEN_S = 60.0     # hard server-side cap on one listen, however it ends up open
 _FINAL_WAIT_S = 4.0      # after listen_stop, how long to wait for the final transcript
 _TAIL_SILENCE_S = 0.8    # PCM silence appended on stop so the server VAD closes the utterance
+# The speech service refuses one audio frame above 16000 bytes (stream_type "fast"); the 0.8 s of tail silence is
+# 25600 bytes, so it goes out in frames of at most this size (0.25 s each).
+_MAX_STT_FRAME_BYTES = 8000
+
+
+def _silence_frames(seconds):
+    """The PCM16 silence of `seconds` as base64 frames, none over _MAX_STT_FRAME_BYTES."""
+    total = int(int(_STT_SAMPLE_RATE) * 2 * seconds)
+    total -= total % 2                                      # whole 16-bit samples
+    frames = []
+    while total > 0:
+        size = min(_MAX_STT_FRAME_BYTES, total)
+        frames.append(base64.b64encode(b"\x00" * size).decode("ascii"))
+        total -= size
+    return frames
 _READER_JOIN_S = 15.0    # let an in-flight pipeline call finish before reporting the listen done
 
 _AUDIO, _STOP, _CANCEL = "audio", "stop", "cancel"
+
+# A listen is either a spoken COMMAND (hold-to-talk: the transcript is handled by the pipeline) or DICTATION (the
+# transcript is only handed back as text for a text box and is never interpreted). Dictation is click-to-start /
+# click-to-stop, so it gets a longer safety cap.
+_MODE_COMMAND, _MODE_DICTATION = "command", "dictation"
+_MAX_DICTATION_S = 120.0
+_MAX_DICTATION_CHARS = 1000     # one dictated sentence handed to the page is never longer than this
+_NO_KEY_MESSAGE = "Voice is off: add SARVAM_API_KEY to the .env file and restart the app."
 
 
 def _sarvam_stt_connect(api_key):
@@ -137,8 +167,9 @@ class _Listen:
     """One hold-to-talk utterance: its own outbound queue, STT connection and
     writer/reader threads. Nothing here outlives the listen."""
 
-    def __init__(self, listen_id):
+    def __init__(self, listen_id, mode=_MODE_COMMAND):
         self.id = listen_id
+        self.mode = mode
         self.queue = queue.Queue()
         self.cancelled = threading.Event()   # discard everything, close now
         self.stopping = threading.Event()    # key released (or cap hit): no more audio accepted
@@ -179,7 +210,7 @@ class VoiceSession:
 
     def __init__(self, sid, api_key, emit, get_conn, clinical_adapter, ops_adapter, deferred_intents,
                  stt_factory=None, max_listen_s=_MAX_LISTEN_S, final_wait_s=_FINAL_WAIT_S,
-                 tail_silence_s=_TAIL_SILENCE_S, review_transcripts=False):
+                 tail_silence_s=_TAIL_SILENCE_S, review_transcripts=False, max_dictation_s=_MAX_DICTATION_S):
         self.sid = sid
         self._api_key = api_key
         self._emit = emit  # emit(event, data) -- already scoped to this session's room
@@ -189,6 +220,7 @@ class VoiceSession:
         self._deferred_intents = deferred_intents
         self._stt_factory = stt_factory or _sarvam_stt_connect
         self._max_listen_s = max_listen_s
+        self._max_dictation_s = max_dictation_s
         self._final_wait_s = final_wait_s
         self._tail_silence_s = tail_silence_s
 
@@ -214,29 +246,54 @@ class VoiceSession:
         """Open an STT session now. One listen at a time accepts audio: a
         still-active earlier listen is cancelled first. Returns False once the
         browser has disconnected."""
+        return self._start_listen(listen_id, _MODE_COMMAND)
+
+    def dictation_start(self, listen_id=None):
+        """Open an STT session whose text only goes back to the page (the Need help box). Refused while a
+        spoken command is being held (the microphone is in use); a dictation already running is replaced."""
+        return self._start_listen(listen_id, _MODE_DICTATION)
+
+    def _start_listen(self, listen_id, mode):
         if not self._api_key and self._stt_factory is _sarvam_stt_connect:
             # Everything else in the app works without a speech key; only the
             # microphone needs it. Say so instead of failing mysteriously.
-            self._emit("voice_error", {"message": "Voice is off: add SARVAM_API_KEY to the .env file and restart the app."})
+            self._emit_error(mode, _NO_KEY_MESSAGE)
             return False
         with self._lock:
             if self._closed.is_set():
                 return False
             if self._active is not None:
+                if mode == _MODE_DICTATION and self._active.mode == _MODE_COMMAND:
+                    self._emit_error(mode, "The microphone is in use for a spoken command. Let go of the talk key and try again.")
+                    return False
                 self._cancel_locked(self._active)
-            listen = _Listen(listen_id)
+            listen = _Listen(listen_id, mode)
             listen.thread = threading.Thread(target=self._run_listen, args=(listen,), daemon=True)
             self._listens.append(listen)
             self._active = listen
             listen.thread.start()
             return True
 
+    def _emit_error(self, mode, message):
+        """The error line for the page that is listening: the assistant's, or the dictation box's own."""
+        self._emit("dictation_error" if mode == _MODE_DICTATION else "voice_error", {"message": message})
+
     def send_audio(self, audio_b64):
         """Queue one audio chunk. Dropped unless a listen is active -- the
         server never forwards audio the user did not hold the key for."""
         with self._lock:
             listen = self._active
-            if listen is None or listen.stopping.is_set() or listen.cancelled.is_set():
+            if listen is None or listen.mode != _MODE_COMMAND or listen.stopping.is_set() or listen.cancelled.is_set():
+                return False
+            listen.queue.put((_AUDIO, audio_b64))
+            return True
+
+    def dictation_audio(self, listen_id, audio_b64):
+        """One chunk for the running dictation. Dropped unless THAT dictation is the active listen."""
+        with self._lock:
+            listen = self._active
+            if (listen is None or listen.mode != _MODE_DICTATION or listen.id != listen_id
+                    or listen.stopping.is_set() or listen.cancelled.is_set()):
                 return False
             listen.queue.put((_AUDIO, audio_b64))
             return True
@@ -245,7 +302,16 @@ class VoiceSession:
         """Key released: finish the utterance (final transcript -> pipeline)."""
         with self._lock:
             listen = self._active
-            if listen is None:
+            if listen is None or listen.mode != _MODE_COMMAND:
+                return False
+            self._begin_stop_locked(listen)
+            return True
+
+    def dictation_stop(self, listen_id):
+        """Click to stop dictating: finish the utterance (its text comes back as `dictation_text`)."""
+        with self._lock:
+            listen = self._active
+            if listen is None or listen.mode != _MODE_DICTATION or listen.id != listen_id:
                 return False
             self._begin_stop_locked(listen)
             return True
@@ -256,7 +322,14 @@ class VoiceSession:
         kill an earlier listen that is still finishing); otherwise all."""
         with self._lock:
             for listen in list(self._listens):
-                if listen_id is None or listen.id == listen_id:
+                if listen.mode == _MODE_COMMAND and (listen_id is None or listen.id == listen_id):
+                    self._cancel_locked(listen)
+
+    def dictation_cancel(self, listen_id=None):
+        """Throw the dictation away (closing the box, leaving the page): its text is dropped."""
+        with self._lock:
+            for listen in list(self._listens):
+                if listen.mode == _MODE_DICTATION and (listen_id is None or listen.id == listen_id):
                     self._cancel_locked(listen)
 
     def stop(self):
@@ -288,7 +361,7 @@ class VoiceSession:
     def _run_listen(self, listen):
         reader = None
         graceful = False
-        deadline = time.monotonic() + self._max_listen_s
+        deadline = time.monotonic() + (self._max_dictation_s if listen.mode == _MODE_DICTATION else self._max_listen_s)
         try:
             with _connect_with_retry(self._stt_factory, self._api_key, cancelled=listen.cancelled.is_set,
                                      wait=listen.cancelled.wait) as socket_client:
@@ -313,7 +386,7 @@ class VoiceSession:
                                 listen.reason = "error"
                                 if network_health.classify(exc):      # lost mid-use, not a refused key or a bug
                                     network_health.record("voice", False, kind="dropped")
-                                self._emit("voice_error", {"message": "Lost the connection to the speech service."})
+                                self._emit_error(listen.mode, "Lost the connection to the speech service.")
                             break
                     elif kind == _STOP:
                         graceful = True
@@ -324,9 +397,8 @@ class VoiceSession:
                 if graceful and not listen.cancelled.is_set():
                     try:
                         if self._tail_silence_s > 0:
-                            silence = b"\x00" * int(int(_STT_SAMPLE_RATE) * 2 * self._tail_silence_s)
-                            socket_client.send_realtime_audio_input(
-                                RealtimeAudioInput(audio=base64.b64encode(silence).decode("ascii")))
+                            for frame in _silence_frames(self._tail_silence_s):
+                                socket_client.send_realtime_audio_input(RealtimeAudioInput(audio=frame))
                         socket_client.send_realtime_end(RealtimeEnd())
                         listen.end_sent.set()
                         listen.settled.wait(self._final_wait_s)
@@ -340,8 +412,8 @@ class VoiceSession:
             listen.reason = "error"
             if not listen.cancelled.is_set():
                 _logger.exception("STT realtime connection failed for sid=%s", self.sid)
-                self._emit("voice_error", {"message": CONNECT_FAILED_MESSAGE if is_network_error(exc)
-                                           else "Could not reach the speech service: {}".format(exc)})
+                self._emit_error(listen.mode, CONNECT_FAILED_MESSAGE if is_network_error(exc)
+                                 else "Could not reach the speech service: {}".format(exc))
         finally:
             with self._lock:
                 if self._active is listen:
@@ -349,7 +421,13 @@ class VoiceSession:
                 if listen in self._listens:
                     self._listens.remove(listen)
             listen.done.set()
-            if not listen.cancelled.is_set() and not self._closed.is_set():
+            if listen.mode == _MODE_DICTATION:
+                # The dictation box always hears how its listen ended (a cancelled one too: the page must give
+                # the microphone back and reset its button).
+                if not self._closed.is_set():
+                    self._emit("dictation_end", {"id": listen.id, "heard": listen.heard,
+                                                 "reason": "cancelled" if listen.cancelled.is_set() else listen.reason})
+            elif not listen.cancelled.is_set() and not self._closed.is_set():
                 self._emit("listen_end", {"id": listen.id, "heard": listen.heard, "reason": listen.reason})
 
     def _run_reader(self, socket_client, listen):
@@ -370,6 +448,9 @@ class VoiceSession:
         # Nothing is processed unless a listen is open (and not discarded).
         if listen is None or listen.cancelled.is_set() or listen.done.is_set() or self._closed.is_set():
             return
+        if listen.mode == _MODE_DICTATION:
+            self._handle_dictation_event(message, listen)
+            return
         if isinstance(message, RealtimeSessionBegin):
             self._emit("session_ready", {"id": listen.id})
         elif isinstance(message, RealtimeVadSpeechStart):
@@ -388,6 +469,25 @@ class VoiceSession:
                 listen.settled.set()
         elif isinstance(message, SarvamRealtimeError):
             self._emit("voice_error", {"message": message.message})
+
+    def _handle_dictation_event(self, message, listen):
+        """Speech events of a dictation listen. The ONLY thing a final transcript does here is go back to the page
+        as `dictation_text`: it is never handed to handle_turn, the planner, a review card, the voice memory, the
+        language hint or any intent, whatever the words say ("cancel Rahul's appointment" is just text)."""
+        if isinstance(message, RealtimeSessionBegin):
+            self._emit("dictation_ready", {"id": listen.id})
+        elif isinstance(message, RealtimeTranscriptPartial):
+            self._emit("dictation_partial", {"id": listen.id, "text": message.text})
+        elif isinstance(message, RealtimeTranscriptFinal):
+            text = (message.text or "").strip()
+            if text:
+                listen.heard = True
+                self._emit("dictation_text", {"id": listen.id, "text": text[:_MAX_DICTATION_CHARS]})
+            if listen.end_sent.is_set():
+                listen.settled.set()
+        elif isinstance(message, SarvamRealtimeError):
+            self._emit("dictation_error", {"message": message.message})
+        # voice-activity events are not forwarded: the assistant's screen has nothing to do with dictation
 
     # -- transcript review (staff can correct what was heard) -----------
 
@@ -696,5 +796,30 @@ def register_realtime_voice(socketio, api_key, get_conn, clinical_adapter, ops_a
         session = sessions.get(request.sid)
         if session:
             session.listen_cancel(data.get("id") if isinstance(data, dict) else None)
+
+    # Dictation (the Need help box): same audio and speech connection, its own events. See VoiceSession.
+    @socketio.on("dictation_start")
+    def _on_dictation_start(data=None):
+        session = sessions.get(request.sid)
+        if session:
+            session.dictation_start(data.get("id") if isinstance(data, dict) else None)
+
+    @socketio.on("dictation_audio")
+    def _on_dictation_audio(data=None):
+        session = sessions.get(request.sid)
+        if session and isinstance(data, dict) and data.get("audio"):
+            session.dictation_audio(data.get("id"), data["audio"])
+
+    @socketio.on("dictation_stop")
+    def _on_dictation_stop(data=None):
+        session = sessions.get(request.sid)
+        if session and isinstance(data, dict):
+            session.dictation_stop(data.get("id"))
+
+    @socketio.on("dictation_cancel")
+    def _on_dictation_cancel(data=None):
+        session = sessions.get(request.sid)
+        if session:
+            session.dictation_cancel(data.get("id") if isinstance(data, dict) else None)
 
     return sessions

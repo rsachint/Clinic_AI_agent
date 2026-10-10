@@ -5,11 +5,12 @@ import threading
 from datetime import date, datetime, timedelta
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_file
 from flask_socketio import SocketIO
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from clinic import (architecture, auto_actions, booking_blocks, booking_phone, branches, closures, conv_runtime, conversation, core, followup_notify, followups,
-                    gcal_client, gcal_config, gcal_sync, network_health, notify, patient_activity, planner_log, scheduler, scheduling, settings,
+                    gcal_client, gcal_config, gcal_sync, help_requests, help_uploads, network_health, notify, patient_activity, planner_log, scheduler, scheduling, settings,
                     token_queue, unanswered, whatsapp as wa)
 from clinic.adapters.registry import build_write_handlers, get_adapters
 from clinic.asr import transcribe
@@ -1682,6 +1683,268 @@ def unanswered_notices():
 @app.route("/unanswered/<int:item_id>/notified", methods=["POST"])
 def unanswered_notified(item_id):
     return jsonify(ok=True, changed=unanswered.mark_notified(get_conn(), item_id, _clinic_now()))
+
+
+# -- "Need help": feedback about how the app feels to use (clinic/help_requests.py) ---------------------
+# FEEDBACK RECORDS, not clinic data: nothing here proposes or commits anything, nothing goes through
+# core.propose, and the planner and voice pipeline never see a help request. The username always comes
+# from help_requests.current_user() (a stand-in until login exists), never from the browser. Known limits:
+# there is no CSRF protection anywhere in this app yet (these routes included), and the /help/team/* routes
+# have no access control until login exists. The size limit is set on the upload route only (the rest of the
+# app, WhatsApp webhooks included, has no limit set and is not changed).
+
+# Werkzeug's multipart parser also buffers a chunk of a FILE against this cap, so it must sit well above its 64 KB
+# read size: at 64 KB any real image over that size was refused as "too large". The text fields have their own
+# limits (description length, the 30-part cap) and the whole body is capped by MAX_BODY_BYTES.
+HELP_FORM_MEMORY_BYTES = 1024 * 1024
+HELP_FORM_PARTS = 30                   # more parts than this is refused outright
+
+
+def _help_error(exc):
+    body = {"ok": False, "error": str(exc), "code": getattr(exc, "code", "invalid")}
+    body.update(getattr(exc, "extra", {}) or {})
+    return jsonify(body), getattr(exc, "status", 400)
+
+
+def _help_too_large(limit_text):
+    return jsonify(ok=False, code="too_large", error="That is too large. {}".format(limit_text)), 413
+
+
+def _help_download(path, name, mime):
+    response = send_file(str(path), mimetype=mime, as_attachment=True, download_name=name,
+                         max_age=0)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Content-Security-Policy"] = "default-src 'none'; sandbox"
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
+@app.route("/help/config")
+def help_config():
+    conn = get_conn()
+    try:
+        return jsonify(ok=True, data=help_requests.config_view(conn, help_requests.current_user()))
+    finally:
+        conn.close()
+
+
+@app.route("/help/requests", methods=["POST"])
+def help_request_create():
+    """multipart/form-data: category, description, severity, source, context (JSON text), files (0-5).
+    All or nothing: a request that is refused leaves no row and no file."""
+    request.max_content_length = help_uploads.MAX_BODY_BYTES
+    request.max_form_memory_size = HELP_FORM_MEMORY_BYTES
+    request.max_form_parts = HELP_FORM_PARTS
+    limit_text = "At most {} files, {} MB each and {} MB in all.".format(
+        help_uploads.MAX_FILES, help_uploads.MAX_FILE_BYTES // (1024 * 1024), help_uploads.MAX_TOTAL_BYTES // (1024 * 1024))
+    if request.content_length is not None and request.content_length > help_uploads.MAX_BODY_BYTES:
+        return _help_too_large(limit_text)
+    try:
+        form, uploads = request.form, request.files.getlist("files")
+    except RequestEntityTooLarge:
+        return _help_too_large(limit_text)
+    uploads = [u for u in uploads if (u.filename or "").strip()]
+    try:
+        context = json.loads(form.get("context") or "{}")
+    except ValueError:
+        context = {}
+    conn = get_conn()
+    staged = None
+    try:
+        user = help_requests.current_user()
+        help_requests.validate_fields(conn, form.get("category"), form.get("description"), form.get("severity"),
+                                      form.get("source"), bool(uploads))
+        staged = help_uploads.stage_files(uploads)
+        data = help_requests.create_request(
+            conn, user["username"], form.get("category"), form.get("description"), form.get("severity"), form.get("source"),
+            staged=staged, context=context, now=_clinic_now(), extra_context={"app_version": os.environ.get("APP_VERSION")})
+        staged = None            # create_request owns (and has dealt with) the staged files from here
+        return jsonify(ok=True, data=data), 201
+    except (help_requests.HelpError, help_uploads.UploadError) as exc:
+        return _help_error(exc)
+    finally:
+        if staged is not None:
+            staged.discard()
+        conn.close()
+
+
+@app.route("/help/requests")
+def help_request_list():
+    conn = get_conn()
+    try:
+        return jsonify(ok=True, requests=help_requests.list_for_user(conn, help_requests.current_user()["username"], _clinic_now()))
+    finally:
+        conn.close()
+
+
+@app.route("/help/requests/<int:request_id>")
+def help_request_detail(request_id):
+    conn = get_conn()
+    try:
+        item = help_requests.get_request(conn, request_id, help_requests.current_user()["username"], _clinic_now())
+        if item is None:
+            return jsonify(ok=False, error="That request does not exist.", code="not_found"), 404
+        return jsonify(ok=True, request=item)
+    finally:
+        conn.close()
+
+
+@app.route("/help/attachments/<int:attachment_id>")
+def help_attachment(attachment_id):
+    """A file attached to one of the current user's own requests, as a download (never shown inline)."""
+    conn = get_conn()
+    try:
+        found = help_requests.attachment_for_download(conn, attachment_id, help_requests.current_user()["username"])
+    finally:
+        conn.close()
+    if found is None:
+        return jsonify(ok=False, error="That file does not exist.", code="not_found"), 404
+    return _help_download(*found)
+
+
+@app.route("/help/notices")
+def help_notices():
+    conn = get_conn()
+    try:
+        notices = help_requests.pending_notices(conn, help_requests.current_user()["username"])
+        for item in notices:
+            item["text"] = help_requests.notice_text(item)
+        return jsonify(ok=True, notices=notices)
+    finally:
+        conn.close()
+
+
+@app.route("/help/requests/<int:request_id>/notified", methods=["POST"])
+def help_notified(request_id):
+    conn = get_conn()
+    try:
+        changed = help_requests.mark_notified(conn, request_id, help_requests.current_user()["username"], _clinic_now())
+        return jsonify(ok=True, changed=changed)
+    finally:
+        conn.close()
+
+
+# Team side: no access control until login exists.
+
+@app.route("/help/team/requests")
+def help_team_requests():
+    conn = get_conn()
+    try:
+        now = _clinic_now()
+        overdue = request.args.get("overdue", "").lower() in ("1", "true", "yes", "on")
+        items = help_requests.team_list(conn, request.args.get("status") or None, request.args.get("category") or None, overdue, now)
+        return jsonify(ok=True, requests=items, summary=help_requests.team_summary(conn, now))
+    except help_requests.HelpError as exc:
+        return _help_error(exc)
+    finally:
+        conn.close()
+
+
+@app.route("/help/team/requests/<int:request_id>")
+def help_team_request_detail(request_id):
+    conn = get_conn()
+    try:
+        item = help_requests.get_request(conn, request_id, None, _clinic_now())
+        if item is None:
+            return jsonify(ok=False, error="That request does not exist.", code="not_found"), 404
+        return jsonify(ok=True, request=item)
+    finally:
+        conn.close()
+
+
+@app.route("/help/team/requests/<int:request_id>/status", methods=["POST"])
+def help_team_status(request_id):
+    p = _json_body()
+    conn = get_conn()
+    try:
+        item = help_requests.set_status(conn, request_id, p.get("status"), p.get("note"), "team", _clinic_now())
+        return jsonify(ok=True, request=item)
+    except help_requests.HelpError as exc:
+        return _help_error(exc)
+    finally:
+        conn.close()
+
+
+@app.route("/help/team/attachments/<int:attachment_id>")
+def help_team_attachment(attachment_id):
+    conn = get_conn()
+    try:
+        found = help_requests.attachment_for_download(conn, attachment_id, None)
+    finally:
+        conn.close()
+    if found is None:
+        return jsonify(ok=False, error="That file does not exist.", code="not_found"), 404
+    return _help_download(*found)
+
+
+@app.route("/help/team/import", methods=["POST"])
+def help_team_import():
+    """An updates file from the developer: a multipart `file` (CSV or JSON), a JSON body (a list of
+    {ticket_no, status, note}, or {"updates": [...]}), or a raw CSV body. Safe to repeat."""
+    request.max_content_length = help_requests.MAX_IMPORT_BYTES + 64 * 1024
+    request.max_form_memory_size = help_requests.MAX_IMPORT_BYTES + 1024
+    request.max_form_parts = 5
+    conn = get_conn()
+    try:
+        try:
+            if request.files.get("file") is not None:
+                rows = help_requests.parse_updates(request.files["file"].stream.read(help_requests.MAX_IMPORT_BYTES + 1))
+            elif request.is_json:
+                body = request.get_json(silent=True)
+                rows = body.get("updates") if isinstance(body, dict) else body
+                if not isinstance(rows, list):
+                    raise help_requests.HelpError('Send a list of {"ticket_no", "status", "note"} objects.')
+            else:
+                rows = help_requests.parse_updates(request.get_data(cache=False))
+        except RequestEntityTooLarge:
+            return _help_too_large("An updates file can be at most {} KB.".format(help_requests.MAX_IMPORT_BYTES // 1024))
+        if len(rows) > help_requests.MAX_IMPORT_ROWS:
+            raise help_requests.HelpError("At most {} rows can be imported at once.".format(help_requests.MAX_IMPORT_ROWS))
+        return jsonify(ok=True, result=help_requests.import_updates(conn, rows, _clinic_now()))
+    except help_requests.HelpError as exc:
+        return _help_error(exc)
+    finally:
+        conn.close()
+
+
+@app.route("/help/team/export")
+def help_team_export():
+    """A ZIP (requests.csv, requests.json, attachments/<ticket>/..., README.txt). ?status=new  ?since=2026-10-01
+    ?unexported=1 (only those never exported). Nothing is stamped unless ?mark_exported=1, so it can be repeated."""
+    truthy = ("1", "true", "yes", "on")
+    conn = get_conn()
+    try:
+        now = _clinic_now()
+        bundle, count = help_requests.export_bundle(
+            conn, None, request.args.get("status") or None, request.args.get("since") or None,
+            request.args.get("unexported", "").lower() in truthy, request.args.get("mark_exported", "").lower() in truthy, now)
+    except help_requests.HelpError as exc:
+        return _help_error(exc)
+    finally:
+        conn.close()
+    response = send_file(bundle, mimetype="application/zip", as_attachment=True, max_age=0,
+                         download_name="help-requests-{}.zip".format(now.strftime("%Y%m%d-%H%M")))
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["X-Help-Request-Count"] = str(count)
+    return response
+
+
+@app.route("/settings/help-sla")
+def settings_help_sla_data():
+    return jsonify(ok=True, data={"hours": settings.help_sla_hours(get_conn()), "min": settings.MIN_HELP_SLA_HOURS,
+                                  "max": settings.MAX_HELP_SLA_HOURS})
+
+
+@app.route("/settings/help-sla", methods=["POST"])
+def settings_help_sla_save():
+    conn = get_conn()
+    try:
+        settings.set_help_sla_hours(conn, _json_body().get("hours"))
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    return jsonify(ok=True, data={"hours": settings.help_sla_hours(conn), "min": settings.MIN_HELP_SLA_HOURS,
+                                  "max": settings.MAX_HELP_SLA_HOURS})
 
 
 def wire_network_health():

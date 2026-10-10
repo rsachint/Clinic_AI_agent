@@ -554,6 +554,88 @@ CREATE TABLE IF NOT EXISTS network_events (
 );
 CREATE INDEX IF NOT EXISTS idx_network_events_ts ON network_events (ts);
 
+-- "Need help" (clinic/help_requests.py): what the people who USE the app say about how it feels to use it
+-- (a confusing screen, a slow step, something they could not find, voice or language not understood). These
+-- are feedback records, not clinic data: nothing here is a proposal, nothing goes through core.propose and
+-- the planner never reads them. Times are the clinic's local wall clock (IST) as 'YYYY-MM-DD HH:MM:SS' text.
+--
+-- help_categories: what a request can be about. Seeded below with INSERT OR IGNORE (never overwritten) and
+-- meant to be extended without a code change: add a row, or set active = 0 to retire one. A request stores
+-- the category KEY, and a retired category still reads fine on the requests that already use it.
+CREATE TABLE IF NOT EXISTS help_categories (
+    key TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 100,
+    active INTEGER NOT NULL DEFAULT 1
+);
+INSERT OR IGNORE INTO help_categories (key, label, sort_order, active) VALUES ('voice_assistant', 'Voice assistant', 10, 1);
+INSERT OR IGNORE INTO help_categories (key, label, sort_order, active) VALUES ('patients_data', 'Patients data', 20, 1);
+INSERT OR IGNORE INTO help_categories (key, label, sort_order, active) VALUES ('language_understanding', 'Language understanding', 30, 1);
+INSERT OR IGNORE INTO help_categories (key, label, sort_order, active) VALUES ('other', 'Other', 90, 1);
+
+-- One row per request. ticket_no is 'HELP-0001', sequential, never reused. sla_hours and sla_due_at are
+-- SNAPSHOTS taken when the request was sent: changing the help_sla_hours setting later never moves them.
+-- exported_at: when the team exported it (so "new since the last export" works); notified_at: when the
+-- person who sent it was told, once, that it is resolved. `username` is set by the server, never the browser.
+CREATE TABLE IF NOT EXISTS help_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_no TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    username TEXT NOT NULL,
+    category_key TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'minor' CHECK (severity IN ('minor', 'annoying', 'blocks_work')),
+    description TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'typed' CHECK (source IN ('typed', 'voice', 'mixed')),
+    status TEXT NOT NULL DEFAULT 'new' CHECK (status IN ('new', 'acknowledged', 'in_progress', 'resolved', 'closed')),
+    sla_hours INTEGER NOT NULL,
+    sla_due_at TEXT NOT NULL,
+    resolved_at TEXT,
+    context_json TEXT,
+    exported_at TEXT,
+    notified_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_help_requests_user ON help_requests (username, created_at);
+CREATE INDEX IF NOT EXISTS idx_help_requests_status ON help_requests (status, created_at);
+
+-- The files attached to a request. stored_name is random (the person's file name is only kept here, as
+-- text, and is never used on disk); sha256 and bytes are of the stored file.
+CREATE TABLE IF NOT EXISTS help_attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id INTEGER NOT NULL REFERENCES help_requests (id),
+    original_name TEXT NOT NULL,
+    stored_name TEXT NOT NULL UNIQUE,
+    mime TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_help_attachments_request ON help_attachments (request_id);
+
+-- What happened to a request, oldest first. APPEND-ONLY like audit_log: the triggers make an update or a
+-- delete fail, and no code path attempts one. actor: 'user' (sent it), 'team' (changed it in the app) or
+-- 'import' (an updates file from the developer). kind: 'created', 'status', 'note', 'exported'.
+CREATE TABLE IF NOT EXISTS help_request_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id INTEGER NOT NULL REFERENCES help_requests (id),
+    at TEXT NOT NULL,
+    actor TEXT NOT NULL CHECK (actor IN ('user', 'team', 'import')),
+    kind TEXT NOT NULL,
+    from_status TEXT,
+    to_status TEXT,
+    note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_help_events_request ON help_request_events (request_id, id);
+CREATE TRIGGER IF NOT EXISTS help_request_events_no_update
+BEFORE UPDATE ON help_request_events
+BEGIN
+    SELECT RAISE(ABORT, 'help_request_events is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS help_request_events_no_delete
+BEFORE DELETE ON help_request_events
+BEGIN
+    SELECT RAISE(ABORT, 'help_request_events is append-only');
+END;
+
 
 -- ---------------------------------------------------------------------------
 -- Read-only views for the "Model does all read operations" mode (clinic/sql_read.py).

@@ -33,5 +33,8 @@ test_sarvam.py
 # replay reports (made-up conversations, and what the real model was sent in live runs)
 replay_results/
 
+# files people attach to "Need help" requests (screenshots can show patient data): never publish
+data/help_uploads/
+
 # exports of clinic data (patient names and phones): never publish
 exports/

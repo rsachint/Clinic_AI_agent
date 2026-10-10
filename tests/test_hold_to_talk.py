@@ -3,6 +3,7 @@ fake STT connection. No microphone, Sarvam, WhatsApp or Google call is ever
 made -- `stt_factory` is injected everywhere, and the module's default factory
 is replaced by a tripwire for the whole file."""
 
+import base64
 import os
 import queue
 import sqlite3
@@ -195,7 +196,12 @@ class ListenLifecycleTests(HoldToTalkBase):
         # audio went out in order, then silence padding, then `end`
         sock = stt.sockets[0]
         self.assertEqual(sock.audio[:2], ["chunk-1", "chunk-2"])
-        self.assertEqual(len(sock.audio), 3)              # + the tail silence
+        padding = sock.audio[2:]                          # + the tail silence, in frames the speech service accepts
+        self.assertTrue(padding)
+        raw = [base64.b64decode(frame) for frame in padding]
+        self.assertTrue(all(0 < len(chunk) <= 16000 for chunk in raw))     # never above the per-frame cap
+        self.assertEqual(sum(len(chunk) for chunk in raw), 25600)          # still 0.8 s of 16 kHz PCM16
+        self.assertTrue(all(set(chunk) == {0} for chunk in raw))
         self.assertTrue(sock.ended)
         # ... and the STT session is closed again
         self.assertEqual((stt.opened, stt.closed), (1, 1))

@@ -59,7 +59,7 @@ class PatientsSubtabs(unittest.TestCase):
         nav = read("static", "nav.js")
         ids = re.findall(r'\{ id: "(\w+)", label', nav)
         self.assertEqual(ids, ["assistant", "queue", "appointments", "automation", "patients", "messages", "connectors",
-                               "audit", "settings", "profile", "login"])
+                               "audit", "settings", "help", "profile", "login"])      # "Need help" sits right after Settings
         self.assertEqual(self.html.count('data-tab="followups"'), 0)
         self.assertEqual(len(re.findall(r'<section class="tab-panel" data-tab="', self.html)), len(ids))
 

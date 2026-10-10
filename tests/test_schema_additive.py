@@ -260,6 +260,51 @@ class AdditiveSchemaTests(unittest.TestCase):
             conn.close()
             conn2.close()
 
+    def test_the_help_tables_are_new_tables_added_in_place_with_seeded_categories_and_an_append_only_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "old.db")
+            self.make_old(path)                      # a database from before "Need help" existed
+            conn = db.connect(path)
+            conn2 = db.connect(path)                 # idempotent: the seed is not repeated or overwritten
+            self.assertEqual(columns(conn, "help_categories"), {"key", "label", "sort_order", "active"})
+            self.assertEqual(columns(conn, "help_requests"), {
+                "id", "ticket_no", "created_at", "username", "category_key", "severity", "description", "source", "status",
+                "sla_hours", "sla_due_at", "resolved_at", "context_json", "exported_at", "notified_at"})
+            self.assertEqual(columns(conn, "help_attachments"), {
+                "id", "request_id", "original_name", "stored_name", "mime", "bytes", "sha256", "created_at"})
+            self.assertEqual(columns(conn, "help_request_events"), {
+                "id", "request_id", "at", "actor", "kind", "from_status", "to_status", "note"})
+            self.assertEqual([tuple(r) for r in conn.execute("SELECT key, label, active FROM help_categories ORDER BY sort_order")],
+                             [("voice_assistant", "Voice assistant", 1), ("patients_data", "Patients data", 1),
+                              ("language_understanding", "Language understanding", 1), ("other", "Other", 1)])
+            conn.execute("UPDATE help_categories SET label = 'Renamed', active = 0 WHERE key = 'other'")
+            conn.commit()
+            conn3 = db.connect(path)
+            self.assertEqual(conn3.execute("SELECT label, active FROM help_categories WHERE key = 'other'").fetchone()[:], ("Renamed", 0))
+            row = conn.execute("SELECT * FROM wa_messages").fetchone()
+            self.assertEqual((row["raw_text"], row["status"]), ("hello", "classified"))    # existing rows untouched
+            conn.execute("INSERT INTO help_requests (ticket_no, created_at, username, category_key, description, sla_hours, sla_due_at) "
+                         "VALUES ('HELP-0001', '2026-10-05 10:00:00', 'u', 'other', 'd', 24, '2026-10-06 10:00:00')")
+            with self.assertRaises(sqlite3.IntegrityError):                                # ticket numbers are unique
+                conn.execute("INSERT INTO help_requests (ticket_no, created_at, username, category_key, description, sla_hours, sla_due_at) "
+                             "VALUES ('HELP-0001', '2026-10-05 10:00:00', 'u', 'other', 'd', 24, '2026-10-06 10:00:00')")
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("INSERT INTO help_requests (ticket_no, created_at, username, category_key, description, status, sla_hours, sla_due_at) "
+                             "VALUES ('HELP-0002', 'x', 'u', 'other', 'd', 'done', 24, 'y')")
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("INSERT INTO help_requests (ticket_no, created_at, username, category_key, description, severity, sla_hours, sla_due_at) "
+                             "VALUES ('HELP-0003', 'x', 'u', 'other', 'd', 'huge', 24, 'y')")
+            conn.execute("INSERT INTO help_request_events (request_id, at, actor, kind) VALUES (1, 'x', 'user', 'created')")
+            with self.assertRaises(sqlite3.IntegrityError):                                # fixed actors only
+                conn.execute("INSERT INTO help_request_events (request_id, at, actor, kind) VALUES (1, 'x', 'robot', 'created')")
+            with self.assertRaises(sqlite3.DatabaseError):                                 # append-only
+                conn.execute("UPDATE help_request_events SET note = 'x'")
+            with self.assertRaises(sqlite3.DatabaseError):
+                conn.execute("DELETE FROM help_request_events")
+            conn.close()
+            conn2.close()
+            conn3.close()
+
 
 if __name__ == "__main__":
     unittest.main()

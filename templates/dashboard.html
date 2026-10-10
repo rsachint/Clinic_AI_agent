@@ -36,6 +36,8 @@
   </nav>
 
   <main class="main-panel">
+    {# One-time "your request is resolved" notices (static/help_notice.js). #}
+    <div id="help-notices" class="help-notices"></div>
 
     <section class="tab-panel" data-tab="assistant">
       <div class="call-stage" id="call-stage" data-active="false">
@@ -433,8 +435,29 @@
       </div>
       <div id="settings-branches"></div>
       <div id="settings-followups"></div>
+      <div id="settings-help"></div>
       <div id="settings-sarvam"></div>
       <div id="settings-architecture"></div>
+    </section>
+    <section class="tab-panel" data-tab="help" hidden>
+      {# "Need help" (static/help.js): feedback about how the app feels to use. Sub-tabs: static/help_subtabs.js. #}
+      <div class="subtabs" id="help-subtabs" role="tablist" aria-label="Need help sections">
+        <button type="button" class="subtab" role="tab" data-subtab-link="report" aria-selected="true">Report an issue</button>
+        <button type="button" class="subtab" role="tab" data-subtab-link="mine" aria-selected="false">My requests</button>
+        <button type="button" class="subtab" role="tab" data-subtab-link="team" aria-selected="false">Team view</button>
+      </div>
+
+      <div class="subtab-panel" data-subtab="report" role="tabpanel">
+      <div id="help-report"></div>
+      </div>
+
+      <div class="subtab-panel" data-subtab="mine" role="tabpanel" hidden>
+      <div id="help-mine"></div>
+      </div>
+
+      <div class="subtab-panel" data-subtab="team" role="tabpanel" hidden>
+      <div id="help-team"></div>
+      </div>
     </section>
     <section class="tab-panel" data-tab="profile" hidden>
       <div class="card"><p class="muted">Coming soon.</p></div>
@@ -472,6 +495,7 @@
 <script src="{{ url_for('static', filename='calendar_view.js') }}"></script>
 <script src="{{ url_for('static', filename='settings_branches.js') }}"></script>
 <script src="{{ url_for('static', filename='settings_followups.js') }}"></script>
+<script src="{{ url_for('static', filename='settings_help.js') }}"></script>
 <script src="{{ url_for('static', filename='settings_sarvam.js') }}"></script>
 <script src="{{ url_for('static', filename='settings_architecture.js') }}"></script>
 <script src="{{ url_for('static', filename='settings_collapse.js') }}"></script>
@@ -479,6 +503,9 @@
 <script src="{{ url_for('static', filename='unanswered_notice.js') }}"></script>
 <script src="{{ url_for('static', filename='read_format.js') }}"></script>
 <script src="{{ url_for('static', filename='live_voice.js') }}"></script>
+<script src="{{ url_for('static', filename='help_subtabs.js') }}"></script>
+<script src="{{ url_for('static', filename='help.js') }}"></script>
+<script src="{{ url_for('static', filename='help_notice.js') }}"></script>
 {# After live_voice.js: it shares that script's socket (window.clinicSocket). #}
 <script src="{{ url_for('static', filename='network_chip.js') }}"></script>
 <script src="{{ url_for('static', filename='network_history.js') }}"></script>
